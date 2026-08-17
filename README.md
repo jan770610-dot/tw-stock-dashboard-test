@@ -10,3 +10,7 @@
 - Actions 頁面可手動執行，也可指定日期。
 
 重要：目前 repository 是 Public，所以上傳 v2 後，automation 內的策略程式與 seed 資料也會公開可見。若要保護策略程式，後續應改成 private automation repo 或完成 Streamlit private repo 授權。
+
+
+## v2.1 Seed
+大型歷史 seed 改放 GitHub Release `seed-v2` 的 `bootstrap_seed_v2.zip`，避免 GitHub 瀏覽器上傳限制。

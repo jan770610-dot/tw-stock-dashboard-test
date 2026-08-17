@@ -1,0 +1,6 @@
+usage: rs_breadth.py [-h] [--analysis-only] [--date DATE]
+
+options:
+  -h, --help       show this help message and exit
+  --analysis-only  只讀 cache 重算，不連網補缺日
+  --date DATE      指定分析日期 YYYY-MM-DD；供雲端排程使用
