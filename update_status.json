@@ -1,9 +1,10 @@
 {
-  "status": "ready",
+  "status": "success",
   "target_date": "2026-08-14",
   "rs_date": "2026-08-14",
   "duck_date": "2026-08-14",
-  "last_run_taipei": "尚未啟用 GitHub Actions 自動更新",
-  "message": "v2 已安裝；完成 GitHub Actions 首次手動測試後，將於台灣時間每個交易日 18:05 自動啟動。",
+  "last_run_taipei": "2026-08-17 17:33:29",
+  "message": "2026-08-14 兩套系統皆已更新完成。",
+  "attempts": 1,
   "schedule": "週一至週五 18:05（Asia/Taipei）"
 }
