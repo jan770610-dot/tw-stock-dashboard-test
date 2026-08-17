@@ -1,27 +1,12 @@
-# 台股分析中心・Streamlit Cloud 測試版
+# 台股分析中心 v2
 
-這是用來驗證「手機不在同一個 Wi‑Fi，也可以透過 Internet 開啟台股分析網頁」的最小測試版。
+這一版加入：
+- 手機友善的 KPI 卡片，不再把「偏低水位」「廣度差」截成省略號。
+- RS 圖表明確圖例。
+- 自動更新狀態。
+- GitHub Actions 週一至週五台灣時間 18:05 自動更新。
+- 官方資料尚未齊時，8 分鐘後重試，最多 3 次。
+- 首次執行以 2026-08-14 的既有 stock.db / RS cache 當種子，之後用 Actions cache 做增量更新。
+- Actions 頁面可手動執行，也可指定日期。
 
-## GitHub 需要上傳
-- `app.py`
-- `requirements.txt`
-
-`.gitignore` 與本 README 可一起上傳，但不是必要條件。
-
-## 部署
-1. 在 GitHub 建立 repository，例如 `tw-stock-dashboard-test`。
-2. 將本資料夾內檔案上傳到 repository 根目錄。
-3. 登入 Streamlit Community Cloud。
-4. 建立新 App，選擇剛才的 repository。
-5. Main file path 填 `app.py`。
-6. 按 Deploy。
-7. 等部署完成後，會取得 `https://xxxxx.streamlit.app` 類型網址。
-8. 手機關閉 Wi‑Fi，改用 4G/5G，再開該網址。
-9. 按頁面上的「按這裡測試遠端操作」。
-
-## 測試成功判定
-- 手機 4G/5G 可以開頁面。
-- 可以看到「台股分析中心」。
-- 按測試按鈕後，成功次數會增加。
-
-這三項都成功，就代表網頁遠端使用路徑已成立。
+重要：目前 repository 是 Public，所以上傳 v2 後，automation 內的策略程式與 seed 資料也會公開可見。若要保護策略程式，後續應改成 private automation repo 或完成 Streamlit private repo 授權。

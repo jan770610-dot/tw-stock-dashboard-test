@@ -1,0 +1,12 @@
+{
+  "sha256": "c501b78e46a8908e904ab3c6c37a29dae0d480b918b268ff65bac40dc26182c9",
+  "size_bytes": 101530544,
+  "parts": [
+    "seed.part01",
+    "seed.part02",
+    "seed.part03",
+    "seed.part04",
+    "seed.part05"
+  ],
+  "seed_date": "2026-08-14"
+}
