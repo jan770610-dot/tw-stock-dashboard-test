@@ -1,0 +1,131 @@
+name: 每日台股自動更新
+
+on:
+  schedule:
+    - cron: "5 18 * * 1-5"
+      timezone: "Asia/Taipei"
+
+  workflow_dispatch:
+    inputs:
+      target_date:
+        description: "指定日期 YYYY-MM-DD；留白 = 台灣當天"
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: tw-stock-daily-update
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+
+    env:
+      TZ: Asia/Taipei
+      PYTHONUNBUFFERED: "1"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: automation/requirements.txt
+
+      - name: Install automation packages
+        run: python -m pip install -r automation/requirements.txt
+
+      - name: Resolve Taiwan target date
+        id: target
+        shell: bash
+        env:
+          MANUAL_DATE: ${{ github.event.inputs.target_date }}
+        run: |
+          if [ -n "$MANUAL_DATE" ]; then
+            TARGET_DATE="$MANUAL_DATE"
+          else
+            TARGET_DATE=$(TZ=Asia/Taipei date +%F)
+            DOW=$(TZ=Asia/Taipei date +%u)
+
+            if [ "$DOW" = "6" ]; then
+              TARGET_DATE=$(TZ=Asia/Taipei date -d "yesterday" +%F)
+            elif [ "$DOW" = "7" ]; then
+              TARGET_DATE=$(TZ=Asia/Taipei date -d "2 days ago" +%F)
+            fi
+          fi
+
+          echo "date=$TARGET_DATE" >> "$GITHUB_OUTPUT"
+          echo "TARGET_DATE=$TARGET_DATE"
+
+      - name: Restore runtime history cache
+        uses: actions/cache@v5
+        with:
+          path: |
+            automation/duckbill/stock.db
+            automation/duckbill/stock.db-wal
+            automation/duckbill/stock.db-shm
+            automation/rs/cache
+
+          key: tw-stock-runtime-${{ runner.os }}-${{ steps.target.outputs.date }}
+
+          restore-keys: |
+            tw-stock-runtime-${{ runner.os }}-
+
+      - name: Bootstrap history on cache miss
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+        run: |
+          if [ ! -f automation/duckbill/stock.db ] || [ ! -d automation/rs/cache ]; then
+
+            echo "Runtime cache miss; downloading seed..."
+
+            mkdir -p /tmp/tw-stock-seed
+
+            gh release download seed-v2 \
+              --pattern "bootstrap_seed_v2.zip" \
+              --dir /tmp/tw-stock-seed
+
+            unzip -q /tmp/tw-stock-seed/bootstrap_seed_v2.zip -d .
+
+            test -f automation/duckbill/stock.db
+            test -d automation/rs/cache
+
+            echo "Seed restored from Release."
+
+          else
+            echo "Runtime history cache restored."
+          fi
+
+      - name: Run RS and Duckbill updates
+        run: |
+          python -u automation/auto_update.py \
+            --date "${{ steps.target.outputs.date }}" \
+            --attempts 3 \
+            --retry-minutes 8
+
+      - name: Commit latest results to dashboard
+        shell: bash
+
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add rs_latest.xlsx duck_latest.xlsx update_status.json
+
+          if git diff --cached --quiet; then
+            echo "No dashboard file changes."
+          else
+            git commit -m "auto: update Taiwan stock data ${{ steps.target.outputs.date }}"
+            git push origin HEAD:main
+          fi
