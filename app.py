@@ -1272,9 +1272,41 @@ with tabs[3]:
     st.markdown("**目前 v0.2 分數組成**：上漲廣度 20%＋RS 水位 20%＋新高/低 10%＋漲跌停 7%＋RS方向 12%＋量價效率 10%＋加權/等權同步 8%＋櫃買相對強弱 6%＋主流延續 7%。")
     cols=[c for c in ["日期","Wade內部強度分數","Wade分數5日變化","Wade市場狀態","左側減碼警示","早期轉強訊號","上漲家數","下跌家數","上漲比例%","漲停近似家數","跌停近似家數","52週新高家數","52週新低家數","上市上漲比例%","上櫃上漲比例%","成交金額20日比%","加權指數報酬%","櫃買指數報酬%","上市等權平均報酬%","上櫃等權平均報酬%","主流延續率%","新強勢領頭股數","量價效率分數","權值同步分數","櫃買相對強弱分數","主流延續分數","市場總結白話","操作建議","市場階段","強勢股方向"] if c in daily.columns]
     if cols:
-        hist_show=daily[cols].tail(30).sort_values("日期",ascending=False).copy()
+        hist_base=daily[cols].copy()
+
+        # 歷史資料區間：預設最近 3 個月，可一路切到全部歷史。
+        if "日期" in hist_base.columns:
+            hist_base["日期"]=normalize_date_series(hist_base["日期"])
+            hist_base=hist_base.dropna(subset=["日期"]).sort_values("日期")
+
+        hist_range=st.selectbox(
+            "歷史顯示區間",
+            ["最近1個月","最近3個月","最近6個月","最近1年","全部"],
+            index=1,
+            key="wade_history_range",
+        )
+
+        days_map={
+            "最近1個月":31,
+            "最近3個月":93,
+            "最近6個月":186,
+            "最近1年":366,
+        }
+
+        if hist_range=="全部" or "日期" not in hist_base.columns or hist_base.empty:
+            hist_show=hist_base.copy()
+        else:
+            latest_hist_date=hist_base["日期"].max()
+            cutoff=latest_hist_date-pd.Timedelta(days=days_map[hist_range])
+            hist_show=hist_base[hist_base["日期"]>=cutoff].copy()
+
+        if "日期" in hist_show.columns:
+            hist_show=hist_show.sort_values("日期",ascending=False)
+            hist_show["日期"]=hist_show["日期"].dt.strftime("%Y-%m-%d")
+
         hist_show=hist_show.rename(columns={"左側減碼警示":"向上減碼觀察"})
-        st.dataframe(hist_show,hide_index=True,use_container_width=True,height=520)
+        st.caption(f"目前顯示 {len(hist_show):,} 個交易日；可切換到『全部』一路往前查看既有歷史資料。")
+        st.dataframe(hist_show,hide_index=True,use_container_width=True,height=600)
 
 
 with tabs[4]:
