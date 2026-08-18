@@ -1,10 +1,10 @@
 {
-  "status": "success",
+  "status": "partial",
   "target_date": "2026-08-17",
   "rs_date": "2026-08-17",
   "duck_date": "2026-08-17",
-  "last_run_taipei": "2026-08-18 09:01:23",
-  "message": "2026-08-17 兩套系統皆已更新完成。",
+  "last_run_taipei": "2026-08-18 09:29:33",
+  "message": "部分更新完成：RS=2026-08-17、鴨嘴=2026-08-17。保留各系統最後成功結果。",
   "attempts": 1,
   "schedule": "週一至週五 18:05（Asia/Taipei）"
 }
