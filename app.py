@@ -211,39 +211,139 @@ def stage_flow_html(stage):
 
 
 
-def action_level(stage, wade_score, market_lr_phase, left_alert):
-    """把詳細建議再濃縮成手機一眼能懂的 5 段操作語言。"""
+def action_level(stage, wade_score, market_lr_phase, left_alert, left_score=None, right_score=None, wade_change5=None):
+    """把詳細建議濃縮成可直接執行的操作語言；左側與右側分開表達。"""
     if text(left_alert,"—") != "—" or "減碼" in text(market_lr_phase,""):
-        return "分批減碼"
+        return "⚠️ 分批減碼／汰弱留強"
     score=_num(wade_score)
+    left=_num(left_score,0) or 0
+    right=_num(right_score,0) or 0
+    w5=_num(wade_change5,0) or 0
     if stage in {"低檔續弱","中段走弱"} and (score is None or score < 45):
-        return "防守降低曝險"
-    if "右側確認" in text(market_lr_phase,"") or (stage in {"中段回升","高檔續強"} and (score or 0)>=60):
-        return "偏多持有"
+        return "🛡️ 防守降低曝險"
+    if "右側確認" in text(market_lr_phase,"") or (stage in {"中段回升","高檔續強"} and (score or 0)>=60 and right>=65):
+        return "🚀 右側偏多持有"
     if "左轉右" in text(market_lr_phase,""):
-        return "逐步布局"
-    if stage=="低檔回升" or "左側" in text(market_lr_phase,"") or "試單" in text(market_lr_phase,""):
-        return "小部位試單"
-    return "觀望等待"
+        return "↗️ 左轉右逐步布局"
+    if stage=="低檔回升" and left>=right+10:
+        return "🌱 左側小部位試單｜等待右側確認"
+    if "左側" in text(market_lr_phase,""):
+        return "🌱 左側小部位試單"
+    if "試單" in text(market_lr_phase,"") or right>=58:
+        return "📈 右側小部位試單"
+    if w5 < -8 and score is not None and score < 55:
+        return "⏳ 觀望等待／先看5日結構修復"
+    return "⏳ 觀望等待"
+
+
+def _quality_label(score):
+    return "高" if score>=80 else "中高" if score>=68 else "中" if score>=52 else "偏低"
 
 
 def market_confidence(row, market_lr):
-    """0-100 決策可信度：看資料完整度與不同指標是否同方向，不是漲跌預測機率。"""
+    """把「資料完整度」與「訊號一致度」拆開；不把大幅波動本身誤當成更高信心。"""
     fields=["Wade內部強度分數","上漲比例%","52週新高家數","52週新低家數","上市上漲比例%","上櫃上漲比例%","量價效率分數","權值同步分數","主流延續分數"]
     present=sum(_num(first_value(row,[f])) is not None for f in fields)
-    completeness=present/len(fields)*55
+    completeness=max(0,min(100,present/len(fields)*100))
+
+    stage=text(first_value(row,["市場階段"]),"")
+    direction=text(first_value(row,["強勢股方向"]),"")
+    wade=_num(first_value(row,["Wade內部強度分數"]),50) or 50
+    w5=_num(first_value(row,["Wade分數5日變化"]),0) or 0
+    adv=_num(first_value(row,["上漲比例%"]),50) or 50
+    nh=_num(first_value(row,["52週新高家數"]),0) or 0
+    nl=_num(first_value(row,["52週新低家數"]),0) or 0
     left=_num(market_lr.get("左側分數"),0) or 0
     right=_num(market_lr.get("右側分數"),0) or 0
-    # 左右側差距越明顯，決策方向越清楚；交界時則保留不確定性。
-    separation=min(25,abs(right-left)*0.45)
-    w5=abs(_num(first_value(row,["Wade分數5日變化"]),0) or 0)
-    momentum=min(10,w5*0.8)
-    direction=text(first_value(row,["強勢股方向"]),"")
+    phase=text(market_lr.get("左右側階段"),"")
+
+    consistency=50.0
+    # 市場階段與 RS 方向是否同向。
+    if ("回升" in stage and "增加" in direction) or ("續強" in stage and direction in {"增加","明顯增加","持平"}) or ("走弱" in stage and "減少" in direction):
+        consistency += 15
+    elif ("回升" in stage and "減少" in direction) or ("走弱" in stage and "增加" in direction):
+        consistency -= 12
+
+    # Wade 與上漲家數是否互相確認。
+    if wade>=60 and adv>=55:
+        consistency += 12
+    elif wade<45 and adv<45:
+        consistency += 10
+    elif (wade>=60 and adv<48) or (wade<45 and adv>=55):
+        consistency -= 10
+    else:
+        consistency += 2
+
+    # 5日變化要看方向，不能用絕對值加分。
+    if stage in {"低檔回升","中段回升","高檔續強"}:
+        if w5>=5: consistency += 12
+        elif w5<=-5: consistency -= 18
+        else: consistency += 2
+    elif stage in {"中段走弱","高檔轉弱","低檔續弱"}:
+        if w5<=-5: consistency += 10
+        elif w5>=5: consistency -= 10
+
+    # 左右側階段與分數差距是否吻合。
+    if "左側" in phase and left>=right+10:
+        consistency += 8
+    elif "右側" in phase and right>=left+10:
+        consistency += 8
+    elif "左轉右" in phase and abs(left-right)<=20:
+        consistency += 6
+    elif abs(left-right)<5:
+        consistency -= 4
+
+    if nh>nl: consistency += 4
+    elif nl>nh*1.5 and nl>=5: consistency -= 5
+
+    consistency=max(0,min(100,consistency))
+    overall=max(0,min(100,completeness*0.4+consistency*0.6))
+    return {
+        "資料完整度": round(completeness,0),
+        "資料完整度標籤": _quality_label(completeness),
+        "訊號一致度": round(consistency,0),
+        "訊號一致度標籤": _quality_label(consistency),
+        "判讀品質": round(overall,0),
+        "判讀品質標籤": _quality_label(overall),
+    }
+
+
+def metric_day_change(daily, col):
+    if daily is None or len(daily)<2 or col not in daily.columns:
+        return None
+    a=_num(daily.iloc[-1].get(col)); b=_num(daily.iloc[-2].get(col))
+    if a is None or b is None: return None
+    return a-b
+
+
+def signed_num(v, digits=1, suffix=""):
+    x=_num(v)
+    if x is None: return "—"
+    return f"{x:+.{digits}f}{suffix}"
+
+
+def wade_timing_summary(score, day_change, five_change):
+    d=_num(day_change); f=_num(five_change)
+    if d is None or f is None:
+        return "Wade 多時間週期資料不足"
+    if d>=5 and f<=-5:
+        return "短線明顯反彈，但5日趨勢尚未完全扭轉"
+    if d>=0 and f>=0:
+        return "今日與5日同步改善，內部結構較一致"
+    if d<0 and f>0:
+        return "今日回落，但5日結構仍較前期改善"
+    if d<=-5 and f<=-5:
+        return "短線與5日同步轉弱，先提高防守"
+    return "短線與5日訊號仍有分歧，等待進一步確認"
+
+
+def short_market_trigger(row, market_lr):
     stage=text(first_value(row,["市場階段"]),"")
-    consistency=10 if (("回升" in stage and "增加" in direction) or ("走弱" in stage and "減少" in direction) or ("續強" in stage and direction in {"增加","明顯增加","持平"})) else 4
-    score=max(0,min(100,completeness+separation+momentum+consistency))
-    label="高" if score>=78 else "中高" if score>=65 else "中" if score>=50 else "偏低"
-    return round(score,0),label
+    if stage=="低檔回升": return "Wade≥60＋上漲≥55%＋RS持續增加"
+    if stage=="中段回升": return "右側≥70＋主流延續不降"
+    if stage in {"高檔續強","高檔整理"}: return "留意Wade 5日轉弱＋強勢股減少"
+    if stage in {"高檔轉弱","中段走弱"}: return "Wade回升＋上漲比例重回50～55%"
+    return "至少2項：廣度、Wade、價格同向確認"
 
 
 def day_change_summary(daily):
@@ -617,10 +717,16 @@ leadership_score=first_value(rs_latest,["主流延續分數"])
 market_summary_plain=text(first_value(rs_latest,["市場總結白話"]), market_signal(stage)+"："+stage_plain(stage))
 operation_action=text(first_value(rs_latest,["操作建議"]), infer_action(stage,wade_score,left_alert,early_signal))
 market_lr=market_lr_assessment(rs_latest)
-confidence_score,confidence_label=market_confidence(rs_latest,market_lr)
-operation_level=action_level(stage,wade_score,market_lr["左右側階段"],left_alert)
+quality=market_confidence(rs_latest,market_lr)
+wade_day_change=metric_day_change(daily,"Wade內部強度分數")
+wade_timing_text=wade_timing_summary(wade_score,wade_day_change,wade_change5)
+operation_level=action_level(
+    stage,wade_score,market_lr["左右側階段"],left_alert,
+    market_lr.get("左側分數"),market_lr.get("右側分數"),wade_change5
+)
 day_change_text=day_change_summary(daily)
 next_trigger=next_market_trigger(rs_latest,market_lr)
+short_trigger=short_market_trigger(rs_latest,market_lr)
 twii_lr=index_lr_assessment(rs_latest,"twii","加權")
 twoii_lr=index_lr_assessment(rs_latest,"twoii","櫃買")
 stock_lr=build_stock_lr_table(master,strong,recovery)
@@ -630,7 +736,7 @@ pre_b=int(pre_status.str.contains("B級").sum()) if not pre_status.empty else 0
 update_status=load_update_status()
 
 st.title("📈 台股分析中心")
-st.markdown('<div class="hero-sub">RS 市場廣度 × 鴨嘴型態 × 培育中心｜正式網頁版 v2.6｜決策摘要優化版</div>',unsafe_allow_html=True)
+st.markdown('<div class="hero-sub">RS 市場廣度 × 鴨嘴型態 × 培育中心｜正式網頁版 v2.7｜決策校準版</div>',unsafe_allow_html=True)
 
 u_status=update_status.get("status","unknown")
 last_run=update_status.get("last_run_taipei","—")
@@ -643,48 +749,44 @@ else:
 if u_status in {"partial","no_new_data"} and message: st.warning(message)
 elif u_status=="error" and message: st.error(message)
 
-cards([
-    ("市場總結",market_signal(stage),stage_plain(stage)),
-    ("操作層級",operation_level,f"詳細：{operation_action}"),
-    ("判讀信心",f"{confidence_label}／{confidence_score:.0f}","資料完整度＋訊號一致性；不是勝率"),
-    ("歷史水位",water,f"全期 P{safe_num(full_rank,1)}／近3年 P{safe_num(rolling_rank,1)}"),
-    ("強勢股方向",direction,f"變化速度：{speed}"),
-    ("RS 強勢股",safe_num(strong_count,0," 檔"),f"占比 {safe_num(strong_pct,2,'%')}／單日 {safe_num(change,0,' 檔')}"),
-    ("鴨嘴符合",f"{len(all_ok):,} 檔",f"新進 {len(duck_new):,}／退出 {len(duck_exit):,}／A級 {pre_a:,}"),
-    ("Wade市場內部",safe_num(wade_score,1," 分"),f"{wade_state}／5日 {safe_num(wade_change5,1)}"),
-    ("大盤左右側",market_lr["左右側階段"],f"左 {market_lr['左側分數']:.0f}／右 {market_lr['右側分數']:.0f}"),
-    ("復甦候選",f"{len(recovery):,} 檔","跌深後開始修復；非買進訊號"),
-])
-
-summary=f"目前為「{water}／{stage}」，強勢股方向「{direction}」、速度「{speed}」。"
-if change is not None:
-    try:
-        c=float(change)
-        if c<0 and direction in {"增加","明顯增加"}: summary += f" 雖然單日減少 {abs(int(c))} 檔，但中短期廣度結構仍維持增加，兩者不矛盾。"
-    except Exception: pass
-if stage=="低檔回升": summary += " 代表市場內部由低水位開始修復，仍需觀察是否持續擴散。"
-elif stage=="高檔轉弱": summary += " 代表高水位開始退潮，風險明顯高於單純高水位。"
-if left_alert!="—": summary += f" {left_alert}。"
-elif early_signal!="—": summary += f" {early_signal}。"
 st.write("### 今日決策摘要")
 decision_cards([
-    ("市場現在在哪裡",f"{market_signal(stage)}｜{stage}",market_summary_plain),
+    ("市場在哪裡",f"{market_signal(stage)}｜{stage}",f"{water}；{stage_plain(stage)}"),
     ("現在怎麼做",operation_level,market_lr["左右側建議"]),
-    ("左右側位置",market_lr["左右側階段"],f"左 {market_lr['左側分數']:.0f}／右 {market_lr['右側分數']:.0f}"),
-    ("判讀信心",f"{confidence_label}／{confidence_score:.0f}","代表資料與訊號一致性，不是未來上漲機率"),
+    ("今天變化",wade_timing_text,f"Wade 今日 {signed_num(wade_day_change)}｜5日 {signed_num(wade_change5)}"),
+    ("下一個升級／降級條件",short_trigger,next_trigger),
 ])
-st.markdown(f'<div class="focus-box"><b>今天只看三件事：</b><br>① {html.escape(day_change_text)}<br>② {html.escape(next_trigger)}<br>③ 詳細操作：{html.escape(operation_action)}<br><span class="small-note">「向上減碼」是高檔風險管理；與「左側布局」是不同概念。左右側評分為本系統量化代理，不是 Wade 官方公式。</span></div>',unsafe_allow_html=True)
+st.markdown(
+    f'<div class="focus-box"><b>今天只看三件事：</b><br>'
+    f'① 今日變化：{html.escape(day_change_text)}<br>'
+    f'② Wade節奏：{html.escape(wade_timing_text)}（今日 {html.escape(signed_num(wade_day_change))}／5日 {html.escape(signed_num(wade_change5))}）<br>'
+    f'③ 操作：{html.escape(operation_level)}；{html.escape(next_trigger)}<br>'
+    f'<span class="small-note">資料完整度與訊號一致度分開評估；分數不是未來上漲機率。左右側評分為本系統量化代理，不是 Wade 官方公式。</span></div>',
+    unsafe_allow_html=True
+)
 st.markdown(stage_flow_html(stage),unsafe_allow_html=True)
+
+st.write("### 市場關鍵數據")
+cards([
+    ("歷史水位",water,f"全期 P{safe_num(full_rank,1)}／近3年 P{safe_num(rolling_rank,1)}"),
+    ("RS 強勢股",safe_num(strong_count,0," 檔"),f"占比 {safe_num(strong_pct,2,'%')}／單日 {safe_num(change,0,' 檔')}"),
+    ("Wade市場內部",safe_num(wade_score,1," 分"),f"今日 {signed_num(wade_day_change)}／5日 {signed_num(wade_change5)}"),
+    ("大盤左右側",market_lr["左右側階段"],f"左 {market_lr['左側分數']:.0f}／右 {market_lr['右側分數']:.0f}"),
+    ("資料完整度",f"{quality['資料完整度標籤']}／{quality['資料完整度']:.0f}","今天應有資料是否齊全"),
+    ("訊號一致度",f"{quality['訊號一致度標籤']}／{quality['訊號一致度']:.0f}","RS、Wade、廣度、多時間週期是否同向"),
+    ("鴨嘴符合",f"{len(all_ok):,} 檔",f"新進 {len(duck_new):,}／退出 {len(duck_exit):,}／A級 {pre_a:,}"),
+    ("復甦候選",f"{len(recovery):,} 檔","跌深後開始修復；非買進訊號"),
+])
 
 tabs=st.tabs(["🏠 總覽","↔️ 左右側決策","📊 RS／市場廣度","🧭 Wade大盤強弱","🌱 復甦候選","🦆 鴨嘴系統","🔥 鴨嘴×培育中心","📐 台指期","🧪 資料品質","🔄 更新資料"])
 
 with tabs[0]:
     st.subheader("今日一眼看懂")
     decision_cards([
-        ("市場狀態",market_signal(stage),f"RS：{stage}｜{stage_plain(stage)}"),
-        ("操作",operation_level,operation_action),
-        ("今日變化",day_change_text,f"Wade：{safe_num(wade_score,1)}｜5日 {safe_num(wade_change5,1)}"),
-        ("下一個確認點","升級／降級條件",next_trigger),
+        ("市場狀態",f"{market_signal(stage)}｜{stage}",stage_plain(stage)),
+        ("操作",operation_level,market_lr["左右側建議"]),
+        ("Wade節奏",wade_timing_text,f"目前 {safe_num(wade_score,1)}｜今日 {signed_num(wade_day_change)}｜5日 {signed_num(wade_change5)}"),
+        ("下一個確認點",short_trigger,next_trigger),
     ])
     c1,c2=st.columns([1.12,1])
     with c1:
@@ -720,7 +822,7 @@ with tabs[1]:
     st.divider()
     st.write("### 個股左右側判讀")
     if stock_lr.empty:
-        st.info("全市場整合資料尚未產生；跑一次 v2.5 更新後即可使用。")
+        st.info("全市場整合資料尚未產生；跑一次正式資料更新後即可使用。")
     else:
         q=st.text_input("搜尋個股代號／名稱",key="lr_stock_search")
         sx=filter_stock_table(stock_lr.copy(),q)
