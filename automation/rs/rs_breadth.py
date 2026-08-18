@@ -1369,8 +1369,17 @@ def main():
         ov=recent_raw.set_index("date")
         common=raw.index.intersection(ov.index)
         for c in overlay_cols:
-            if c in ov.columns:
-                raw.loc[common,c]=ov.loc[common,c]
+            if c not in ov.columns:
+                continue
+            # v2.5.5 hotfix:
+            # 舊版 Excel 讀回來時部分數值欄會被 pandas 推斷為 int64；
+            # 新版 Wade / 指數欄位含小數，Pandas 3 不允許直接把 float 塞進 int64。
+            # 因此在覆蓋近期盤面資料前，先把目標欄位統一轉為 float64。
+            if c not in raw.columns:
+                raw[c] = np.nan
+            raw[c] = pd.to_numeric(raw[c], errors="coerce").astype("float64")
+            values = pd.to_numeric(ov.loc[common, c], errors="coerce").astype("float64")
+            raw.loc[common, c] = values
         raw=raw.reset_index()
         new_rows=recent_raw[recent_raw["date"] > pd.Timestamp(published_latest)].copy() if published_latest else recent_raw.copy()
         if not new_rows.empty:
