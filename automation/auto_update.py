@@ -40,8 +40,12 @@ def write_status(status,target,rs_date,duck_date,message,attempts):
 
 def main():
     ap=argparse.ArgumentParser(); ap.add_argument('--date'); ap.add_argument('--attempts',type=int,default=3); ap.add_argument('--retry-minutes',type=int,default=8); args=ap.parse_args()
-    if args.date: target=dt.datetime.strptime(args.date,'%Y-%m-%d').date()
-    else: target=dt.datetime.now(ZoneInfo('Asia/Taipei')).date()
+    if args.date:
+        target=dt.datetime.strptime(args.date,'%Y-%m-%d').date()
+    else:
+        now=dt.datetime.now(ZoneInfo('Asia/Taipei'))
+        # 16:00 前視為當日尚未完成盤後資料，自動抓最近已收盤日。
+        target=now.date() if now.hour>=16 else now.date()-dt.timedelta(days=1)
     while target.weekday()>=5: target-=dt.timedelta(days=1)
     existing_rs=excel_latest(ROOT/'rs_latest.xlsx','每日強勢股數量',0)
     existing_duck=excel_latest(ROOT/'duck_latest.xlsx','全部符合',1)
