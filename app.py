@@ -337,6 +337,109 @@ def wade_timing_summary(score, day_change, five_change):
     return "短線與5日訊號仍有分歧，等待進一步確認"
 
 
+def signal_active(v):
+    """事件型訊號是否啟動。空白、破折號與『未觸發』都視為未啟動。"""
+    s=text(v,"—")
+    return s not in {"—","-","未觸發","None","nan","NaN",""}
+
+
+def signal_display(v):
+    return text(v,"—") if signal_active(v) else "未觸發"
+
+
+def signal_streak_stats(df, col):
+    """統計事件型訊號的連續天數；每天重新判定，不做固定延長。"""
+    empty={"目前連續":0,"段數":0,"中位數":None,"80百分位":None,"最長":None}
+    if df is None or df.empty or col not in df.columns:
+        return empty
+    flags=[signal_active(v) for v in df[col].tolist()]
+    runs=[]; cur=0
+    for on in flags:
+        if on:
+            cur+=1
+        elif cur:
+            runs.append(cur); cur=0
+    if cur: runs.append(cur)
+    current=0
+    for on in reversed(flags):
+        if on: current+=1
+        else: break
+    if not runs: return empty
+    s=pd.Series(runs,dtype="float64")
+    return {
+        "目前連續":int(current),
+        "段數":int(len(runs)),
+        "中位數":float(s.median()),
+        "80百分位":float(s.quantile(.8)),
+        "最長":int(s.max()),
+    }
+
+
+def signal_stat_text(stats):
+    if not stats or not stats.get("段數"):
+        return "歷史樣本不足"
+    med=stats.get("中位數"); p80=stats.get("80百分位")
+    return f"歷史中位 {med:.0f}天｜80% 約≤{p80:.0f}天｜樣本 {stats['段數']} 段"
+
+
+def signal_current_text(stats):
+    cur=int((stats or {}).get("目前連續",0) or 0)
+    return f"目前第 {cur} 天" if cur>0 else "目前未觸發"
+
+
+def signal_event_backtest(df, signal_col, price_col, mode="up", horizons=(5,10,20)):
+    """以每一段訊號的第一天為事件日，計算後續指數報酬與區間最大回撤。
+    mode='up'：成功定義為期末報酬 > 0；mode='down'：成功定義為期末報酬 < 0。
+    """
+    cols=["訊號","市場","期間","樣本數","平均報酬%","符合方向%","平均區間最大回撤%"]
+    if df is None or df.empty or signal_col not in df.columns or price_col not in df.columns:
+        return pd.DataFrame(columns=cols)
+    x=df.copy()
+    if "日期" in x.columns: x=x.sort_values("日期").reset_index(drop=True)
+    prices=pd.to_numeric(x[price_col],errors="coerce")
+    flags=x[signal_col].map(signal_active)
+    starts=[i for i,on in enumerate(flags) if on and (i==0 or not bool(flags.iloc[i-1]))]
+    rows=[]
+    for h in horizons:
+        rets=[]; dds=[]
+        for i in starts:
+            if i+h>=len(x): continue
+            p0=prices.iloc[i]; p1=prices.iloc[i+h]
+            if pd.isna(p0) or pd.isna(p1) or p0<=0: continue
+            path=prices.iloc[i:i+h+1].dropna()
+            if path.empty: continue
+            ret=(float(p1)/float(p0)-1)*100
+            dd=(path.astype(float)/float(p0)-1).min()*100
+            rets.append(ret); dds.append(float(dd))
+        if not rets: continue
+        s=pd.Series(rets,dtype="float64")
+        success=(s>0).mean()*100 if mode=="up" else (s<0).mean()*100
+        rows.append({
+            "期間":f"{h}日","樣本數":len(rets),"平均報酬%":round(float(s.mean()),2),
+            "符合方向%":round(float(success),1),"平均區間最大回撤%":round(float(pd.Series(dds).mean()),2)
+        })
+    return pd.DataFrame(rows)
+
+
+def overheat_label(score):
+    x=_num(score,0) or 0
+    if x>=85: return "極高"
+    if x>=70: return "高"
+    if x>=55: return "偏高"
+    if x>=35: return "中"
+    return "低"
+
+
+def classify_recovery_stage(left, right, overheat, rec_score=None):
+    """復甦候選三層：觀察 → 左側試單 → 接近右側確認。"""
+    l=_num(left,0) or 0; r=_num(right,0) or 0; oh=_num(overheat,0) or 0; rec=_num(rec_score,0) or 0
+    if r>=58 or (r>=52 and l>=55):
+        return "↗️ 接近右側確認"
+    if l>=60 and rec>=50 and oh<70:
+        return "🌱 可左側試單"
+    return "👀 觀察名單"
+
+
 def short_market_trigger(row, market_lr):
     stage=text(first_value(row,["市場階段"]),"")
     if stage=="低檔回升": return "Wade≥60＋上漲≥55%＋RS持續增加"
@@ -569,6 +672,22 @@ def build_stock_lr_table(master, strong, recovery):
         ma20chg=_num(r.get("MA20較前日"),0) or 0
         ma60chg=_num(r.get("MA60較前日"),0) or 0
         spreadchg=_num(r.get("開口較前日"),0) or 0
+        gap20=_num(r.get("月線乖離率%"),0) or 0
+        first_hot=r.get("首次過熱日期")
+        try:
+            has_hot_date=not pd.isna(first_hot) and str(first_hot).strip() not in {"","—","-"}
+        except Exception:
+            has_hot_date=bool(first_hot)
+
+        # 過熱程度 0-100：與右側強度分開。右側可很強，同時也可能很熱。
+        # 月線乖離是主體；RS/正式型態/既有過熱標記只做加成，不直接壓低右側分數。
+        heat=max(0,min(70,max(0,gap20)*5.0))
+        if rs is not None and rs>=95: heat+=12
+        elif rs is not None and rs>=85: heat+=8
+        if formal or complete>=100: heat+=8
+        if overheat: heat+=18
+        if has_hot_date: heat+=8
+        heat=max(0,min(100,heat))
 
         # 左側 0-100：估值 35 + 修復 30 + 基本面 25 + 接近右側 10。
         left=0; lreason=[]
@@ -601,16 +720,16 @@ def build_stock_lr_table(master, strong, recovery):
         elif formal: right+=8; rreason.append("正式鴨嘴")
         elif "A級" in pre: right+=6; rreason.append("接近右側觸發")
         if ma20chg>0 and ma60chg>0 and spreadchg>0: right+=6; rreason.append("均線與開口同步改善")
-        if overheat: right-=8; rreason.append("過熱，不宜追價")
+        if overheat: rreason.append("過熱，不宜追價")
         if exit_today: right-=30; rreason.append("今日退出")
         right=max(0,min(100,right))
 
         if exit_today:
             phase="🛑 右側失敗／退出觀察"
             action="停止新增部位；依原停損/退場規則降低部位，等下一次觸發"
-        elif overheat and right>=60:
+        elif (overheat or heat>=70) and right>=60:
             phase="⚠️ 右側過熱／向上減碼"
-            action="不追高；持有者可續抱強勢核心，但分批鎖利並提高移動停利"
+            action=f"右側仍強，但過熱程度 {heat:.0f}/100（{overheat_label(heat)}）；不追高，持有者分批鎖利並提高移動停利"
         elif left>=65 and right>=60:
             phase="↗️ 左轉右確認"
             action="原左側試單可轉為基本部位；後續只有價格繼續證明才加碼"
@@ -634,7 +753,9 @@ def build_stock_lr_table(master, strong, recovery):
             action="目前不屬高品質左側或右側機會，等待條件改善"
 
         rows.append({
-            "左側分數":round(left,1),"右側分數":round(right,1),"左右側階段":phase,"系統建議":action,
+            "左側分數":round(left,1),"右側分數":round(right,1),
+            "過熱程度":round(heat,1),"過熱等級":overheat_label(heat),
+            "左右側階段":phase,"系統建議":action,
             "左側依據":"；".join(lreason[:5]) or "—","右側依據":"；".join(rreason[:5]) or "—"
         })
     z=pd.concat([x.reset_index(drop=True),pd.DataFrame(rows)],axis=1)
@@ -734,9 +855,13 @@ pre_status=pre.get("預備鴨嘴狀態",pd.Series(dtype=str)).fillna("").astype(
 pre_a=int(pre_status.str.contains("A級").sum()) if not pre_status.empty else 0
 pre_b=int(pre_status.str.contains("B級").sum()) if not pre_status.empty else 0
 update_status=load_update_status()
+left_signal_stats=signal_streak_stats(daily,"左側減碼警示")
+early_signal_stats=signal_streak_stats(daily,"早期轉強訊號")
+left_alert_show=signal_display(left_alert)
+early_signal_show=signal_display(early_signal)
 
 st.title("📈 台股分析中心")
-st.markdown('<div class="hero-sub">RS 市場廣度 × 鴨嘴型態 × 培育中心｜正式網頁版 v2.7｜決策校準版</div>',unsafe_allow_html=True)
+st.markdown('<div class="hero-sub">RS 市場廣度 × 鴨嘴型態 × 培育中心｜正式網頁版 v2.8｜訊號／過熱整合版</div>',unsafe_allow_html=True)
 
 u_status=update_status.get("status","unknown")
 last_run=update_status.get("last_run_taipei","—")
@@ -827,15 +952,17 @@ with tabs[1]:
         q=st.text_input("搜尋個股代號／名稱",key="lr_stock_search")
         sx=filter_stock_table(stock_lr.copy(),q)
         stages=["全部"]+sorted(sx["左右側階段"].dropna().astype(str).unique().tolist()) if "左右側階段" in sx.columns else ["全部"]
-        c1,c2,c3=st.columns([1,1,1])
+        c1,c2,c3,c4=st.columns([1,1,1,1])
         chosen=c1.selectbox("階段",stages,key="lr_stage")
         min_left=c2.slider("最低左側分數",0,100,0,5,key="lr_left")
         min_right=c3.slider("最低右側分數",0,100,0,5,key="lr_right")
+        max_heat=c4.slider("最高過熱程度",0,100,100,5,key="lr_heat")
         if chosen!="全部": sx=sx[sx["左右側階段"]==chosen]
         sx=sx[(pd.to_numeric(sx["左側分數"],errors="coerce").fillna(0)>=min_left)&(pd.to_numeric(sx["右側分數"],errors="coerce").fillna(0)>=min_right)]
+        if "過熱程度" in sx.columns: sx=sx[pd.to_numeric(sx["過熱程度"],errors="coerce").fillna(0)<=max_heat]
         sx=sx.sort_values(["決策排序分數","右側分數","左側分數"],ascending=False,na_position="last")
-        show=[c for c in ["代號","名稱","市場","收盤","左右側階段","左側分數","右側分數","系統建議","左側依據","右側依據","RS判讀","復甦分數","鴨嘴階段","預備鴨嘴狀態","鴨嘴完成度%","三率狀態","營收狀態","EPS年增率%","估值狀態","折價率%","合理價"] if c in sx.columns]
-        st.caption(f"符合目前篩選：{len(sx):,} 檔。左側偏估值/基本面/修復；右側偏價格/RS/鴨嘴觸發。")
+        show=[c for c in ["代號","名稱","市場","收盤","左右側階段","左側分數","右側分數","過熱程度","過熱等級","系統建議","左側依據","右側依據","RS判讀","復甦分數","鴨嘴階段","預備鴨嘴狀態","鴨嘴完成度%","三率狀態","營收狀態","EPS年增率%","估值狀態","折價率%","合理價"] if c in sx.columns]
+        st.caption(f"符合目前篩選：{len(sx):,} 檔。左側＝提前布局價值；右側＝趨勢確認程度；過熱＝追價風險，三者分開看。")
         st.dataframe(sx[show],hide_index=True,use_container_width=True,height=650)
         with st.expander("怎麼解讀各階段"):
             st.markdown("""
@@ -866,8 +993,8 @@ with tabs[3]:
     st.caption("v0.2：把 Wade 公開常看的市場內部概念量化；不是 Wade 官方公式。已納入量價效率、加權/等權同步、櫃買相對強弱與強勢股主流延續性；指數資料抓不到時會自動退回市場內部代理。")
     cards([
         ("市場內部強度",safe_num(wade_score,1," / 100"),wade_state),
-        ("向上減碼觀察",left_alert,f"5日分數變化 {safe_num(wade_change5,1)}"),
-        ("早期轉強",early_signal,"市場內部先於指數改善時提示"),
+        ("向上減碼觀察",left_alert_show,f"{signal_current_text(left_signal_stats)}｜{signal_stat_text(left_signal_stats)}"),
+        ("早期轉強",early_signal_show,f"{signal_current_text(early_signal_stats)}｜{signal_stat_text(early_signal_stats)}"),
         ("上漲／下跌",f"{safe_num(advance_count,0)}／{safe_num(decline_count,0)}",f"上漲比例 {safe_num(advance_ratio,1,'%')}"),
         ("漲停／跌停*",f"{safe_num(limit_up,0)}／{safe_num(limit_down,0)}","*目前以單日報酬 ±9.5% 近似"),
         ("52週新高／新低",f"{safe_num(new_high,0)}／{safe_num(new_low,0)}","收盤價 250 交易日新高低"),
@@ -881,6 +1008,26 @@ with tabs[3]:
     if left_alert!="—": st.warning(f"目前警示：{left_alert}。這代表高檔內部結構開始退潮，屬分批降低風險的觀察訊號，不等於一次清倉。")
     elif early_signal!="—": st.success(f"目前訊號：{early_signal}。市場內部改善速度領先價格表現，可觀察是否持續擴散。")
     else: st.info(f"目前狀態：{wade_state}。尚未觸發明確向上減碼或早期轉強訊號。")
+
+    st.write("**訊號持續天數／歷史常態**")
+    cards([
+        ("向上減碼",signal_current_text(left_signal_stats),signal_stat_text(left_signal_stats)),
+        ("早期轉強",signal_current_text(early_signal_stats),signal_stat_text(early_signal_stats)),
+    ])
+    with st.expander("訊號有效性回測（每段只算第一次觸發）"):
+        bt=[]
+        for sig_col,sig_name,mode in [("左側減碼警示","向上減碼","down"),("早期轉強訊號","早期轉強","up")]:
+            for price_col,market_name in [("加權指數收盤","加權"),("櫃買指數收盤","櫃買")]:
+                b=signal_event_backtest(daily,sig_col,price_col,mode)
+                if not b.empty:
+                    b.insert(0,"市場",market_name); b.insert(0,"訊號",sig_name); bt.append(b)
+        if bt:
+            bt_show=pd.concat(bt,ignore_index=True)
+            st.dataframe(bt_show,hide_index=True,use_container_width=True)
+            st.caption("早期轉強的『符合方向』＝期末上漲；向上減碼的『符合方向』＝期末下跌。樣本少時只供觀察，不應把比例當成固定勝率。")
+        else:
+            st.info("目前可用的指數歷史或訊號樣本不足；之後每天增量累積後會自動出現 5／10／20 日統計。")
+
     wc=wade_chart(daily,180)
     if wc is not None: st.altair_chart(wc,use_container_width=True)
     st.markdown("**目前 v0.2 分數組成**：上漲廣度 20%＋RS 水位 20%＋新高/低 10%＋漲跌停 7%＋RS方向 12%＋量價效率 10%＋加權/等權同步 8%＋櫃買相對強弱 6%＋主流延續 7%。")
@@ -893,7 +1040,7 @@ with tabs[3]:
 
 with tabs[4]:
     st.subheader("被遺忘資金／災後復甦候選")
-    st.caption("v0.1 量化代理：找『距52週高點仍有一段跌幅，但已站回月線、月線上彎、5/20日動能改善，RS尚未過熱』的股票。這是觀察名單，不是買進訊號。")
+    st.caption("v0.2：找跌深後開始修復的股票，再依左側／右側／過熱程度分成『👀觀察名單 → 🌱可左側試單 → ↗️接近右側確認』。復甦本身不是買點，但條件完整時可升級操作層級。")
     if recovery.empty:
         st.info("目前沒有符合條件的復甦候選；第一次新版更新後才會產生此工作表。")
     else:
@@ -907,10 +1054,36 @@ with tabs[4]:
             tag=tag[tcols].drop_duplicates("代號")
             rx=rx.merge(tag,on="代號",how="left")
             if "狀態" in rx.columns: rx=rx.rename(columns={"狀態":"鴨嘴狀態"})
-        rq=st.text_input("搜尋代號／名稱",key="recovery_search")
+        # 接入左右側/過熱分數，直接把復甦候選分成三個可理解層級。
+        if not stock_lr.empty and "代號" in stock_lr.columns and "代號" in rx.columns:
+            lrcols=[c for c in ["代號","左側分數","右側分數","過熱程度","過熱等級","左右側階段","系統建議","估值狀態","折價率%","合理價"] if c in stock_lr.columns]
+            lrtag=stock_lr[lrcols].drop_duplicates("代號")
+            rx=rx.merge(lrtag,on="代號",how="left",suffixes=("","_左右側"))
+        if "左側分數" not in rx.columns: rx["左側分數"]=0
+        if "右側分數" not in rx.columns: rx["右側分數"]=0
+        if "過熱程度" not in rx.columns: rx["過熱程度"]=0
+        rx["復甦階段"]=[classify_recovery_stage(l,r,h,rec) for l,r,h,rec in zip(
+            rx["左側分數"],rx["右側分數"],rx["過熱程度"],rx.get("復甦分數",pd.Series(0,index=rx.index))
+        )]
+        order={"↗️ 接近右側確認":0,"🌱 可左側試單":1,"👀 觀察名單":2}
+        cnt=rx["復甦階段"].value_counts()
+        cards([
+            ("👀 觀察名單",f"{int(cnt.get('👀 觀察名單',0)):,} 檔","剛開始修復，先追蹤"),
+            ("🌱 可左側試單",f"{int(cnt.get('🌱 可左側試單',0)):,} 檔","修復＋左側條件較完整"),
+            ("↗️ 接近右側確認",f"{int(cnt.get('↗️ 接近右側確認',0)):,} 檔","價格／RS／型態開始證明"),
+        ])
+        c1,c2=st.columns([1,1])
+        rq=c1.text_input("搜尋代號／名稱",key="recovery_search")
+        rstage=c2.selectbox("復甦階段",["全部","👀 觀察名單","🌱 可左側試單","↗️ 接近右側確認"],key="recovery_stage")
         rx=filter_stock_table(rx,rq)
-        if "復甦分數" in rx.columns: rx=rx.sort_values("復甦分數",ascending=False,na_position="last")
-        st.dataframe(rx,hide_index=True,use_container_width=True,height=620)
+        if rstage!="全部": rx=rx[rx["復甦階段"]==rstage]
+        rx["_stage_order"]=rx["復甦階段"].map(order).fillna(9)
+        sort_cols=["_stage_order"] + (["復甦分數"] if "復甦分數" in rx.columns else [])
+        asc=[True] + ([False] if "復甦分數" in rx.columns else [])
+        rx=rx.sort_values(sort_cols,ascending=asc,na_position="last").drop(columns=["_stage_order"])
+        front=[c for c in ["代號","名稱","市場","收盤","復甦階段","復甦分數","左側分數","右側分數","過熱程度","過熱等級","左右側階段","系統建議"] if c in rx.columns]
+        rest=[c for c in rx.columns if c not in front]
+        st.dataframe(rx[front+rest],hide_index=True,use_container_width=True,height=620)
 
 with tabs[5]:
     st.subheader("鴨嘴型態篩選")
@@ -981,4 +1154,4 @@ with tabs[9]:
     with open(DEFAULT_RS,"rb") as f: d1.download_button("下載 RS 最新結果",f.read(),file_name="rs_latest.xlsx",mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",use_container_width=True)
     with open(DEFAULT_DUCK,"rb") as f: d2.download_button("下載鴨嘴最新結果",f.read(),file_name="duck_latest.xlsx",mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",use_container_width=True)
 
-st.divider(); st.caption(f"正式版 v2.6｜決策摘要優化｜RS：{rs_date}｜鴨嘴：{duck_date}｜量化篩選與市場廣度工具，不構成投資建議。")
+st.divider(); st.caption(f"正式版 v2.8｜訊號／過熱整合｜RS：{rs_date}｜鴨嘴：{duck_date}｜量化篩選與市場廣度工具，不構成投資建議。")
