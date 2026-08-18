@@ -29,6 +29,14 @@ def excel_latest(path,sheet,header=0):
     except Exception as e:
         print('[WARN] read date failed',path,e,flush=True); return None
 
+def excel_has_columns(path,sheet,required,header=0):
+    try:
+        df=pd.read_excel(path,sheet_name=sheet,header=header,nrows=3)
+        return set(required).issubset(set(df.columns))
+    except Exception as e:
+        print('[WARN] schema check failed',path,sheet,e,flush=True)
+        return False
+
 def latest_file(folder,pattern):
     fs=sorted(folder.glob(pattern),key=lambda p:p.stat().st_mtime,reverse=True)
     return fs[0] if fs else None
@@ -49,17 +57,31 @@ def main():
     while target.weekday()>=5: target-=dt.timedelta(days=1)
     existing_rs=excel_latest(ROOT/'rs_latest.xlsx','每日強勢股數量',0)
     existing_duck=excel_latest(ROOT/'duck_latest.xlsx','全部符合',1)
+
+    # v2.5.1 schema upgrade guard:
+    # 若資料日期已是目標日，但舊 workbook 尚未包含 v2.5 的 Wade/市場總結欄位，
+    # 第一次部署時仍強制重建 RS 與鴨嘴輸出一次。重建完成後，日後恢復純增量更新。
+    rs_schema_ok=excel_has_columns(
+        ROOT/'rs_latest.xlsx',
+        '每日強勢股數量',
+        {'Wade內部強度分數','市場總結白話','操作建議','加權MA20','櫃買MA20'},
+        0
+    )
+    schema_upgrade=not rs_schema_ok
+    if schema_upgrade:
+        print('[UPGRADE] v2.5 schema not found; force one-time rebuild for target date.',flush=True)
+
     rs_date=existing_rs; duck_date=existing_duck; rs_out=None; duck_out=None; errors=[]
     used_attempts=0
     for attempt in range(1,max(1,args.attempts)+1):
         used_attempts=attempt; print(f'=== Attempt {attempt}/{args.attempts} target={target} ===',flush=True)
-        if rs_date!=target:
+        if rs_date!=target or schema_upgrade:
             env=os.environ.copy(); env['RS_TARGET_DATE']=target.isoformat(); env['TZ']='Asia/Taipei'
             rc=run([sys.executable,'-u','rs_breadth.py','--date',target.isoformat()],RS_DIR,env)
             if rc!=0: errors.append(f'RS exit={rc}')
             rs_out=latest_file(RS_DIR/'output','*_RS強勢股市場廣度_極值趨勢.xlsx')
             if rs_out: rs_date=excel_latest(rs_out,'每日強勢股數量',0)
-        if duck_date!=target:
+        if duck_date!=target or schema_upgrade:
             env=os.environ.copy(); env['TZ']='Asia/Taipei'
             rc=run([sys.executable,'-u','stock_duckbill.py','--update','--date',target.isoformat()],DUCK_DIR,env)
             if rc!=0: errors.append(f'Duck exit={rc}')
