@@ -25,6 +25,7 @@ jobs:
     env:
       TZ: Asia/Taipei
       PYTHONUNBUFFERED: "1"
+
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -50,7 +51,6 @@ jobs:
           if [ -n "$MANUAL_DATE" ]; then
             TARGET_DATE="$MANUAL_DATE"
           else
-            # 與 auto_update.py 使用完全相同的規則：
             # 台灣時間 16:00 前，視為當日盤後資料尚未完整，抓最近已收盤日。
             TARGET_DATE=$(python - <<'PYDATE'
           import datetime as dt
@@ -74,8 +74,12 @@ jobs:
             automation/duckbill/stock.db-wal
             automation/duckbill/stock.db-shm
             automation/rs/cache
-          key: tw-stock-runtime-${{ runner.os }}-${{ steps.target.outputs.date }}
+          # v2.5 專用 cache key：
+          # 第一次升級會從舊 cache fallback，跑完後另存 v25 cache。
+          # 下一交易日再從最新 v25 cache 接續，只補新日期。
+          key: tw-stock-runtime-v25-${{ runner.os }}-${{ steps.target.outputs.date }}
           restore-keys: |
+            tw-stock-runtime-v25-${{ runner.os }}-
             tw-stock-runtime-${{ runner.os }}-
 
       - name: Bootstrap history on cache miss
