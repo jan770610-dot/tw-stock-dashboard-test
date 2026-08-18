@@ -592,11 +592,22 @@ def _downcast_market_data(all_df: pd.DataFrame) -> pd.DataFrame:
     return x
 
 
+def _normalize_merge_date(series: pd.Series) -> pd.Series:
+    """將 merge 用日期欄統一成 timezone-naive datetime64[ns]，避免 pandas 因 us/object 混型而拒絕合併。"""
+    x = pd.to_datetime(series, errors="coerce")
+    try:
+        if getattr(x.dt, "tz", None) is not None:
+            x = x.dt.tz_localize(None)
+    except Exception:
+        pass
+    return x.dt.normalize().astype("datetime64[ns]")
+
+
 def _load_index_store() -> pd.DataFrame:
     cols=["date","twii_close","twii_ret","twoii_close","twoii_ret"]
     if not INDEX_STORE.exists(): return pd.DataFrame(columns=cols)
     try:
-        z=pd.read_csv(INDEX_STORE); z["date"]=pd.to_datetime(z["date"],errors="coerce")
+        z=pd.read_csv(INDEX_STORE); z["date"]=_normalize_merge_date(z["date"])
         return z.dropna(subset=["date"]).sort_values("date").drop_duplicates("date",keep="last")
     except Exception:
         return pd.DataFrame(columns=cols)
@@ -615,7 +626,7 @@ def _update_index_store(start_day: dt.date, end_day: dt.date, analysis_only: boo
                 if h is None or h.empty: continue
                 if isinstance(h.columns,pd.MultiIndex): h.columns=[c[0] for c in h.columns]
                 c=pd.to_numeric(h.get("Close"),errors="coerce").dropna()
-                q=pd.DataFrame({"date":pd.to_datetime(c.index).tz_localize(None),f"{prefix}_close":c.values})
+                q=pd.DataFrame({"date":_normalize_merge_date(pd.Series(pd.to_datetime(c.index).tz_localize(None))),f"{prefix}_close":c.values})
                 q[f"{prefix}_ret"]=q[f"{prefix}_close"].pct_change()*100
                 frames.append(q)
             if frames:
@@ -1337,7 +1348,17 @@ def main():
     recent_raw, latest = _daily_raw_from_market(data, cfg)
     idx=_update_index_store(hist_start,end,args.analysis_only)
     if not recent_raw.empty and not idx.empty:
-        recent_raw=recent_raw.merge(idx[[c for c in ["date","twii_close","twii_ret","twoii_close","twoii_ret"] if c in idx.columns]],on="date",how="left")
+        # v2.5.3 hotfix: pandas 3 / Python 3.13 可能把兩邊日期讀成 datetime64[us] 與 object。
+        # merge 前強制正規化為同一個 datetime64[ns]，避免 ValueError。
+        recent_raw=recent_raw.copy()
+        idx=idx.copy()
+        recent_raw["date"]=_normalize_merge_date(recent_raw["date"])
+        idx["date"]=_normalize_merge_date(idx["date"])
+        print(f"[DATE MERGE] recent={recent_raw['date'].dtype} index={idx['date'].dtype}",flush=True)
+        recent_raw=recent_raw.merge(
+            idx[[c for c in ["date","twii_close","twii_ret","twoii_close","twoii_ret"] if c in idx.columns]],
+            on="date",how="left"
+        )
     recovery=_forgotten_recovery_candidates(data,cfg)
     if not published_raw.empty and not recent_raw.empty:
         # 既有 RS 核心統計完全沿用，避免因近期暖機區間造成停牌股樣本微小差異；
