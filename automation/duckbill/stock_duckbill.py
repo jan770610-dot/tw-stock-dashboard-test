@@ -615,29 +615,41 @@ def fetch_twse_openapi_current() -> List[dict]:
 
 
 def fetch_tpex_openapi_current() -> List[dict]:
-    url = "https://www.tpex.org.tw/openapi/v1/tpex_mainboard_daily_close_quotes"
-    js = request_json(url)
-    if not isinstance(js, list):
-        return []
-    out = []
-    for x in js:
-        # 欄位名稱可能隨版本略有不同，採多組官方欄位別名容錯。
-        code = str(x.get("SecuritiesCompanyCode", x.get("Code", x.get("股票代號", x.get("代號", ""))))).strip()
-        name = str(x.get("CompanyName", x.get("Name", x.get("名稱", "")))).strip()
-        if not is_common_stock(code, name):
-            continue
-        close = clean_num(x.get("Close", x.get("ClosingPrice", x.get("收盤"))))
-        if close is None or close <= 0:
-            continue
-        out.append({
-            "stock_id": code, "name": name, "market": "TPEx",
-            "close": close,
-            "open": clean_num(x.get("Open", x.get("OpeningPrice", x.get("開盤")))),
-            "high": clean_num(x.get("High", x.get("HighestPrice", x.get("最高")))),
-            "low": clean_num(x.get("Low", x.get("LowestPrice", x.get("最低")))),
-            "volume": clean_num(x.get("TradingShares", x.get("TradeVolume", x.get("成交股數")))),
-        })
-    return out
+    urls = [
+        "https://www.tpex.org.tw/openapi/v1/tpex_mainboard_daily_close_quotes",
+        "https://www.tpex.org.tw/openapi/v1/tpex_mainboard_quotes",
+    ]
+    errors: List[str] = []
+    for url in urls:
+        try:
+            js = request_json(url, timeout=20, tries=3)
+            if not isinstance(js, list):
+                continue
+            out = []
+            for x in js:
+                if not isinstance(x, dict):
+                    continue
+                code = str(x.get("SecuritiesCompanyCode", x.get("SecuritiesCode", x.get("Code", x.get("股票代號", x.get("代號", "")))))).strip()
+                name = str(x.get("CompanyName", x.get("SecuritiesName", x.get("Name", x.get("股票名稱", x.get("名稱", "")))))).strip()
+                if not is_common_stock(code, name):
+                    continue
+                close = clean_num(x.get("Close", x.get("ClosingPrice", x.get("ClosePrice", x.get("收盤價", x.get("收盤"))))))
+                if close is None or close <= 0:
+                    continue
+                out.append({
+                    "stock_id": code, "name": name, "market": "TPEx", "close": close,
+                    "open": clean_num(x.get("Open") or x.get("OpeningPrice") or x.get("OpenPrice") or x.get("開盤價") or x.get("開盤")),
+                    "high": clean_num(x.get("High") or x.get("HighestPrice") or x.get("HighPrice") or x.get("最高價") or x.get("最高")),
+                    "low": clean_num(x.get("Low") or x.get("LowestPrice") or x.get("LowPrice") or x.get("最低價") or x.get("最低")),
+                    "volume": clean_num(x.get("TradingShares") or x.get("TradeVolume") or x.get("TradingVolume") or x.get("成交股數") or x.get("成交量")),
+                })
+            if out:
+                return out
+        except Exception as e:
+            errors.append(f"{url}: {e}")
+    if errors:
+        raise RuntimeError(" | ".join(errors))
+    return []
 
 
 def upsert_prices(conn: sqlite3.Connection, day: dt.date, rows: List[dict]) -> int:
@@ -657,6 +669,24 @@ def upsert_prices(conn: sqlite3.Connection, day: dt.date, rows: List[dict]) -> i
     return len(values)
 
 
+def _price_market_minimums(conn: sqlite3.Connection, day: dt.date) -> Tuple[int, int]:
+    min_twse, min_tpex = 700, 550
+    row = conn.execute(
+        "SELECT MAX(date) FROM prices WHERE date < ?", (day.isoformat(),)
+    ).fetchone()
+    if row and row[0]:
+        prev = row[0]
+        counts = dict(conn.execute(
+            "SELECT market, COUNT(*) FROM prices WHERE date=? GROUP BY market", (prev,)
+        ).fetchall())
+        c1, c2 = int(counts.get("TWSE", 0)), int(counts.get("TPEx", 0))
+        if c1 >= 700:
+            min_twse = max(min_twse, int(c1 * 0.85))
+        if c2 >= 550:
+            min_tpex = max(min_tpex, int(c2 * 0.85))
+    return min_twse, min_tpex
+
+
 def fetch_and_store_day(conn: sqlite3.Connection, day: dt.date, allow_current_openapi: bool = True, slow_retry: bool = False) -> Tuple[int, int, List[str]]:
     errors: List[str] = []
     twse: List[dict] = []
@@ -670,22 +700,36 @@ def fetch_and_store_day(conn: sqlite3.Connection, day: dt.date, allow_current_op
     except Exception as e:
         errors.append(f"TPEx歷史端點：{e}")
 
-    if allow_current_openapi and day == dt.date.today():
-        if not twse:
+    min_twse, min_tpex = _price_market_minimums(conn, day)
+    taipei_today = dt.datetime.now(dt.timezone(dt.timedelta(hours=8))).date()
+    if allow_current_openapi and day == taipei_today:
+        if len(twse) < min_twse:
             try:
-                twse = fetch_twse_openapi_current()
-                if twse:
-                    errors.append("TWSE歷史端點無資料，已改用TWSE OpenAPI當日資料")
+                x = fetch_twse_openapi_current()
+                if len(x) > len(twse):
+                    twse = x
+                    errors.append("TWSE歷史端點不完整，已改用TWSE OpenAPI當日資料")
             except Exception as e:
                 errors.append(f"TWSE OpenAPI：{e}")
-        if not tpex:
+        if len(tpex) < min_tpex:
             try:
-                tpex = fetch_tpex_openapi_current()
-                if tpex:
-                    errors.append("TPEx歷史端點無資料，已改用TPEx OpenAPI當日資料")
+                x = fetch_tpex_openapi_current()
+                if len(x) > len(tpex):
+                    tpex = x
+                    errors.append("TPEx歷史端點不完整，已改用TPEx OpenAPI當日資料")
             except Exception as e:
                 errors.append(f"TPEx OpenAPI：{e}")
 
+    # 原版會把單邊市場先寫入 DB，造成殘缺交易日。新版採 atomic gate：兩邊完整才一次提交。
+    if len(twse) < min_twse or len(tpex) < min_tpex:
+        errors.append(
+            f"完整性驗證失敗：TWSE={len(twse)}（至少{min_twse}）、TPEx={len(tpex)}（至少{min_tpex}）；本日不寫入資料庫"
+        )
+        return 0, 0, errors
+
+    # 若先前版本留下殘缺同日資料，正式提交前先清掉該日再重建，避免混雜。
+    conn.execute("DELETE FROM prices WHERE date=?", (day.isoformat(),))
+    conn.commit()
     n1 = upsert_prices(conn, day, twse)
     n2 = upsert_prices(conn, day, tpex)
     return n1, n2, errors
@@ -1327,15 +1371,30 @@ def _upsert_income_record_with_basis(conn: sqlite3.Connection, r: dict, availabi
 
 
 def _seed_bulk_income_for_target(conn: sqlite3.Connection, target: dt.date, stock_ids: List[str]) -> Tuple[int, List[str]]:
-    """用官方六類 OpenAPI 補「目前最新季」；只有保守可得日<=target 才可寫入歷史。
-
-    這允許 8/17 補跑 8/14 時使用 Q2（保守可得日 8/14），但不會把 target 之後的季度倒灌。
-    """
+    """只補『當期應有且資料庫尚缺』的最新季，避免每天重抓同一季財報。"""
     if not stock_ids:
         return 0, []
-    rows, errors = _fetch_official_income_bulk_latest(stock_ids)
+    missing=[]
+    for sid in dict.fromkeys(str(x) for x in stock_ids):
+        if _is_three_rate_na_stock(conn,sid,target):
+            continue
+        latest=_available_quarters_for_stock(conn,sid,target,1)
+        if not latest:
+            continue
+        y,q=latest[-1]
+        got=conn.execute("""SELECT 1 FROM fundamental_income_history
+                            WHERE stock_id=? AND year=? AND quarter=? AND availability_date<=? LIMIT 1""",
+                         (sid,int(y),int(q),target.isoformat())).fetchone()
+        if not got:
+            missing.append(sid)
+    if not missing:
+        return 0, []
+    rows, errors = _fetch_official_income_bulk_latest(missing)
     added = 0
+    miss=set(missing)
     for r in rows:
+        if str(r.get("stock_id")) not in miss:
+            continue
         avail = _income_available_for_identity(str(r["stock_id"]), str(r.get("name") or _stock_name_asof(conn,str(r["stock_id"]),target)), int(r["year"]), int(r["quarter"]), str(r.get("source") or ""))
         if avail > target:
             continue
@@ -1374,6 +1433,28 @@ def fetch_official_income_snapshot(conn: sqlite3.Connection, target: dt.date, st
                       f"逐公司法定時限：一般業需最新季 {len(required_period)} 檔，覆蓋 {len(required_period)-len(missing)}/{len(required_period)}；三率不適用/特殊業別 {len(exempt)} 檔" +
                       (f"；真正缺最新季 {len(missing)} 檔 ({','.join(missing[:20])})" if missing else "；當期最新季無實質缺漏"))
         return hist
+    # 今日若資料庫已涵蓋每檔目前依法可得最新季，直接沿用，不為相同季度重抓。
+    wanted=set(str(x) for x in (stock_ids or []))
+    if wanted:
+        hist=_latest_income_history_asof(conn,target,stock_ids)
+        latest_by_sid={}
+        if not hist.empty:
+            for _,rr in hist.iterrows():
+                latest_by_sid[str(rr["stock_id"])]=(int(rr["year"]),int(rr["quarter"]))
+        required={}
+        exempt=[]
+        for sid in wanted:
+            if _is_three_rate_na_stock(conn,sid,target):
+                exempt.append(sid); continue
+            latest=_available_quarters_for_stock(conn,sid,target,1)
+            if latest: required[sid]=latest[-1]
+        missing=[sid for sid,pq in required.items() if latest_by_sid.get(sid)!=pq]
+        if not missing:
+            if not hist.empty and required:
+                hist=hist[hist.apply(lambda r: (str(r["stock_id"]) in exempt) or required.get(str(r["stock_id"]))==(int(r["year"]),int(r["quarter"])),axis=1)].copy()
+            record_source(conn,target,"官方財報最新批次",target.isoformat(),True,True,
+                          f"增量更新：當期最新季已存在，沿用 {len(hist)} 檔，不重抓相同季度")
+            return hist
     rows_all, errors = _fetch_official_income_bulk_latest(stock_ids)
     if rows_all:
         # 每家公司只保留最新一期作為今天的官方快照。
@@ -2119,6 +2200,19 @@ def fetch_official_month_revenue(conn: sqlite3.Connection, target: dt.date, cfg:
         record_source(conn,target,"營收Point-in-time",target.isoformat() if not hist.empty else None,bool(not hist.empty),complete,msg)
         return hist
 
+    # 今日若候選股的最新應有月份都已存在 history，直接沿用；月營收不用每天重抓。
+    wanted=set(str(x) for x in (stock_ids or []))
+    if wanted:
+        hist=_latest_revenue_history_asof(conn,target,stock_ids)
+        latest_required={sid:(_available_month_keys_for_stock(conn,sid,target,1)[-1] if _available_month_keys_for_stock(conn,sid,target,1) else None) for sid in wanted}
+        required={sid for sid,mk in latest_required.items() if mk is not None}
+        have_month={str(r["stock_id"]):int(r["month_key"]) for _,r in hist.iterrows()} if not hist.empty else {}
+        missing=[sid for sid in required if have_month.get(sid)!=latest_required.get(sid)]
+        if not missing:
+            record_source(conn,target,"營收Point-in-time",target.isoformat(),True,True,
+                          f"增量更新：最新應有月份已存在，沿用 {len(hist)}/{len(required)} 檔，不重抓相同月份")
+            return hist
+
     for source,url,market in endpoints:
         try:
             lr = _fetch_official_revenue_rows(source,url,market)
@@ -2729,13 +2823,15 @@ def _refresh_yfinance_eps(conn: sqlite3.Connection, target: dt.date, meta: Dict[
         record_source(conn, target, "Yahoo Finance EPS", target.isoformat(), True, True, "本次沒有需要刷新 Yahoo EPS 的優先股票")
         return
 
-    # 同一天已成功存有資料者不重抓。
+    # EPS 是季度資料：近期已有成功快照就沿用，不需每天重抓。
+    refresh_days=max(1,cfg.getint("general","yfinance_eps_refresh_days",fallback=7))
+    cutoff=(today-dt.timedelta(days=refresh_days-1)).isoformat()
     fetch_ids = []
     cached = 0
     for sid in ids:
         got = conn.execute(
-            "SELECT 1 FROM yfinance_eps_snapshot WHERE observed_date=? AND stock_id=? LIMIT 1",
-            (today.isoformat(), sid)).fetchone()
+            "SELECT 1 FROM yfinance_eps_snapshot WHERE observed_date>=? AND observed_date<=? AND stock_id=? LIMIT 1",
+            (cutoff,today.isoformat(), sid)).fetchone()
         if got:
             cached += 1
         else:
@@ -2770,7 +2866,7 @@ def _refresh_yfinance_eps(conn: sqlite3.Connection, target: dt.date, meta: Dict[
                 if done == 1 or done % 20 == 0 or done == total:
                     print(f"        Yahoo EPS {done}/{total}：成功 {ok}、無資料/失敗 {fail}", flush=True)
     success_total = cached + ok
-    msg = f"優先名單 {len(ids)} 檔；快取 {cached}、本次成功 {ok}、無資料/失敗 {fail}。Yahoo EPS 僅作估值優先來源，官方 MOPS/交易所隱含EPS仍保留備援"
+    msg = f"優先名單 {len(ids)} 檔；{refresh_days}日內快取 {cached}、本次成功 {ok}、無資料/失敗 {fail}。Yahoo EPS 為季度資料，不每日重抓；官方 MOPS/交易所隱含EPS仍保留備援"
     if errors:
         msg += "；首批=" + " | ".join(errors[:5])
     # Yahoo 是選配補強；少數個股查無 EPS 時由官方備援，不把整套估值標成不完整。
@@ -2908,96 +3004,76 @@ def _find_exchange_per_near(day: dt.date, market: str, max_back: int = 10) -> Tu
 def _backfill_official_pe_history(conn: sqlite3.Connection, target: dt.date,
                                   meta: Dict[str, Tuple[str, str]],
                                   cfg: configparser.ConfigParser) -> None:
-    """
-    v13：完全改用 TWSE/TPEx 官方「依日期本益比」。
-    為降低官方網站負擔，近 N 年採每月最後交易日取樣，外加 target 當日。
-    這些 PER 本身即為交易所在當日使用當時已申報近4季財報計算，天然具 Point-in-time 性質。
+    """TWSE/TPEx 官方 PER 增量快取。
+
+    舊版每天先刪掉近3年 PER 再重抓 36 個月底，耗時最大。
+    v2.4 改為：歷史月份有足夠快取就直接沿用；只補新月份/缺漏月份，
+    另抓 target 當日（這本來就是新的每日資料）。
     """
     if not meta:
         return
-    years = max(1, cfg.getint("general", "valuation_history_years", fallback=3))
-    start = target - dt.timedelta(days=366 * years)
-    month_candidates = _month_last_calendar_days(start, target)
-    min_samples = max(12, cfg.getint("general", "valuation_min_pe_samples", fallback=24))
-    total_written = 0
-    errors: List[str] = []
-
-    # 清除同一批標的既有自算/舊來源 PE，避免舊資料混入分位數。
-    marks = ",".join("?" for _ in meta)
-    if marks:
-        conn.execute(f"DELETE FROM valuation_pe_history WHERE stock_id IN ({marks})", tuple(meta.keys()))
-        conn.commit()
-
-    by_market: Dict[str, set] = {"TWSE": set(), "TPEx": set()}
-    for sid, (_, market) in meta.items():
+    years=max(1,cfg.getint("general","valuation_history_years",fallback=3))
+    start_day=target-dt.timedelta(days=366*years)
+    month_candidates=_month_last_calendar_days(start_day,target)
+    min_samples=max(12,cfg.getint("general","valuation_min_pe_samples",fallback=24))
+    total_written=0; skipped_months=0; errors=[]
+    by_market={"TWSE":set(),"TPEx":set()}
+    for sid,(_,market) in meta.items():
         by_market["TPEx" if str(market).lower().startswith("tpex") else "TWSE"].add(str(sid))
 
-    for market, ids in by_market.items():
-        if not ids:
-            continue
-        print(f"[官方PER] {market}：{len(ids)} 檔，近 {years} 年月底樣本 {len(month_candidates)} 個 + 目標日", flush=True)
-        # 月底樣本
-        used_dates: set = set()
-        for pidx, cand in enumerate(month_candidates, 1):
-            if pidx == 1 or pidx % 6 == 0 or pidx == len(month_candidates):
-                print(f"    [{market} PER {pidx}/{len(month_candidates)}] 月底附近 {cand} ...", flush=True)
-            d, rows = _find_exchange_per_near(cand, market, max_back=10)
-            if not d or d in used_dates:
-                continue
-            used_dates.add(d)
-            vals = []
+    for market,ids in by_market.items():
+        if not ids: continue
+        source=f"{market}-official-daily-PER"
+        threshold=max(40,min(len(ids),int(len(ids)*0.45)))
+        print(f"[官方PER增量] {market}：{len(ids)} 檔；歷史月份有快取即跳過",flush=True)
+        for pidx,cand in enumerate(month_candidates,1):
+            ms=dt.date(cand.year,cand.month,1)
+            if cand.month==12: me=dt.date(cand.year+1,1,1)-dt.timedelta(days=1)
+            else: me=dt.date(cand.year,cand.month+1,1)-dt.timedelta(days=1)
+            existing=int(conn.execute("""SELECT COUNT(DISTINCT stock_id) FROM valuation_pe_history
+                                       WHERE source=? AND date>=? AND date<=? AND per>0""",
+                                      (source,ms.isoformat(),me.isoformat())).fetchone()[0])
+            if existing>=threshold:
+                skipped_months+=1; continue
+            if pidx==1 or pidx%6==0 or pidx==len(month_candidates):
+                print(f"    [{market} PER 補月 {pidx}/{len(month_candidates)}] {cand}",flush=True)
+            d,rows=_find_exchange_per_near(cand,market,max_back=10)
+            if not d: continue
+            vals=[]
             for r in rows:
-                sid = str(r["stock_id"])
-                if sid not in ids:
-                    continue
-                pe = clean_num(r.get("per"))
-                if pe is None or pe <= 0:
-                    continue
-                vals.append((sid, d.isoformat(), pe, clean_num(r.get("pbr")),
-                             clean_num(r.get("dividend_yield")), f"{market}-official-daily-PER"))
+                sid=str(r["stock_id"]); pe=clean_num(r.get("per"))
+                if sid not in ids or pe is None or pe<=0: continue
+                vals.append((sid,d.isoformat(),pe,clean_num(r.get("pbr")),clean_num(r.get("dividend_yield")),source))
             if vals:
                 conn.executemany("""INSERT OR REPLACE INTO valuation_pe_history
-                    (stock_id,date,per,pbr,dividend_yield,source) VALUES (?,?,?,?,?,?)""", vals)
-                total_written += len(vals)
-                conn.commit()
-            time.sleep(0.35)
+                    (stock_id,date,per,pbr,dividend_yield,source) VALUES (?,?,?,?,?,?)""",vals)
+                conn.commit(); total_written+=len(vals)
+            time.sleep(0.15)
 
-        # target 當日一定另外抓，供「目前市場PER / 交易所隱含EPS」使用。
-        print(f"    [{market} PER 目標日] {target} ...", flush=True)
-        try:
-            rows = (_twse_per_day(target) if market == "TWSE" else _tpex_per_day(target))
-            vals = []
-            for r in rows:
-                sid = str(r["stock_id"])
-                if sid not in ids:
-                    continue
-                pe = clean_num(r.get("per"))
-                if pe is None or pe <= 0:
-                    continue
-                vals.append((sid, target.isoformat(), pe, clean_num(r.get("pbr")),
-                             clean_num(r.get("dividend_yield")), f"{market}-official-daily-PER"))
-            if vals:
-                conn.executemany("""INSERT OR REPLACE INTO valuation_pe_history
-                    (stock_id,date,per,pbr,dividend_yield,source) VALUES (?,?,?,?,?,?)""", vals)
-                total_written += len(vals)
-                conn.commit()
-        except Exception as e:
-            errors.append(f"{market} target PER:{e}")
+        # target 當日：若已跑過同一日就直接沿用。
+        existing_today=int(conn.execute("SELECT COUNT(DISTINCT stock_id) FROM valuation_pe_history WHERE source=? AND date=? AND per>0",
+                                        (source,target.isoformat())).fetchone()[0])
+        if existing_today<threshold:
+            try:
+                rows=(_twse_per_day(target) if market=="TWSE" else _tpex_per_day(target))
+                vals=[]
+                for r in rows:
+                    sid=str(r["stock_id"]); pe=clean_num(r.get("per"))
+                    if sid not in ids or pe is None or pe<=0: continue
+                    vals.append((sid,target.isoformat(),pe,clean_num(r.get("pbr")),clean_num(r.get("dividend_yield")),source))
+                if vals:
+                    conn.executemany("""INSERT OR REPLACE INTO valuation_pe_history
+                        (stock_id,date,per,pbr,dividend_yield,source) VALUES (?,?,?,?,?,?)""",vals)
+                    conn.commit(); total_written+=len(vals)
+            except Exception as e:
+                errors.append(f"{market} target PER:{e}")
 
-    counts = {}
-    for sid in meta:
-        counts[sid] = int(conn.execute(
-            "SELECT COUNT(*) FROM valuation_pe_history WHERE stock_id=? AND date>=? AND date<=? AND per>0",
-            (sid, start.isoformat(), target.isoformat())).fetchone()[0])
-    ok = sum(n >= min_samples for n in counts.values())
-    short = sum(0 < n < min_samples for n in counts.values())
-    missing = sum(n == 0 for n in counts.values())
-    msg = (f"TWSE/TPEx 官方每日PER，近{years}年採月底交易日抽樣＋目標日；"
-           f"{len(meta)}檔：足夠(>={min_samples}) {ok}、短樣本 {short}、無資料 {missing}；寫入 {total_written} 筆")
-    if errors:
-        msg += "；首批錯誤=" + " | ".join(errors[:3])
-    # 無 PER 可能是虧損、剛上市或交易所本來不提供，不應把整個來源判為不完整；只有實際請求錯誤才算不完整。
-    record_source(conn, target, "官方PER歷史", target.isoformat(), ok + short > 0, len(errors) == 0, msg)
+    counts={sid:int(conn.execute("SELECT COUNT(*) FROM valuation_pe_history WHERE stock_id=? AND date>=? AND date<=? AND per>0",
+                                 (sid,start_day.isoformat(),target.isoformat())).fetchone()[0]) for sid in meta}
+    ok=sum(n>=min_samples for n in counts.values()); short=sum(0<n<min_samples for n in counts.values()); missing=sum(n==0 for n in counts.values())
+    msg=(f"增量PER：歷史快取月份跳過 {skipped_months} 次，只補新月/缺漏月＋目標日；{len(meta)}檔：足夠 {ok}、短樣本 {short}、無資料 {missing}；本次新增/更新 {total_written} 筆")
+    if errors: msg += "；首批錯誤="+" | ".join(errors[:3])
+    record_source(conn,target,"官方PER歷史",target.isoformat(),ok+short>0,len(errors)==0,msg)
 
 
 def _backfill_valuation_price_history(conn: sqlite3.Connection, target: dt.date, meta: Dict[str, Tuple[str, str]],
