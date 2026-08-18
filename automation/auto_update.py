@@ -79,8 +79,26 @@ def main():
             env=os.environ.copy(); env['RS_TARGET_DATE']=target.isoformat(); env['TZ']='Asia/Taipei'
             rc=run([sys.executable,'-u','rs_breadth.py','--date',target.isoformat()],RS_DIR,env)
             if rc!=0: errors.append(f'RS exit={rc}')
-            rs_out=latest_file(RS_DIR/'output','*_RS強勢股市場廣度_極值趨勢.xlsx')
-            if rs_out: rs_date=excel_latest(rs_out,'每日強勢股數量',0)
+            # v2.5.2: 只接受目標日期且確實含新版欄位的 RS 輸出。
+            required_rs_cols={'Wade內部強度分數','市場總結白話','操作建議'}
+            target_tag=target.strftime('%Y%m%d')
+            candidates=sorted(
+                (RS_DIR/'output').glob(f'*_{target_tag}_RS強勢股市場廣度_極值趨勢.xlsx'),
+                key=lambda p:p.stat().st_mtime,
+                reverse=True
+            )
+            rs_out=None
+            for cand in candidates:
+                cand_date=excel_latest(cand,'每日強勢股數量',0)
+                cand_schema=excel_has_columns(cand,'每日強勢股數量',required_rs_cols,0)
+                print(f'[RS OUTPUT] {cand.name} date={cand_date} v2.5_schema={cand_schema}',flush=True)
+                if cand_date==target and cand_schema:
+                    rs_out=cand
+                    rs_date=cand_date
+                    break
+            if rs_out is None:
+                errors.append('RS output missing v2.5 schema or target date')
+                print('[ERROR] 找不到含 v2.5 新欄位且日期正確的 RS 輸出檔。',flush=True)
         if duck_date!=target or schema_upgrade:
             env=os.environ.copy(); env['TZ']='Asia/Taipei'
             rc=run([sys.executable,'-u','stock_duckbill.py','--update','--date',target.isoformat()],DUCK_DIR,env)
@@ -92,9 +110,21 @@ def main():
             print(f'[WAIT] New trading data not complete. Sleep {args.retry_minutes} minutes.',flush=True)
             time.sleep(max(0,args.retry_minutes)*60)
     # copy only results that are not older than current published files
-    if rs_out and rs_out.exists() and rs_date and (not existing_rs or rs_date>=existing_rs): shutil.copy2(rs_out,ROOT/'rs_latest.xlsx')
+    if rs_out and rs_out.exists() and rs_date and (not existing_rs or rs_date>=existing_rs):
+        shutil.copy2(rs_out,ROOT/'rs_latest.xlsx')
+        # 複製後再次確認正式 rs_latest.xlsx 真的是新版格式。
+        published_schema_ok=excel_has_columns(
+            ROOT/'rs_latest.xlsx',
+            '每日強勢股數量',
+            {'Wade內部強度分數','市場總結白話','操作建議'},
+            0
+        )
+        print(f'[RS PUBLISH] copied={rs_out.name} schema_ok={published_schema_ok}',flush=True)
+        if not published_schema_ok:
+            errors.append('Published rs_latest.xlsx still missing v2.5 schema')
+            rs_date=None
     if duck_out and duck_out.exists() and duck_date and (not existing_duck or duck_date>=existing_duck): shutil.copy2(duck_out,ROOT/'duck_latest.xlsx')
-    if rs_date==target and duck_date==target:
+    if rs_date==target and duck_date==target and not errors:
         status='success'; msg=f'{target} 兩套系統皆已更新完成。'
     elif (rs_date and rs_date>=target) or (duck_date and duck_date>=target):
         status='partial'; msg=f'部分更新完成：RS={rs_date}、鴨嘴={duck_date}。保留各系統最後成功結果。'
