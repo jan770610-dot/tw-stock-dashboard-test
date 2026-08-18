@@ -4,11 +4,10 @@ on:
   schedule:
     - cron: "5 18 * * 1-5"
       timezone: "Asia/Taipei"
-
   workflow_dispatch:
     inputs:
       target_date:
-        description: "指定日期 YYYY-MM-DD；留白 = 台灣當天"
+        description: "指定日期 YYYY-MM-DD；留白 = 自動抓最近已收盤交易日"
         required: false
         type: string
 
@@ -23,11 +22,9 @@ jobs:
   update:
     runs-on: ubuntu-latest
     timeout-minutes: 330
-
     env:
       TZ: Asia/Taipei
       PYTHONUNBUFFERED: "1"
-
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -53,16 +50,19 @@ jobs:
           if [ -n "$MANUAL_DATE" ]; then
             TARGET_DATE="$MANUAL_DATE"
           else
-            TARGET_DATE=$(TZ=Asia/Taipei date +%F)
-            DOW=$(TZ=Asia/Taipei date +%u)
-
-            if [ "$DOW" = "6" ]; then
-              TARGET_DATE=$(TZ=Asia/Taipei date -d "yesterday" +%F)
-            elif [ "$DOW" = "7" ]; then
-              TARGET_DATE=$(TZ=Asia/Taipei date -d "2 days ago" +%F)
-            fi
+            # 與 auto_update.py 使用完全相同的規則：
+            # 台灣時間 16:00 前，視為當日盤後資料尚未完整，抓最近已收盤日。
+            TARGET_DATE=$(python - <<'PYDATE'
+          import datetime as dt
+          from zoneinfo import ZoneInfo
+          now = dt.datetime.now(ZoneInfo("Asia/Taipei"))
+          day = now.date() if now.hour >= 16 else now.date() - dt.timedelta(days=1)
+          while day.weekday() >= 5:
+              day -= dt.timedelta(days=1)
+          print(day.isoformat())
+          PYDATE
+            )
           fi
-
           echo "date=$TARGET_DATE" >> "$GITHUB_OUTPUT"
           echo "TARGET_DATE=$TARGET_DATE"
 
@@ -74,9 +74,7 @@ jobs:
             automation/duckbill/stock.db-wal
             automation/duckbill/stock.db-shm
             automation/rs/cache
-
           key: tw-stock-runtime-${{ runner.os }}-${{ steps.target.outputs.date }}
-
           restore-keys: |
             tw-stock-runtime-${{ runner.os }}-
 
@@ -84,45 +82,28 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
-
         run: |
           if [ ! -f automation/duckbill/stock.db ] || [ ! -d automation/rs/cache ]; then
-
-            echo "Runtime cache miss; downloading seed..."
-
+            echo "Runtime cache miss; downloading 2026-08-14 seed from GitHub Release..."
             mkdir -p /tmp/tw-stock-seed
-
-            gh release download seed-v2 \
-              --pattern "bootstrap_seed_v2.zip" \
-              --dir /tmp/tw-stock-seed
-
+            gh release download seed-v2 --pattern "bootstrap_seed_v2.zip" --dir /tmp/tw-stock-seed
             unzip -q /tmp/tw-stock-seed/bootstrap_seed_v2.zip -d .
-
             test -f automation/duckbill/stock.db
             test -d automation/rs/cache
-
             echo "Seed restored from Release."
-
           else
             echo "Runtime history cache restored."
           fi
 
       - name: Run RS and Duckbill updates
-        run: |
-          python -u automation/auto_update.py \
-            --date "${{ steps.target.outputs.date }}" \
-            --attempts 3 \
-            --retry-minutes 8
+        run: python -u automation/auto_update.py --date "${{ steps.target.outputs.date }}" --attempts 3 --retry-minutes 8
 
       - name: Commit latest results to dashboard
         shell: bash
-
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-
           git add rs_latest.xlsx duck_latest.xlsx update_status.json
-
           if git diff --cached --quiet; then
             echo "No dashboard file changes."
           else
