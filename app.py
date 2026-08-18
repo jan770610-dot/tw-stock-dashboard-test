@@ -189,7 +189,9 @@ def stage_plain(stage):
         "高檔轉弱":"市場仍在高位，但內部強勢股開始退潮"}.get(stage,"市場結構暫無明確方向")
 
 def infer_action(stage,wade_score,left_alert,early_signal):
-    if text(left_alert,"—")!="—": return "分批減碼／汰弱留強"
+    level=risk_signal_level(left_alert)
+    if level=="reduce": return "分批減碼／汰弱留強"
+    if level=="watch": return "停止擴大曝險／風險觀察"
     try: score=float(wade_score)
     except Exception: score=None
     if stage in {"中段走弱","低檔續弱"} and (score is None or score<45): return "防守降低曝險"
@@ -213,8 +215,11 @@ def stage_flow_html(stage):
 
 def action_level(stage, wade_score, market_lr_phase, left_alert, left_score=None, right_score=None, wade_change5=None):
     """把詳細建議濃縮成可直接執行的操作語言；左側與右側分開表達。"""
-    if text(left_alert,"—") != "—" or "減碼" in text(market_lr_phase,""):
+    risk_level=risk_signal_level(left_alert)
+    if risk_level=="reduce" or "減碼" in text(market_lr_phase,""):
         return "⚠️ 分批減碼／汰弱留強"
+    if risk_level=="watch" or "風險升高" in text(market_lr_phase,""):
+        return "🟡 停止加碼／風險觀察"
     score=_num(wade_score)
     left=_num(left_score,0) or 0
     right=_num(right_score,0) or 0
@@ -347,31 +352,60 @@ def signal_display(v):
     return text(v,"—") if signal_active(v) else "未觸發"
 
 
-def signal_streak_stats(df, col):
-    """統計事件型訊號的連續天數；每天重新判定，不做固定延長。"""
-    empty={"目前連續":0,"段數":0,"中位數":None,"80百分位":None,"最長":None}
+def signal_streak_stats(df, col, predicate=None):
+    """統計事件型訊號連續天數。
+    predicate 可用來只統計某一級事件，例如只算真正橘色『向上減碼』，不把黃色風險觀察混在一起。
+    """
+    empty={
+        "目前連續":0,"段數":0,"中位數":None,"80百分位":None,"最長":None,
+        "開始日期":None,"上次連續":0,"上次開始日期":None,"上次結束日期":None
+    }
     if df is None or df.empty or col not in df.columns:
         return empty
-    flags=[signal_active(v) for v in df[col].tolist()]
-    runs=[]; cur=0
-    for on in flags:
-        if on:
-            cur+=1
-        elif cur:
-            runs.append(cur); cur=0
-    if cur: runs.append(cur)
+    x=df.copy()
+    if "日期" in x.columns:
+        x=x.sort_values("日期").reset_index(drop=True)
+        dates=normalize_date_series(x["日期"])
+    else:
+        x=x.reset_index(drop=True)
+        dates=pd.Series([pd.NaT]*len(x))
+    fn=predicate or signal_active
+    flags=[]
+    for v in x[col].tolist():
+        try: flags.append(bool(fn(v)))
+        except Exception: flags.append(False)
+    runs=[]; run_start=None
+    for i,on in enumerate(flags):
+        if on and run_start is None:
+            run_start=i
+        if run_start is not None and ((not on) or i==len(flags)-1):
+            end_i=(i if on and i==len(flags)-1 else i-1)
+            runs.append((run_start,end_i,end_i-run_start+1))
+            run_start=None
     current=0
     for on in reversed(flags):
         if on: current+=1
         else: break
     if not runs: return empty
-    s=pd.Series(runs,dtype="float64")
+    lens=pd.Series([r[2] for r in runs],dtype="float64")
+    current_start=None
+    if current>0:
+        idx=len(flags)-current
+        if idx < len(dates) and not pd.isna(dates.iloc[idx]):
+            current_start=dates.iloc[idx].strftime("%Y-%m-%d")
+    prior=None
+    if current>0 and len(runs)>=2: prior=runs[-2]
+    elif current==0 and runs: prior=runs[-1]
+    prev_len=prior[2] if prior else 0
+    prev_start=prev_end=None
+    if prior:
+        a,b,_=prior
+        if a<len(dates) and not pd.isna(dates.iloc[a]): prev_start=dates.iloc[a].strftime("%Y-%m-%d")
+        if b<len(dates) and not pd.isna(dates.iloc[b]): prev_end=dates.iloc[b].strftime("%Y-%m-%d")
     return {
-        "目前連續":int(current),
-        "段數":int(len(runs)),
-        "中位數":float(s.median()),
-        "80百分位":float(s.quantile(.8)),
-        "最長":int(s.max()),
+        "目前連續":int(current),"段數":int(len(runs)),
+        "中位數":float(lens.median()),"80百分位":float(lens.quantile(.8)),"最長":int(lens.max()),
+        "開始日期":current_start,"上次連續":int(prev_len),"上次開始日期":prev_start,"上次結束日期":prev_end,
     }
 
 
@@ -384,7 +418,43 @@ def signal_stat_text(stats):
 
 def signal_current_text(stats):
     cur=int((stats or {}).get("目前連續",0) or 0)
-    return f"目前第 {cur} 天" if cur>0 else "目前未觸發"
+    if cur>0:
+        start=(stats or {}).get("開始日期")
+        return f"目前第 {cur} 天" + (f"｜起始 {start}" if start else "")
+    prev=int((stats or {}).get("上次連續",0) or 0)
+    end=(stats or {}).get("上次結束日期")
+    if prev>0:
+        return f"目前未觸發｜上次 {prev} 天" + (f"（至 {end}）" if end else "")
+    return "目前未觸發"
+
+
+def risk_signal_level(v):
+    """把既有左側減碼警示拆成『黃色風險觀察』與真正『橘色向上減碼』。"""
+    s=text(v,"—")
+    if not signal_active(s): return "none"
+    if "🟠" in s or "左側減碼" in s or "高檔內部轉弱" in s:
+        return "reduce"
+    return "watch"
+
+
+def early_signal_phase(stats):
+    cur=int((stats or {}).get("目前連續",0) or 0)
+    if cur<=0: return "未觸發"
+    if cur==1: return "🟢 第1天｜初現"
+    if cur==2: return "🟢🟢 第2天｜確認"
+    return f"🚀 第{cur}天｜持續轉強"
+
+
+def risk_signal_phase(value, risk_stats, reduce_stats):
+    level=risk_signal_level(value)
+    if level=="none": return "未觸發"
+    if level=="watch":
+        cur=max(1,int((risk_stats or {}).get("目前連續",0) or 0))
+        return f"🟡 第{cur}天｜風險升高觀察"
+    cur=max(1,int((reduce_stats or {}).get("目前連續",0) or 0))
+    if cur==1: return "🟠 第1天｜向上減碼觀察"
+    if cur==2: return "🟠 第2天｜風險升高"
+    return f"🔴 第{cur}天｜持續退潮"
 
 
 def signal_event_backtest(df, signal_col, price_col, mode="up", horizons=(5,10,20)):
@@ -419,6 +489,127 @@ def signal_event_backtest(df, signal_col, price_col, mode="up", horizons=(5,10,2
             "符合方向%":round(float(success),1),"平均區間最大回撤%":round(float(pd.Series(dds).mean()),2)
         })
     return pd.DataFrame(rows)
+
+
+def market_exposure_plan(row, market_lr, quality, early_stats, risk_value, reduce_stats):
+    """把市場狀態轉成『股票總曝險參考區間』。
+    這是相對風險預算，不是總資產配置，也不是最佳化後的固定答案。
+    """
+    stage=text(first_value(row,["市場階段"]),"")
+    wade=_num(first_value(row,["Wade內部強度分數"]),50) or 50
+    w5=_num(first_value(row,["Wade分數5日變化"]),0) or 0
+    left=_num(market_lr.get("左側分數"),0) or 0
+    right=_num(market_lr.get("右側分數"),0) or 0
+    consistency=_num((quality or {}).get("訊號一致度"),50) or 50
+    early_days=int((early_stats or {}).get("目前連續",0) or 0)
+    reduce_days=int((reduce_stats or {}).get("目前連續",0) or 0)
+    risk=risk_signal_level(risk_value)
+
+    base={
+        "低檔續弱":(10,25),"低檔整理":(15,30),"低檔回升":(25,40),
+        "中段走弱":(20,35),"中段整理":(30,50),"中段回升":(50,70),
+        "高檔轉弱":(20,40),"高檔整理":(40,60),"高檔續強":(60,80),
+    }.get(stage,(25,45))
+    lo,hi=base
+    reasons=[]
+
+    if early_days>=2 and stage in {"低檔回升","中段回升"}:
+        lo+=5; hi+=10; reasons.append(f"早期轉強已連續{early_days}天")
+    elif early_days==1:
+        hi+=5; reasons.append("早期轉強初現")
+    if right>=70 and wade>=60:
+        lo+=5; hi+=5; reasons.append("右側與Wade同步確認")
+    elif left>=65 and right<60:
+        reasons.append("左側優勢高於右側，仍採分批")
+    if w5<=-8:
+        lo-=5; hi-=5; reasons.append("Wade 5日結構仍弱")
+    if consistency<45:
+        lo-=5; hi-=10; reasons.append("訊號一致度偏低")
+    elif consistency>=68:
+        hi+=5; reasons.append("訊號一致度較高")
+
+    if risk=="watch":
+        hi-=10; reasons.append("黃色風險觀察：停止擴大曝險")
+    elif risk=="reduce":
+        lo=min(lo,30); hi=min(hi,45)
+        if reduce_days>=2: lo-=5; hi-=10
+        if reduce_days>=3: lo-=5; hi-=5
+        reasons.append(f"向上減碼訊號第{max(1,reduce_days)}天")
+
+    lo=max(0,min(90,int(round(lo/5)*5)))
+    hi=max(lo+5,min(95,int(round(hi/5)*5)))
+    if hi<=25: label="低曝險"
+    elif hi<=45: label="中低曝險"
+    elif hi<=65: label="中等曝險"
+    elif hi<=80: label="中高曝險"
+    else: label="高曝險"
+    return {
+        "下限":lo,"上限":hi,"顯示":f"{lo}–{hi}%","層級":label,
+        "說明":"；".join(reasons[:4]) or "依市場階段與左右側分數設定",
+        "註記":"以你自行設定的股票最大風險預算為100%，不是總資產配置。"
+    }
+
+
+def stock_action_plan(left, right, heat, rs, complete, formal, pre, exit_today, today_new, rec, ma20=None, ma20chg=0):
+    """把左/右/過熱三軸翻譯成可操作的動作標籤與下一步條件。"""
+    l=_num(left,0) or 0; r=_num(right,0) or 0; h=_num(heat,0) or 0
+    rsn=_num(rs); comp=_num(complete,0) or 0; recv=_num(rec,0) or 0
+    pre_s=text(pre,"")
+
+    if exit_today:
+        tag="🛑 退出"
+    elif h>=85 and r>=60:
+        tag="🟠 分批減碼"
+    elif h>=70 and r>=60:
+        tag="⚠️ 停止追價"
+    elif l>=65 and r>=65 and h<70:
+        tag="↗️ 可逐步加碼"
+    elif r>=75 and h<70:
+        tag="🚀 偏多持有"
+    elif r>=58 and h<70:
+        tag="📈 右側試單"
+    elif l>=65 and h<70:
+        tag="🌱 左側試單"
+    elif recv>=45 or "A級" in pre_s or "B級" in pre_s:
+        tag="👀 觀察"
+    else:
+        tag="⏳ 等待"
+
+    # 下一個加碼/升級條件：只列當下還缺的重要條件，避免每列都一樣。
+    need=[]
+    if exit_today:
+        need=["重新形成A級預備或正式鴨嘴","右側重新≥58"]
+    elif h>=70:
+        need=["先不加碼","過熱<70且右側維持≥65"]
+    else:
+        if r<70: need.append("右側≥70")
+        if rsn is None or rsn<75: need.append("RS≥75")
+        if not formal and comp<100: need.append("鴨嘴正式成立")
+        if h>=55: need.append("過熱<70")
+        if not need:
+            need=["回檔守住MA20","右側維持≥75","過熱<70"]
+    add_condition="＋".join(need[:3])
+
+    invalid=["鴨嘴退出","右側<45"]
+    if ma20 is not None:
+        invalid.insert(0,"跌破MA20且月線轉下")
+    if l>=65 and r<58:
+        invalid=["左側<45","復甦/基本面同步轉弱"] + invalid[:1]
+    invalid_condition="／".join(invalid[:3])
+
+    if exit_today:
+        change="⬇️ 今日降級：鴨嘴退出"
+    elif today_new:
+        change="⬆️ 今日升級：正式鴨嘴新進"
+    elif formal:
+        change="➡️ 維持右側結構"
+    elif "A級" in pre_s:
+        change="⬆️ 接近升級：A級預備"
+    elif "B級" in pre_s:
+        change="➡️ 培育中：B級預備"
+    else:
+        change="—"
+    return tag, add_condition, invalid_condition, change
 
 
 def overheat_label(score):
@@ -556,9 +747,13 @@ def market_lr_assessment(row):
     right += max(0,min(7,(lead-40)*0.18))
     right=max(0,min(100,right))
 
-    if reduce!="—" or (stage=="高檔轉弱" and w5<=-5):
+    reduce_level=risk_signal_level(reduce)
+    if reduce_level=="reduce" or (stage=="高檔轉弱" and w5<=-5):
         phase="⚠️ 向上減碼觀察"
         action="停止追高；持有強股可續抱，但分批鎖利／汰弱留強"
+    elif reduce_level=="watch":
+        phase="🟡 風險升高觀察"
+        action="先停止擴大曝險與追價；尚未視為正式減碼，等待是否升級成高檔內部轉弱"
     elif stage in {"低檔續弱","中段走弱"} and wade<38 and left<55:
         phase="🛡️ 防守／等待"
         action="降低曝險；等市場內部止跌與轉強再提高部位"
@@ -589,7 +784,8 @@ def market_lr_assessment(row):
     elif wade<40: reasons.append(f"Wade內部強度偏弱 {wade:.0f}")
     if w5>=5: reasons.append(f"5日內部強度改善 +{w5:.1f}")
     elif w5<=-5: reasons.append(f"5日內部強度轉弱 {w5:.1f}")
-    if reduce!="—": reasons.append("高檔退潮／向上減碼條件觸發")
+    if reduce_level=="reduce": reasons.append("高檔退潮／向上減碼條件觸發")
+    elif reduce_level=="watch": reasons.append("市場風險升高，但尚未達正式減碼級")
     return {"左側分數":round(left,1),"右側分數":round(right,1),"左右側階段":phase,"左右側建議":action,"判讀依據":"；".join(reasons[:5]) or "目前訊號分散"}
 
 
@@ -668,6 +864,7 @@ def build_stock_lr_table(master, strong, recovery):
         epsg=_num(r.get("EPS年增率%"))
         overheat="過熱" in stage or "不建議追價" in stage
         exit_today=_boolish(r.get("今日退出")) or stage=="今日退出"
+        today_new=_boolish(r.get("今日新進")) or stage.startswith("新進")
         formal=_boolish(r.get("正式鴨嘴")) or stage.startswith("持續符合") or stage.startswith("新進")
         ma20chg=_num(r.get("MA20較前日"),0) or 0
         ma60chg=_num(r.get("MA60較前日"),0) or 0
@@ -685,7 +882,8 @@ def build_stock_lr_table(master, strong, recovery):
         if rs is not None and rs>=95: heat+=12
         elif rs is not None and rs>=85: heat+=8
         if formal or complete>=100: heat+=8
-        if overheat: heat+=18
+        # 若原始鴨嘴狀態已明確標示「過熱／不建議追價」，過熱程度至少進入高檔區，避免文字與分數互相矛盾。
+        if overheat: heat=max(70,heat+18)
         if has_hot_date: heat+=8
         heat=max(0,min(100,heat))
 
@@ -752,14 +950,22 @@ def build_stock_lr_table(master, strong, recovery):
             phase="⏳ 尚未形成優勢"
             action="目前不屬高品質左側或右側機會，等待條件改善"
 
+        op_tag, add_cond, invalid_cond, change_tag = stock_action_plan(
+            left,right,heat,rs,complete,formal,pre,exit_today,today_new,rec,
+            ma20=_num(r.get("MA20")),ma20chg=ma20chg
+        )
         rows.append({
             "左側分數":round(left,1),"右側分數":round(right,1),
             "過熱程度":round(heat,1),"過熱等級":overheat_label(heat),
+            "操作標籤":op_tag,"今日升降級":change_tag,
+            "加碼條件":add_cond,"失效條件":invalid_cond,
             "左右側階段":phase,"系統建議":action,
             "左側依據":"；".join(lreason[:5]) or "—","右側依據":"；".join(rreason[:5]) or "—"
         })
     z=pd.concat([x.reset_index(drop=True),pd.DataFrame(rows)],axis=1)
     z["決策排序分數"]=z[["左側分數","右側分數"]].max(axis=1)
+    action_rank={"↗️ 可逐步加碼":0,"🚀 偏多持有":1,"📈 右側試單":2,"🌱 左側試單":3,"👀 觀察":4,"⚠️ 停止追價":5,"🟠 分批減碼":6,"🛑 退出":7,"⏳ 等待":8}
+    z["操作排序"]=z["操作標籤"].map(action_rank).fillna(9)
     return z
 
 def breadth_chart(df, days=120):
@@ -837,6 +1043,8 @@ tpex_rel=first_value(rs_latest,["櫃買相對強弱分數"])
 leadership_score=first_value(rs_latest,["主流延續分數"])
 market_summary_plain=text(first_value(rs_latest,["市場總結白話"]), market_signal(stage)+"："+stage_plain(stage))
 operation_action=text(first_value(rs_latest,["操作建議"]), infer_action(stage,wade_score,left_alert,early_signal))
+if risk_signal_level(left_alert)=="watch": operation_action="停止擴大曝險／風險觀察"
+elif risk_signal_level(left_alert)=="reduce": operation_action="分批減碼／汰弱留強"
 market_lr=market_lr_assessment(rs_latest)
 quality=market_confidence(rs_latest,market_lr)
 wade_day_change=metric_day_change(daily,"Wade內部強度分數")
@@ -856,12 +1064,16 @@ pre_a=int(pre_status.str.contains("A級").sum()) if not pre_status.empty else 0
 pre_b=int(pre_status.str.contains("B級").sum()) if not pre_status.empty else 0
 update_status=load_update_status()
 left_signal_stats=signal_streak_stats(daily,"左側減碼警示")
+left_reduce_stats=signal_streak_stats(daily,"左側減碼警示",lambda v: risk_signal_level(v)=="reduce")
 early_signal_stats=signal_streak_stats(daily,"早期轉強訊號")
 left_alert_show=signal_display(left_alert)
 early_signal_show=signal_display(early_signal)
+left_signal_phase=risk_signal_phase(left_alert,left_signal_stats,left_reduce_stats)
+early_signal_phase=early_signal_phase(early_signal_stats)
+exposure_plan=market_exposure_plan(rs_latest,market_lr,quality,early_signal_stats,left_alert,left_reduce_stats)
 
 st.title("📈 台股分析中心")
-st.markdown('<div class="hero-sub">RS 市場廣度 × 鴨嘴型態 × 培育中心｜正式網頁版 v2.8｜訊號／過熱整合版</div>',unsafe_allow_html=True)
+st.markdown('<div class="hero-sub">RS 市場廣度 × 鴨嘴型態 × 培育中心｜正式網頁版 v2.9｜操作儀表板版</div>',unsafe_allow_html=True)
 
 u_status=update_status.get("status","unknown")
 last_run=update_status.get("last_run_taipei","—")
@@ -877,16 +1089,18 @@ elif u_status=="error" and message: st.error(message)
 st.write("### 今日決策摘要")
 decision_cards([
     ("市場在哪裡",f"{market_signal(stage)}｜{stage}",f"{water}；{stage_plain(stage)}"),
+    ("總曝險參考",exposure_plan["顯示"],f"{exposure_plan['層級']}｜{exposure_plan['說明']}"),
     ("現在怎麼做",operation_level,market_lr["左右側建議"]),
-    ("今天變化",wade_timing_text,f"Wade 今日 {signed_num(wade_day_change)}｜5日 {signed_num(wade_change5)}"),
+    ("早期轉強",early_signal_phase,signal_current_text(early_signal_stats)),
+    ("風險／減碼",left_signal_phase,signal_current_text(left_reduce_stats if risk_signal_level(left_alert)=="reduce" else left_signal_stats)),
     ("下一個升級／降級條件",short_trigger,next_trigger),
 ])
 st.markdown(
     f'<div class="focus-box"><b>今天只看三件事：</b><br>'
-    f'① 今日變化：{html.escape(day_change_text)}<br>'
-    f'② Wade節奏：{html.escape(wade_timing_text)}（今日 {html.escape(signed_num(wade_day_change))}／5日 {html.escape(signed_num(wade_change5))}）<br>'
+    f'① 部位：總曝險參考 <b>{html.escape(exposure_plan["顯示"])}</b>（{html.escape(exposure_plan["層級"])}）<br>'
+    f'② 訊號：早期轉強 {html.escape(early_signal_phase)}；風險/減碼 {html.escape(left_signal_phase)}<br>'
     f'③ 操作：{html.escape(operation_level)}；{html.escape(next_trigger)}<br>'
-    f'<span class="small-note">資料完整度與訊號一致度分開評估；分數不是未來上漲機率。左右側評分為本系統量化代理，不是 Wade 官方公式。</span></div>',
+    f'<span class="small-note">曝險百分比是相對於你自行設定的股票最大風險預算，不是總資產配置。分數不是未來上漲機率；左右側評分為本系統量化代理，不是 Wade 官方公式。</span></div>',
     unsafe_allow_html=True
 )
 st.markdown(stage_flow_html(stage),unsafe_allow_html=True)
@@ -897,10 +1111,11 @@ cards([
     ("RS 強勢股",safe_num(strong_count,0," 檔"),f"占比 {safe_num(strong_pct,2,'%')}／單日 {safe_num(change,0,' 檔')}"),
     ("Wade市場內部",safe_num(wade_score,1," 分"),f"今日 {signed_num(wade_day_change)}／5日 {signed_num(wade_change5)}"),
     ("大盤左右側",market_lr["左右側階段"],f"左 {market_lr['左側分數']:.0f}／右 {market_lr['右側分數']:.0f}"),
+    ("總曝險參考",exposure_plan["顯示"],exposure_plan["層級"]),
     ("資料完整度",f"{quality['資料完整度標籤']}／{quality['資料完整度']:.0f}","今天應有資料是否齊全"),
     ("訊號一致度",f"{quality['訊號一致度標籤']}／{quality['訊號一致度']:.0f}","RS、Wade、廣度、多時間週期是否同向"),
     ("鴨嘴符合",f"{len(all_ok):,} 檔",f"新進 {len(duck_new):,}／退出 {len(duck_exit):,}／A級 {pre_a:,}"),
-    ("復甦候選",f"{len(recovery):,} 檔","跌深後開始修復；非買進訊號"),
+    ("復甦候選",f"{len(recovery):,} 檔","觀察 → 左側試單 → 接近右側確認"),
 ])
 
 tabs=st.tabs(["🏠 總覽","↔️ 左右側決策","📊 RS／市場廣度","🧭 Wade大盤強弱","🌱 復甦候選","🦆 鴨嘴系統","🔥 鴨嘴×培育中心","📐 台指期","🧪 資料品質","🔄 更新資料"])
@@ -909,7 +1124,9 @@ with tabs[0]:
     st.subheader("今日一眼看懂")
     decision_cards([
         ("市場狀態",f"{market_signal(stage)}｜{stage}",stage_plain(stage)),
+        ("總曝險參考",exposure_plan["顯示"],f"{exposure_plan['層級']}｜{exposure_plan['說明']}"),
         ("操作",operation_level,market_lr["左右側建議"]),
+        ("訊號天數",f"轉強：{early_signal_phase}",f"風險：{left_signal_phase}"),
         ("Wade節奏",wade_timing_text,f"目前 {safe_num(wade_score,1)}｜今日 {signed_num(wade_day_change)}｜5日 {signed_num(wade_change5)}"),
         ("下一個確認點",short_trigger,next_trigger),
     ])
@@ -937,14 +1154,25 @@ with tabs[1]:
         ("整體市場",market_lr["左右側階段"],f"左 {market_lr['左側分數']:.0f}／右 {market_lr['右側分數']:.0f}"),
         ("加權指數",twii_lr["階段"],f"左 {twii_lr['左側分數']:.0f}／右 {twii_lr['右側分數']:.0f}"),
         ("櫃買指數",twoii_lr["階段"],f"左 {twoii_lr['左側分數']:.0f}／右 {twoii_lr['右側分數']:.0f}"),
+        ("總曝險參考",exposure_plan["顯示"],f"{exposure_plan['層級']}｜非總資產配置"),
         ("系統建議",market_lr["左右側建議"],"分數是決策輔助，不是自動下單"),
     ])
     ic1,ic2=st.columns(2)
     with ic1: st.info(f"**加權指數：{twii_lr['階段']}**\n\n{twii_lr['建議']}\n\n依據：{twii_lr['依據']}")
     with ic2: st.info(f"**櫃買指數：{twoii_lr['階段']}**\n\n{twoii_lr['建議']}\n\n依據：{twoii_lr['依據']}")
-    st.markdown(f'<div class="action-box"><b>大盤判斷：</b>{html.escape(market_lr["左右側階段"])}<br><b>建議：</b>{html.escape(market_lr["左右側建議"])}<br><b>依據：</b>{html.escape(market_lr["判讀依據"])}<br><span class="small-note">左側高分不等於最低點已出現；右側高分也不代表可以無條件追高。過熱時會優先切換為「向上減碼」。</span></div>',unsafe_allow_html=True)
+    st.markdown(f'<div class="action-box"><b>大盤判斷：</b>{html.escape(market_lr["左右側階段"])}<br><b>建議：</b>{html.escape(market_lr["左右側建議"])}<br><b>依據：</b>{html.escape(market_lr["判讀依據"])}<br><b>總曝險參考：</b>{html.escape(exposure_plan["顯示"])}（{html.escape(exposure_plan["層級"])}）<br><span class="small-note">{html.escape(exposure_plan["註記"])} 左側高分不等於最低點已出現；右側高分也不代表可以無條件追高。過熱時會優先切換為「向上減碼」。</span></div>',unsafe_allow_html=True)
 
     st.divider()
+    st.write("### 今日操作清單")
+    if not stock_lr.empty and "操作標籤" in stock_lr.columns:
+        ac=stock_lr["操作標籤"].value_counts()
+        cards([
+            ("↗️ 可逐步加碼",f"{int(ac.get('↗️ 可逐步加碼',0)):,} 檔","左轉右且未過熱"),
+            ("🚀 偏多持有",f"{int(ac.get('🚀 偏多持有',0)):,} 檔","右側確認且未過熱"),
+            ("⚠️ 停止追價",f"{int(ac.get('⚠️ 停止追價',0)):,} 檔","趨勢仍強但過熱"),
+            ("🟠 分批減碼",f"{int(ac.get('🟠 分批減碼',0)):,} 檔","高右側＋極度過熱"),
+            ("🛑 退出",f"{int(ac.get('🛑 退出',0)):,} 檔","今日退出／結構失效"),
+        ])
     st.write("### 個股左右側判讀")
     if stock_lr.empty:
         st.info("全市場整合資料尚未產生；跑一次正式資料更新後即可使用。")
@@ -952,17 +1180,21 @@ with tabs[1]:
         q=st.text_input("搜尋個股代號／名稱",key="lr_stock_search")
         sx=filter_stock_table(stock_lr.copy(),q)
         stages=["全部"]+sorted(sx["左右側階段"].dropna().astype(str).unique().tolist()) if "左右側階段" in sx.columns else ["全部"]
-        c1,c2,c3,c4=st.columns([1,1,1,1])
-        chosen=c1.selectbox("階段",stages,key="lr_stage")
-        min_left=c2.slider("最低左側分數",0,100,0,5,key="lr_left")
-        min_right=c3.slider("最低右側分數",0,100,0,5,key="lr_right")
-        max_heat=c4.slider("最高過熱程度",0,100,100,5,key="lr_heat")
+        actions=["全部"]+sorted(sx["操作標籤"].dropna().astype(str).unique().tolist()) if "操作標籤" in sx.columns else ["全部"]
+        c1,c2=st.columns(2)
+        action_chosen=c1.selectbox("今天要看什麼動作",actions,key="lr_action")
+        chosen=c2.selectbox("左右側階段",stages,key="lr_stage")
+        c3,c4,c5=st.columns([1,1,1])
+        min_left=c3.slider("最低左側分數",0,100,0,5,key="lr_left")
+        min_right=c4.slider("最低右側分數",0,100,0,5,key="lr_right")
+        max_heat=c5.slider("最高過熱程度",0,100,100,5,key="lr_heat")
+        if action_chosen!="全部": sx=sx[sx["操作標籤"]==action_chosen]
         if chosen!="全部": sx=sx[sx["左右側階段"]==chosen]
         sx=sx[(pd.to_numeric(sx["左側分數"],errors="coerce").fillna(0)>=min_left)&(pd.to_numeric(sx["右側分數"],errors="coerce").fillna(0)>=min_right)]
         if "過熱程度" in sx.columns: sx=sx[pd.to_numeric(sx["過熱程度"],errors="coerce").fillna(0)<=max_heat]
-        sx=sx.sort_values(["決策排序分數","右側分數","左側分數"],ascending=False,na_position="last")
-        show=[c for c in ["代號","名稱","市場","收盤","左右側階段","左側分數","右側分數","過熱程度","過熱等級","系統建議","左側依據","右側依據","RS判讀","復甦分數","鴨嘴階段","預備鴨嘴狀態","鴨嘴完成度%","三率狀態","營收狀態","EPS年增率%","估值狀態","折價率%","合理價"] if c in sx.columns]
-        st.caption(f"符合目前篩選：{len(sx):,} 檔。左側＝提前布局價值；右側＝趨勢確認程度；過熱＝追價風險，三者分開看。")
+        sx=sx.sort_values(["操作排序","決策排序分數","右側分數","左側分數"],ascending=[True,False,False,False],na_position="last")
+        show=[c for c in ["代號","名稱","市場","收盤","操作標籤","今日升降級","加碼條件","失效條件","左右側階段","左側分數","右側分數","過熱程度","過熱等級","系統建議","左側依據","右側依據","RS判讀","復甦分數","鴨嘴階段","預備鴨嘴狀態","鴨嘴完成度%","三率狀態","營收狀態","EPS年增率%","估值狀態","折價率%","合理價"] if c in sx.columns]
+        st.caption(f"符合目前篩選：{len(sx):,} 檔。先看『操作標籤』，再用左側／右側／過熱三軸確認原因；加碼與失效條件是下一步規則，不代表自動下單。")
         st.dataframe(sx[show],hide_index=True,use_container_width=True,height=650)
         with st.expander("怎麼解讀各階段"):
             st.markdown("""
@@ -972,6 +1204,8 @@ with tabs[1]:
 - **🚀 右側確認**：趨勢、型態與相對強度較完整；偏向持有強股，不代表無腦追高。
 - **⚠️ 右側過熱／向上減碼**：趨勢仍可能強，但價格過熱；停止追價並考慮分批鎖利。
 - **🛑 右側失敗／退出觀察**：型態退出或結構失效，先降低部位，等待下一次觸發。
+
+**操作標籤的優先順序**：退出／減碼／停止追價優先於加碼；也就是右側分數可以很高，但若過熱程度太高，仍會顯示「停止追價」或「分批減碼」。
 """)
 
 with tabs[2]:
@@ -993,8 +1227,8 @@ with tabs[3]:
     st.caption("v0.2：把 Wade 公開常看的市場內部概念量化；不是 Wade 官方公式。已納入量價效率、加權/等權同步、櫃買相對強弱與強勢股主流延續性；指數資料抓不到時會自動退回市場內部代理。")
     cards([
         ("市場內部強度",safe_num(wade_score,1," / 100"),wade_state),
-        ("向上減碼觀察",left_alert_show,f"{signal_current_text(left_signal_stats)}｜{signal_stat_text(left_signal_stats)}"),
-        ("早期轉強",early_signal_show,f"{signal_current_text(early_signal_stats)}｜{signal_stat_text(early_signal_stats)}"),
+        ("風險／向上減碼",left_signal_phase,f"原始訊號：{left_alert_show}｜{signal_current_text(left_reduce_stats if risk_signal_level(left_alert)=="reduce" else left_signal_stats)}"),
+        ("早期轉強",early_signal_phase,f"原始訊號：{early_signal_show}｜{signal_current_text(early_signal_stats)}"),
         ("上漲／下跌",f"{safe_num(advance_count,0)}／{safe_num(decline_count,0)}",f"上漲比例 {safe_num(advance_ratio,1,'%')}"),
         ("漲停／跌停*",f"{safe_num(limit_up,0)}／{safe_num(limit_down,0)}","*目前以單日報酬 ±9.5% 近似"),
         ("52週新高／新低",f"{safe_num(new_high,0)}／{safe_num(new_low,0)}","收盤價 250 交易日新高低"),
@@ -1005,14 +1239,19 @@ with tabs[3]:
         ("上市／上櫃等權",f"{safe_num(twse_mean_return,2,'%')}／{safe_num(tpex_mean_return,2,'%')}",f"櫃買相對 {safe_num(tpex_rel,1)}"),
         ("主流延續率",safe_num(leader_retention,1,"%"),f"新領頭股 {safe_num(new_leaders,0)}／延續分數 {safe_num(leadership_score,1)}"),
     ])
-    if left_alert!="—": st.warning(f"目前警示：{left_alert}。這代表高檔內部結構開始退潮，屬分批降低風險的觀察訊號，不等於一次清倉。")
-    elif early_signal!="—": st.success(f"目前訊號：{early_signal}。市場內部改善速度領先價格表現，可觀察是否持續擴散。")
-    else: st.info(f"目前狀態：{wade_state}。尚未觸發明確向上減碼或早期轉強訊號。")
+    if risk_signal_level(left_alert)=="reduce":
+        st.warning(f"目前：{left_signal_phase}｜{left_alert}。屬向上減碼觀察：停止追高、汰弱留強、分批降低風險，不等於一次清倉。")
+    elif risk_signal_level(left_alert)=="watch":
+        st.warning(f"目前：{left_signal_phase}｜{left_alert}。這一級先視為風險升高觀察，優先停止擴大曝險，尚未等同正式減碼訊號。")
+    elif signal_active(early_signal):
+        st.success(f"目前：{early_signal_phase}｜{early_signal}。第1天視為初現，第2天視為確認，第3天以上視為持續轉強。")
+    else:
+        st.info(f"目前狀態：{wade_state}。尚未觸發明確向上減碼或早期轉強訊號。")
 
     st.write("**訊號持續天數／歷史常態**")
     cards([
-        ("向上減碼",signal_current_text(left_signal_stats),signal_stat_text(left_signal_stats)),
-        ("早期轉強",signal_current_text(early_signal_stats),signal_stat_text(early_signal_stats)),
+        ("風險／向上減碼",left_signal_phase,signal_stat_text(left_reduce_stats if risk_signal_level(left_alert)=="reduce" else left_signal_stats)),
+        ("早期轉強",early_signal_phase,signal_stat_text(early_signal_stats)),
     ])
     with st.expander("訊號有效性回測（每段只算第一次觸發）"):
         bt=[]
@@ -1024,7 +1263,7 @@ with tabs[3]:
         if bt:
             bt_show=pd.concat(bt,ignore_index=True)
             st.dataframe(bt_show,hide_index=True,use_container_width=True)
-            st.caption("早期轉強的『符合方向』＝期末上漲；向上減碼的『符合方向』＝期末下跌。樣本少時只供觀察，不應把比例當成固定勝率。")
+            st.caption("早期轉強的『符合方向』＝期末上漲；左側風險欄位的回測仍包含黃色與橘色事件，操作上已分級顯示。樣本少時只供觀察，不應把比例當成固定勝率。")
         else:
             st.info("目前可用的指數歷史或訊號樣本不足；之後每天增量累積後會自動出現 5／10／20 日統計。")
 
@@ -1056,7 +1295,7 @@ with tabs[4]:
             if "狀態" in rx.columns: rx=rx.rename(columns={"狀態":"鴨嘴狀態"})
         # 接入左右側/過熱分數，直接把復甦候選分成三個可理解層級。
         if not stock_lr.empty and "代號" in stock_lr.columns and "代號" in rx.columns:
-            lrcols=[c for c in ["代號","左側分數","右側分數","過熱程度","過熱等級","左右側階段","系統建議","估值狀態","折價率%","合理價"] if c in stock_lr.columns]
+            lrcols=[c for c in ["代號","操作標籤","今日升降級","加碼條件","失效條件","左側分數","右側分數","過熱程度","過熱等級","左右側階段","系統建議","估值狀態","折價率%","合理價"] if c in stock_lr.columns]
             lrtag=stock_lr[lrcols].drop_duplicates("代號")
             rx=rx.merge(lrtag,on="代號",how="left",suffixes=("","_左右側"))
         if "左側分數" not in rx.columns: rx["左側分數"]=0
@@ -1081,7 +1320,7 @@ with tabs[4]:
         sort_cols=["_stage_order"] + (["復甦分數"] if "復甦分數" in rx.columns else [])
         asc=[True] + ([False] if "復甦分數" in rx.columns else [])
         rx=rx.sort_values(sort_cols,ascending=asc,na_position="last").drop(columns=["_stage_order"])
-        front=[c for c in ["代號","名稱","市場","收盤","復甦階段","復甦分數","左側分數","右側分數","過熱程度","過熱等級","左右側階段","系統建議"] if c in rx.columns]
+        front=[c for c in ["代號","名稱","市場","收盤","復甦階段","操作標籤","今日升降級","加碼條件","失效條件","復甦分數","左側分數","右側分數","過熱程度","過熱等級","左右側階段","系統建議"] if c in rx.columns]
         rest=[c for c in rx.columns if c not in front]
         st.dataframe(rx[front+rest],hide_index=True,use_container_width=True,height=620)
 
@@ -1133,7 +1372,7 @@ with tabs[8]:
 
 with tabs[9]:
     st.subheader("更新資料")
-    st.success("v2.5 延續增量更新：股價只補新交易日；RS 舊歷史沿用；財報/營收已有當期資料就不重抓；PER 歷史只補新月份/缺漏月；Yahoo EPS 使用近期快取。排程仍為週一至週五台灣時間 18:05。")
+    st.success("資料更新核心維持既有增量邏輯：股價只補新交易日；RS 舊歷史沿用；財報/營收已有當期資料就不重抓；PER 歷史只補新月份/缺漏月；Yahoo EPS 使用近期快取。排程仍為週一至週五台灣時間 18:05。")
     st.link_button("▶ 手動執行 GitHub Actions 更新",ACTIONS_URL,use_container_width=True)
     st.caption("手動執行：進入 Actions 後按 Run workflow；可留空日期跑當天，也可指定 YYYY-MM-DD。")
     st.divider()
@@ -1154,4 +1393,4 @@ with tabs[9]:
     with open(DEFAULT_RS,"rb") as f: d1.download_button("下載 RS 最新結果",f.read(),file_name="rs_latest.xlsx",mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",use_container_width=True)
     with open(DEFAULT_DUCK,"rb") as f: d2.download_button("下載鴨嘴最新結果",f.read(),file_name="duck_latest.xlsx",mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",use_container_width=True)
 
-st.divider(); st.caption(f"正式版 v2.8｜訊號／過熱整合｜RS：{rs_date}｜鴨嘴：{duck_date}｜量化篩選與市場廣度工具，不構成投資建議。")
+st.divider(); st.caption(f"正式版 v2.9｜操作儀表板｜RS：{rs_date}｜鴨嘴：{duck_date}｜量化篩選與市場廣度工具，不構成投資建議。")
