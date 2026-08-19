@@ -969,6 +969,91 @@ def build_stock_lr_table(master, strong, recovery):
     z["操作排序"]=z["操作標籤"].map(action_rank).fillna(9)
     return z
 
+
+def _clean_cell(v) -> str:
+    try:
+        if pd.isna(v): return ""
+    except Exception:
+        pass
+    s=str(v).strip()
+    return "" if s in {"", "—", "-", "nan", "None", "<NA>"} else s
+
+
+def _short_text(v, limit=72) -> str:
+    s=_clean_cell(v) or "—"
+    return s if len(s)<=limit else s[:max(1,limit-1)]+"…"
+
+
+def stock_duck_summary(row) -> str:
+    stage=_clean_cell(row.get("鴨嘴階段"))
+    pre_s=_clean_cell(row.get("預備鴨嘴狀態"))
+    complete=_num(row.get("鴨嘴完成度%"))
+    if stage:
+        if "退出" in stage: return "🛑 今日退出"
+        if "新進" in stage: return "🔥 今日新進"
+        if "持續符合" in stage or "正式" in stage: return "✅ 正式符合"
+        if "過熱" in stage: return "⚠️ 正式／過熱"
+        return _short_text(stage,18)
+    if "A級" in pre_s: return "🌱 預備 A級"
+    if "B級" in pre_s: return "🌱 預備 B級"
+    if complete is not None and complete>=80: return f"🌱 完成 {complete:.0f}%"
+    if complete is not None and complete>0: return f"進度 {complete:.0f}%"
+    return "—"
+
+
+def stock_cultivation_summary(row) -> str:
+    cat=_clean_cell(row.get("培育中心類別"))
+    tr=_clean_cell(row.get("三率狀態"))
+    rev=_clean_cell(row.get("營收狀態"))
+    tr_ok=(tr=="三率三升") or ("三率三升" in tr)
+    rev_ok=(rev=="營收三增") or ("營收三增" in rev)
+    if tr_ok and rev_ok: return "✅ 三率＋營收"
+    if tr_ok: return "✅ 三率三升"
+    if rev_ok: return "✅ 營收三增"
+    if cat: return _short_text(cat,18)
+    return "—"
+
+
+def stock_valuation_summary(row) -> str:
+    discount=_num(row.get("折價率%"))
+    val=_clean_cell(row.get("估值狀態"))
+    if discount is not None:
+        if discount>=10: return f"折價 {discount:.0f}%"
+        if discount>=0: return f"折價 {discount:.0f}%"
+        return f"溢價 {abs(discount):.0f}%"
+    return _short_text(val,16) if val else "—"
+
+
+def stock_one_line(row) -> str:
+    action=_clean_cell(row.get("操作標籤")) or "⏳ 等待"
+    phase=_clean_cell(row.get("左右側階段")) or "階段未明"
+    duck=stock_duck_summary(row)
+    cult=stock_cultivation_summary(row)
+    heat=_num(row.get("過熱程度"))
+    heat_s=f"{heat:.0f}/100" if heat is not None else "—"
+    return f"{action}｜{phase}；鴨嘴：{duck}；培育：{cult}；過熱：{heat_s}。"
+
+
+def stock_decision_compact(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty: return pd.DataFrame()
+    out=pd.DataFrame(index=df.index)
+    for c in ["代號","名稱","市場","收盤"]:
+        if c in df.columns: out[c]=df[c]
+    out["操作"]=df.apply(lambda r:_clean_cell(r.get("操作標籤")) or "⏳ 等待",axis=1)
+    out["左右側"]=df.apply(lambda r:f"{_num(r.get('左側分數'),0):.0f} / {_num(r.get('右側分數'),0):.0f}",axis=1)
+    out["過熱"]=df.apply(lambda r:f"{_num(r.get('過熱程度'),0):.0f}",axis=1)
+    out["鴨嘴"]=df.apply(stock_duck_summary,axis=1)
+    out["培育"]=df.apply(stock_cultivation_summary,axis=1)
+    if "RS判讀" in df.columns: out["RS"]=pd.to_numeric(df["RS判讀"],errors="coerce").round(1)
+    out["估值"]=df.apply(stock_valuation_summary,axis=1)
+    if "今日升降級" in df.columns: out["今日變化"]=df["今日升降級"].map(lambda v:_clean_cell(v) or "—")
+    return out.reset_index(drop=True)
+
+
+def stock_choice_label(row) -> str:
+    return f"{_clean_cell(row.get('代號'))} {_clean_cell(row.get('名稱'))}｜{_clean_cell(row.get('操作標籤')) or '⏳ 等待'}｜{_clean_cell(row.get('左右側階段')) or '—'}"
+
+
 def breadth_chart(df, days=120):
     cols=[c for c in ["強勢股占比%","5日平均占比%","20日平均占比%","60日平均占比%"] if c in df.columns]
     if "日期" not in df.columns or not cols: return None
@@ -1341,7 +1426,7 @@ def _manual_stock_lookup(manager):
 
 st.title("📈 台股分析中心")
 st.markdown(
-    '<div class="hero-sub">RS 市場廣度 × 鴨嘴型態 × 培育中心｜正式網頁版 v3.2｜背景掃描 × 無阻塞盤中雷達</div>',
+    '<div class="hero-sub">RS 市場廣度 × 鴨嘴型態 × 培育中心｜正式網頁版 v3.3｜背景掃描 × 個股決策中心</div>',
     unsafe_allow_html=True
 )
 
@@ -1472,7 +1557,7 @@ else:
         ("復甦候選", f"{len(recovery):,} 檔", "觀察 → 左側試單 → 接近右側確認"),
     ])
 
-tabs=st.tabs(["🏠 正式基準","↔️ 左右側決策","📊 RS／市場廣度","🧭 Wade大盤強弱","🌱 復甦候選","🦆 鴨嘴系統","🔥 鴨嘴×培育中心","📐 台指期","🧪 資料品質","🔄 更新資料"])
+tabs=st.tabs(["🏠 正式基準","🎯 個股決策中心","📊 RS／市場廣度","🧭 Wade大盤強弱","🌱 復甦候選","📐 台指期","🧪 資料品質","🔄 更新資料"])
 
 with tabs[0]:
     st.subheader("正式收盤基準／歷史比較")
@@ -1501,66 +1586,151 @@ with tabs[0]:
 
 
 with tabs[1]:
-    st.subheader("左右側決策中心")
-    st.caption("左側＝價格尚未完全確認前，從價值/低位/修復找機會；右側＝等價格與市場結構證明後再增加部位。以下為本系統量化代理，不是 Wade 官方公式。")
-    st.write("### 大盤／指數判讀")
+    st.subheader("🎯 個股決策中心")
+    st.caption("把左右側決策、鴨嘴型態、培育中心與估值放在同一頁。先用精簡主表找標的，再看單檔決策卡；原始鴨嘴／培育清單收在頁面最下方。")
+
+    # 市場環境只保留真正會影響個股決策的摘要，避免一進頁面先被大段文字淹沒。
     cards([
         ("整體市場",market_lr["左右側階段"],f"左 {market_lr['左側分數']:.0f}／右 {market_lr['右側分數']:.0f}"),
         ("加權指數",twii_lr["階段"],f"左 {twii_lr['左側分數']:.0f}／右 {twii_lr['右側分數']:.0f}"),
         ("櫃買指數",twoii_lr["階段"],f"左 {twoii_lr['左側分數']:.0f}／右 {twoii_lr['右側分數']:.0f}"),
-        ("總曝險參考",exposure_plan["顯示"],f"{exposure_plan['層級']}｜非總資產配置"),
-        ("系統建議",market_lr["左右側建議"],"分數是決策輔助，不是自動下單"),
+        ("總曝險參考",exposure_plan["顯示"],exposure_plan["層級"]),
+        ("市場操作",operation_level,market_lr["左右側建議"]),
     ])
-    ic1,ic2=st.columns(2)
-    with ic1: st.info(f"**加權指數：{twii_lr['階段']}**\n\n{twii_lr['建議']}\n\n依據：{twii_lr['依據']}")
-    with ic2: st.info(f"**櫃買指數：{twoii_lr['階段']}**\n\n{twoii_lr['建議']}\n\n依據：{twoii_lr['依據']}")
-    st.markdown(f'<div class="action-box"><b>大盤判斷：</b>{html.escape(market_lr["左右側階段"])}<br><b>建議：</b>{html.escape(market_lr["左右側建議"])}<br><b>依據：</b>{html.escape(market_lr["判讀依據"])}<br><b>總曝險參考：</b>{html.escape(exposure_plan["顯示"])}（{html.escape(exposure_plan["層級"])}）<br><span class="small-note">{html.escape(exposure_plan["註記"])} 左側高分不等於最低點已出現；右側高分也不代表可以無條件追高。過熱時會優先切換為「向上減碼」。</span></div>',unsafe_allow_html=True)
+    with st.expander("查看大盤／指數詳細判讀", expanded=False):
+        ic1,ic2=st.columns(2)
+        with ic1: st.info(f"**加權：{twii_lr['階段']}**\n\n{twii_lr['建議']}\n\n依據：{twii_lr['依據']}")
+        with ic2: st.info(f"**櫃買：{twoii_lr['階段']}**\n\n{twoii_lr['建議']}\n\n依據：{twoii_lr['依據']}")
+        st.markdown(f'<div class="action-box"><b>整體市場：</b>{html.escape(market_lr["左右側階段"])}<br><b>建議：</b>{html.escape(market_lr["左右側建議"])}<br><b>依據：</b>{html.escape(market_lr["判讀依據"])}<br><span class="small-note">左側高分不等於最低點已出現；右側高分也不代表可以無條件追高。過熱／退出訊號優先於加碼訊號。</span></div>',unsafe_allow_html=True)
 
-    st.divider()
-    st.write("### 今日操作清單")
+    st.write("### 今日操作分布")
     if not stock_lr.empty and "操作標籤" in stock_lr.columns:
         ac=stock_lr["操作標籤"].value_counts()
         cards([
             ("↗️ 可逐步加碼",f"{int(ac.get('↗️ 可逐步加碼',0)):,} 檔","左轉右且未過熱"),
             ("🚀 偏多持有",f"{int(ac.get('🚀 偏多持有',0)):,} 檔","右側確認且未過熱"),
+            ("🌱 左側試單",f"{int(ac.get('🌱 左側試單',0)):,} 檔","價值／修復條件較完整"),
             ("⚠️ 停止追價",f"{int(ac.get('⚠️ 停止追價',0)):,} 檔","趨勢仍強但過熱"),
             ("🟠 分批減碼",f"{int(ac.get('🟠 分批減碼',0)):,} 檔","高右側＋極度過熱"),
-            ("🛑 退出",f"{int(ac.get('🛑 退出',0)):,} 檔","今日退出／結構失效"),
+            ("🛑 退出",f"{int(ac.get('🛑 退出',0)):,} 檔","結構失效／今日退出"),
         ])
-    st.write("### 個股左右側判讀")
+
     if stock_lr.empty:
         st.info("全市場整合資料尚未產生；跑一次正式資料更新後即可使用。")
     else:
-        q=st.text_input("搜尋個股代號／名稱",key="lr_stock_search")
-        sx=filter_stock_table(stock_lr.copy(),q)
-        stages=["全部"]+sorted(sx["左右側階段"].dropna().astype(str).unique().tolist()) if "左右側階段" in sx.columns else ["全部"]
-        actions=["全部"]+sorted(sx["操作標籤"].dropna().astype(str).unique().tolist()) if "操作標籤" in sx.columns else ["全部"]
-        c1,c2=st.columns(2)
-        action_chosen=c1.selectbox("今天要看什麼動作",actions,key="lr_action")
-        chosen=c2.selectbox("左右側階段",stages,key="lr_stage")
-        c3,c4,c5=st.columns([1,1,1])
-        min_left=c3.slider("最低左側分數",0,100,0,5,key="lr_left")
-        min_right=c4.slider("最低右側分數",0,100,0,5,key="lr_right")
-        max_heat=c5.slider("最高過熱程度",0,100,100,5,key="lr_heat")
-        if action_chosen!="全部": sx=sx[sx["操作標籤"]==action_chosen]
-        if chosen!="全部": sx=sx[sx["左右側階段"]==chosen]
-        sx=sx[(pd.to_numeric(sx["左側分數"],errors="coerce").fillna(0)>=min_left)&(pd.to_numeric(sx["右側分數"],errors="coerce").fillna(0)>=min_right)]
-        if "過熱程度" in sx.columns: sx=sx[pd.to_numeric(sx["過熱程度"],errors="coerce").fillna(0)<=max_heat]
-        sx=sx.sort_values(["操作排序","決策排序分數","右側分數","左側分數"],ascending=[True,False,False,False],na_position="last")
-        show=[c for c in ["代號","名稱","市場","收盤","操作標籤","今日升降級","加碼條件","失效條件","左右側階段","左側分數","右側分數","過熱程度","過熱等級","系統建議","左側依據","右側依據","RS判讀","復甦分數","鴨嘴階段","預備鴨嘴狀態","鴨嘴完成度%","三率狀態","營收狀態","EPS年增率%","估值狀態","折價率%","合理價"] if c in sx.columns]
-        st.caption(f"符合目前篩選：{len(sx):,} 檔。先看『操作標籤』，再用左側／右側／過熱三軸確認原因；加碼與失效條件是下一步規則，不代表自動下單。")
-        st.dataframe(sx[show],hide_index=True,use_container_width=True,height=650)
-        with st.expander("怎麼解讀各階段"):
-            st.markdown("""
-- **🌱 左側布局候選**：有估值/基本面/跌深修復優勢，但趨勢尚未充分確認；適合小部位、分批、等待市場證明。
-- **↗️ 左轉右確認**：原本左側理由仍在，同時價格開始觸發；可從試單逐步升級基本部位。
-- **📈 右側試單**：價格已出現初步觸發，但確認度還沒到高檔；價格繼續證明才增加。
-- **🚀 右側確認**：趨勢、型態與相對強度較完整；偏向持有強股，不代表無腦追高。
-- **⚠️ 右側過熱／向上減碼**：趨勢仍可能強，但價格過熱；停止追價並考慮分批鎖利。
-- **🛑 右側失敗／退出觀察**：型態退出或結構失效，先降低部位，等待下一次觸發。
+        st.write("### ① 一眼比較主表")
+        f1,f2,f3=st.columns([1.3,1,1])
+        q=f1.text_input("搜尋代號／名稱",key="dc_stock_search",placeholder="例如 2330、台積電")
+        actions=["全部"]+sorted(stock_lr["操作標籤"].dropna().astype(str).unique().tolist()) if "操作標籤" in stock_lr.columns else ["全部"]
+        action_chosen=f2.selectbox("操作",actions,key="dc_action")
+        phase_options=["全部"]+sorted(stock_lr["左右側階段"].dropna().astype(str).unique().tolist()) if "左右側階段" in stock_lr.columns else ["全部"]
+        phase_chosen=f3.selectbox("左右側階段",phase_options,key="dc_phase")
 
-**操作標籤的優先順序**：退出／減碼／停止追價優先於加碼；也就是右側分數可以很高，但若過熱程度太高，仍會顯示「停止追價」或「分批減碼」。
-""")
+        sx=filter_stock_table(stock_lr.copy(),q)
+        if action_chosen!="全部": sx=sx[sx["操作標籤"]==action_chosen]
+        if phase_chosen!="全部": sx=sx[sx["左右側階段"]==phase_chosen]
+
+        a1,a2,a3=st.columns(3)
+        duck_filter=a1.selectbox("鴨嘴",["全部","正式／新進","預備 A級","預備 B級","尚未形成"],key="dc_duck")
+        cultivate_filter=a2.selectbox("培育中心",["全部","三率＋營收","三率三升","營收三增","尚無"],key="dc_cultivate")
+        max_heat=a3.slider("最高過熱程度",0,100,100,5,key="dc_heat")
+
+        if "過熱程度" in sx.columns:
+            sx=sx[pd.to_numeric(sx["過熱程度"],errors="coerce").fillna(0)<=max_heat]
+        if duck_filter!="全部":
+            ds=sx.apply(stock_duck_summary,axis=1)
+            if duck_filter=="正式／新進": sx=sx[ds.str.contains("正式|新進",regex=True,na=False)]
+            elif duck_filter=="預備 A級": sx=sx[ds.str.contains("A級",regex=False,na=False)]
+            elif duck_filter=="預備 B級": sx=sx[ds.str.contains("B級",regex=False,na=False)]
+            else: sx=sx[ds.eq("—")]
+        if cultivate_filter!="全部":
+            cs=sx.apply(stock_cultivation_summary,axis=1)
+            if cultivate_filter=="三率＋營收": sx=sx[cs.str.contains("三率＋營收",regex=False,na=False)]
+            elif cultivate_filter=="三率三升": sx=sx[cs.str.contains("三率三升|三率＋營收",regex=True,na=False)]
+            elif cultivate_filter=="營收三增": sx=sx[cs.str.contains("營收三增|三率＋營收",regex=True,na=False)]
+            else: sx=sx[cs.eq("—")]
+
+        sort_cols=[c for c in ["操作排序","決策排序分數","右側分數","左側分數"] if c in sx.columns]
+        if sort_cols:
+            asc=[True,False,False,False][:len(sort_cols)]
+            sx=sx.sort_values(sort_cols,ascending=asc,na_position="last")
+        compact=stock_decision_compact(sx)
+        st.caption(f"符合目前篩選：{len(sx):,} 檔。主表刻意拿掉長篇分析文字；先看操作、左右側、過熱、鴨嘴、培育、RS 與估值。")
+        st.dataframe(compact,hide_index=True,use_container_width=True,height=520)
+
+        st.write("### ② 單檔決策卡")
+        if sx.empty:
+            st.info("目前篩選沒有個股；放寬條件後即可查看單檔決策卡。")
+        else:
+            choice_map={stock_choice_label(r):i for i,r in sx.iterrows()}
+            labels=list(choice_map.keys())
+            selected_label=st.selectbox("選一檔看完整判讀",labels,key="dc_single_stock")
+            r=sx.loc[choice_map[selected_label]]
+            left_v=_num(r.get("左側分數"),0) or 0
+            right_v=_num(r.get("右側分數"),0) or 0
+            heat_v=_num(r.get("過熱程度"),0) or 0
+            duck_s=stock_duck_summary(r)
+            cult_s=stock_cultivation_summary(r)
+            val_s=stock_valuation_summary(r)
+            rs_v=_num(r.get("RS判讀"))
+            rec_v=_num(r.get("復甦分數"))
+            eps_v=_num(r.get("EPS年增率%"))
+            fair_v=_num(r.get("合理價"))
+
+            st.markdown(f"#### {_clean_cell(r.get('代號'))} {_clean_cell(r.get('名稱'))}")
+            decision_cards([
+                ("現在怎麼做",_clean_cell(r.get("操作標籤")) or "⏳ 等待",f"{_clean_cell(r.get('左右側階段')) or '—'}｜左 {left_v:.0f}／右 {right_v:.0f}／過熱 {heat_v:.0f}"),
+                ("為什麼",_short_text(r.get("系統建議"),90),f"左：{_short_text(r.get('左側依據'),48)}｜右：{_short_text(r.get('右側依據'),48)}"),
+                ("加碼條件",_short_text(r.get("加碼條件"),90),"只有條件繼續被價格／基本面證明才升級部位"),
+                ("失效／退出",_short_text(r.get("失效條件"),90),"退出／減碼／過熱警示優先於加碼訊號"),
+            ])
+            decision_cards([
+                ("鴨嘴",duck_s,f"完成度 {safe_num(r.get('鴨嘴完成度%'),0,'%')}｜{_clean_cell(r.get('預備鴨嘴狀態')) or '無預備標記'}"),
+                ("培育中心",cult_s,f"EPS年增 {safe_num(eps_v,1,'%')}｜{_clean_cell(r.get('培育中心類別')) or '—'}"),
+                ("RS／復甦",f"RS {safe_num(rs_v,1)}",f"復甦分數 {safe_num(rec_v,1)}"),
+                ("估值",val_s,f"合理價 {safe_num(fair_v,2)}｜{_clean_cell(r.get('估值狀態')) or '—'}"),
+            ])
+            st.info(f"**一句話判讀：** {stock_one_line(r)}")
+
+        st.write("### ③ 多股橫向比較")
+        st.caption("可選 2～5 檔，把原本散在後面的大量分析欄位收斂成同一張表。")
+        compare_source=sx if not sx.empty else stock_lr
+        compare_map={stock_choice_label(r):i for i,r in compare_source.iterrows()}
+        selected_multi=st.multiselect("選擇要比較的股票",list(compare_map.keys()),key="dc_multi_stock")
+        if len(selected_multi)>5:
+            st.warning("為了單頁可讀性，目前只顯示前 5 檔。")
+            selected_multi=selected_multi[:5]
+        if selected_multi:
+            cm=compare_source.loc[[compare_map[x] for x in selected_multi]].copy()
+            cmp=stock_decision_compact(cm)
+            # 多股比較多帶四個最關鍵的文字欄，仍控制在單頁可讀範圍。
+            cmp["加碼條件"]=cm["加碼條件"].map(lambda v:_short_text(v,42)).values if "加碼條件" in cm.columns else "—"
+            cmp["失效條件"]=cm["失效條件"].map(lambda v:_short_text(v,42)).values if "失效條件" in cm.columns else "—"
+            st.dataframe(cmp,hide_index=True,use_container_width=True,height=min(360,85+48*len(cmp)))
+
+    st.divider()
+    with st.expander("🦆 進階：鴨嘴原始清單／今日新進退出",expanded=False):
+        mode=st.radio("查看",["全部符合","今日新進","今日退出","即將可能符合"],horizontal=True,key="dc_duck_raw_mode")
+        source_map={"全部符合":all_ok,"今日新進":duck_new,"今日退出":duck_exit,"即將可能符合":pre}
+        dfx=source_map[mode].copy()
+        dq=st.text_input("搜尋代號／名稱",key="dc_duck_raw_search")
+        dfx=filter_stock_table(dfx,dq)
+        if mode=="即將可能符合" and "預備鴨嘴狀態" in dfx.columns:
+            grade=st.selectbox("預備等級",["全部","A級","B級"],key="dc_duck_grade")
+            if grade!="全部": dfx=dfx[dfx["預備鴨嘴狀態"].fillna("").astype(str).str.contains(grade)]
+        st.caption(f"顯示 {len(dfx):,} 檔")
+        st.dataframe(clean_duck(dfx),hide_index=True,use_container_width=True,height=500)
+
+    with st.expander("🔥 進階：培育中心交集／估值候選",expanded=False):
+        bmode=st.radio("交集類型",["兩者皆有","三率三升","營收三增","估值買進候選"],horizontal=True,key="dc_breed_mode")
+        bmap={"兩者皆有":both,"三率三升":three_rate,"營收三增":three_rev,"估值買進候選":value_candidates}
+        bx=filter_stock_table(bmap[bmode].copy(),st.text_input("搜尋代號／名稱",key="dc_breed_search"))
+        if bmode=="估值買進候選":
+            cols=[c for c in ["日期","代號","名稱","市場","收盤","合理價","折價率%","估值狀態","鴨嘴狀態","月線乖離率%","培育中心類別","是否鴨嘴"] if c in bx.columns]
+            if "折價率%" in bx.columns: bx=bx.sort_values("折價率%",ascending=False,na_position="last")
+            st.dataframe(bx[cols] if cols else bx,hide_index=True,use_container_width=True,height=500)
+        else:
+            st.dataframe(clean_duck(bx),hide_index=True,use_container_width=True,height=500)
 
 with tabs[2]:
     st.subheader("RS 強勢股市場廣度")
@@ -1711,31 +1881,6 @@ with tabs[4]:
         st.dataframe(rx[front+rest],hide_index=True,use_container_width=True,height=620)
 
 with tabs[5]:
-    st.subheader("鴨嘴型態篩選")
-    mode=st.radio("查看",["全部符合","今日新進","今日退出","即將可能符合"],horizontal=True)
-    source_map={"全部符合":all_ok,"今日新進":duck_new,"今日退出":duck_exit,"即將可能符合":pre}
-    dfx=source_map[mode].copy(); q=st.text_input("搜尋代號／名稱",key="duck_search"); dfx=filter_stock_table(dfx,q)
-    if mode=="全部符合" and "狀態" in dfx.columns:
-        options=sorted([x for x in dfx["狀態"].dropna().astype(str).unique().tolist() if x]); chosen=st.multiselect("狀態篩選",options)
-        if chosen: dfx=dfx[dfx["狀態"].astype(str).isin(chosen)]
-    if mode=="即將可能符合" and "預備鴨嘴狀態" in dfx.columns:
-        grade=st.selectbox("預備等級",["全部","A級","B級"])
-        if grade!="全部": dfx=dfx[dfx["預備鴨嘴狀態"].fillna("").astype(str).str.contains(grade)]
-    st.caption(f"顯示 {len(dfx):,} 檔")
-    st.dataframe(clean_duck(dfx),hide_index=True,use_container_width=True,height=620)
-
-with tabs[6]:
-    st.subheader("鴨嘴 × 基本面培育中心")
-    bmode=st.radio("交集類型",["兩者皆有","三率三升","營收三增","估值買進候選"],horizontal=True)
-    bmap={"兩者皆有":both,"三率三升":three_rate,"營收三增":three_rev,"估值買進候選":value_candidates}
-    bx=filter_stock_table(bmap[bmode].copy(),st.text_input("搜尋代號／名稱",key="both_search"))
-    if bmode=="估值買進候選":
-        cols=[c for c in ["日期","代號","名稱","市場","收盤","合理價","折價率%","估值狀態","鴨嘴狀態","月線乖離率%","培育中心類別","是否鴨嘴"] if c in bx.columns]
-        if "折價率%" in bx.columns: bx=bx.sort_values("折價率%",ascending=False,na_position="last")
-        st.dataframe(bx[cols] if cols else bx,hide_index=True,use_container_width=True,height=620)
-    else: st.dataframe(clean_duck(bx),hide_index=True,use_container_width=True,height=620)
-
-with tabs[7]:
     st.subheader("台指期月／季線鴨嘴參考")
     if tx.empty: st.info("目前沒有台指期資料。")
     else:
@@ -1743,7 +1888,7 @@ with tabs[7]:
         cards([("收盤",safe_num(first.get("收盤"),0),""),("MA20",safe_num(first.get("MA20"),2),""),("MA60",safe_num(first.get("MA60"),2),""),("月季線鴨嘴",mouth_text,"")])
         st.dataframe(tx,hide_index=True,use_container_width=True)
 
-with tabs[8]:
+with tabs[6]:
     st.subheader("資料來源與自動更新狀態")
     st.write("**GitHub Actions 更新狀態**")
     st.json(update_status if update_status else {"狀態":"尚無 update_status.json"})
@@ -1756,7 +1901,7 @@ with tabs[8]:
         else: st.warning(f"有 {len(incomplete)} 個來源標記為部分缺漏／不完整，請看訊息欄。")
         st.dataframe(source_status,hide_index=True,use_container_width=True,height=620)
 
-with tabs[9]:
+with tabs[7]:
     st.subheader("更新資料")
     st.success("資料更新核心維持既有增量邏輯：股價只補新交易日；RS 舊歷史沿用；財報/營收已有當期資料就不重抓；PER 歷史只補新月份/缺漏月；Yahoo EPS 使用近期快取。排程仍為週一至週五台灣時間 18:05。")
     st.link_button("▶ 手動執行 GitHub Actions 更新",ACTIONS_URL,use_container_width=True)
@@ -1779,4 +1924,4 @@ with tabs[9]:
     with open(DEFAULT_RS,"rb") as f: d1.download_button("下載 RS 最新結果",f.read(),file_name="rs_latest.xlsx",mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",use_container_width=True)
     with open(DEFAULT_DUCK,"rb") as f: d2.download_button("下載鴨嘴最新結果",f.read(),file_name="duck_latest.xlsx",mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",use_container_width=True)
 
-st.divider(); st.caption(f"正式版 v3.0｜盤中／正式單一儀表板｜RS：{rs_date}｜鴨嘴：{duck_date}｜量化篩選與市場廣度工具，不構成投資建議。")
+st.divider(); st.caption(f"正式版 v3.3｜背景掃描 × 個股決策中心｜RS：{rs_date}｜鴨嘴：{duck_date}｜量化篩選與市場廣度工具，不構成投資建議。")
