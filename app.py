@@ -1840,14 +1840,16 @@ with tabs[1]:
 
         if "過熱程度" in sx.columns:
             sx=sx[pd.to_numeric(sx["過熱程度"],errors="coerce").fillna(0)<=max_heat]
-        if duck_filter!="全部":
-            ds=sx.apply(stock_duck_summary,axis=1)
+        # pandas 在空 DataFrame 上 apply(axis=1) 可能回傳 DataFrame，
+        # 此時再使用 .str 會發生 AttributeError。篩選已無結果時直接略過後續字串篩選。
+        if duck_filter!="全部" and not sx.empty:
+            ds=sx.apply(stock_duck_summary,axis=1).astype("string")
             if duck_filter=="正式／新進": sx=sx[ds.str.contains("正式|新進",regex=True,na=False)]
             elif duck_filter=="預備 A級": sx=sx[ds.str.contains("A級",regex=False,na=False)]
             elif duck_filter=="預備 B級": sx=sx[ds.str.contains("B級",regex=False,na=False)]
             else: sx=sx[ds.eq("—")]
-        if cultivate_filter!="全部":
-            cs=sx.apply(stock_cultivation_summary,axis=1)
+        if cultivate_filter!="全部" and not sx.empty:
+            cs=sx.apply(stock_cultivation_summary,axis=1).astype("string")
             if cultivate_filter=="三率＋營收": sx=sx[cs.str.contains("三率＋營收",regex=False,na=False)]
             elif cultivate_filter=="三率三升": sx=sx[cs.str.contains("三率三升|三率＋營收",regex=True,na=False)]
             elif cultivate_filter=="營收三增": sx=sx[cs.str.contains("營收三增|三率＋營收",regex=True,na=False)]
