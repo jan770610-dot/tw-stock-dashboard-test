@@ -1,4 +1,4 @@
-name: 個股出場策略回測 v1.1
+name: 個股出場策略回測 v1.2
 
 on:
   workflow_dispatch:
@@ -118,7 +118,7 @@ jobs:
             echo "RS daily history cache restored."
           fi
 
-      - name: Run exit strategy backtest v1.1
+      - name: Run exit strategy backtest v1.2
         shell: bash
         env:
           FETCH_MISSING: ${{ inputs.fetch_missing }}
@@ -140,9 +140,10 @@ jobs:
           echo "--- top summary ---"
           python - <<'PY'
           import pandas as pd
-          x=pd.read_csv('exit_backtest_summary.csv')
-          y=x[(x['類型']!='基準') & (x['群組排名']==1)]
-          print(y[['進場群組','策略','綜合分數','中位報酬%','中位峰值捕捉率%','平均高點回吐%','樣本數','有效觸發率%']].to_string(index=False))
+          x=pd.read_csv('exit_backtest_validation.csv')
+          y=x[x['群組排名']==1]
+          cols=['進場群組','策略','綜合分數','觸發_中位報酬%','觸發_勝率%','觸發_中位持有日','有效觸發率%','年度正報酬率%','可靠度']
+          print(y[cols].to_string(index=False))
           PY
 
       - name: Commit backtest results
@@ -150,11 +151,11 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add exit_backtest_latest.xlsx exit_backtest_summary.csv exit_backtest_status.json
+          git add exit_backtest_latest.xlsx exit_backtest_summary.csv exit_backtest_validation.csv exit_backtest_status.json
           if git diff --cached --quiet; then
             echo "No backtest result changes."
           else
-            git commit -m "research: update exit strategy backtest ${{ steps.dates.outputs.end }}"
+            git commit -m "research: update exit strategy backtest v1.2 ${{ steps.dates.outputs.end }}"
             git pull --rebase origin main
             git push origin HEAD:main
           fi
