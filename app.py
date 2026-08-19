@@ -579,17 +579,151 @@ def market_exposure_plan(row, market_lr, quality, early_stats, risk_value, reduc
     }
 
 
+EXIT_BACKTEST_V12 = {
+    "一般鴨嘴": {
+        "策略": "過熱分數≥80", "門檻": 80,
+        "觸發中位報酬%": 9.375, "觸發勝率%": 87.93,
+        "觸發中位持有日": 7, "有效觸發率%": 52.75,
+    },
+    "可交易強股": {
+        "策略": "過熱分數≥70", "門檻": 70,
+        "觸發中位報酬%": 10.118, "觸發勝率%": 94.77,
+        "觸發中位持有日": 13, "有效觸發率%": 50.33,
+    },
+    "RS85領頭強股": {
+        "策略": "過熱分數≥90", "門檻": 90,
+        "觸發中位報酬%": 11.596, "觸發勝率%": 97.86,
+        "觸發中位持有日": 10, "有效觸發率%": 59.04,
+    },
+}
+
+
+def stock_profit_exit_plan(heat, rs, right, formal, today_new, exit_today,
+                           has_hot_date=False, ma20chg=None, spreadchg=None):
+    """把 v1.2 出場回測轉成單檔『獲利階段／出場階段』。
+
+    重要：回測族群是依進場事件分類；頁面對既有持股只能用目前 RS／右側狀態做管理代理，
+    因此這裡把歷史結果當成獲利保護門檻，不把它當成保證或機械式全數賣出規則。
+    """
+    h=_num(heat,0) or 0
+    rsn=_num(rs)
+    r=_num(right,0) or 0
+    m20=_num(ma20chg)
+    spr=_num(spreadchg)
+
+    if exit_today:
+        return {
+            "獲利階段":"🔴 結構退出",
+            "獲利動作":"退出／大幅降低部位；等待下一次重新觸發",
+            "獲利門檻":"結構失效",
+            "獲利管理類型":"風險控制",
+            "回測參考":"鴨嘴正式失效在回測中不是最佳獲利點；此處只作失敗交易／結構破壞的風險控制。",
+            "二階段確認":"—",
+        }
+
+    if not formal and not today_new:
+        return {
+            "獲利階段":"⚪ 尚未進入獲利管理",
+            "獲利動作":"先等正式鴨嘴／右側確認，再啟動獲利保護門檻",
+            "獲利門檻":"—",
+            "獲利管理類型":"尚未正式進場",
+            "回測參考":"回測以鴨嘴新進事件為共同進場基準；未正式觸發前不套用獲利出場門檻。",
+            "二階段確認":"—",
+        }
+
+    if rsn is not None and rsn >= 85:
+        profile="RS85領頭強股"
+    elif r >= 58:
+        profile="可交易強股"
+    else:
+        profile="一般鴨嘴"
+    ref=EXIT_BACKTEST_V12[profile]
+
+    weak_count=sum([
+        m20 is not None and m20 <= 0,
+        spr is not None and spr <= 0,
+        r < 60,
+    ])
+
+    # 曾進入過熱後又退回 70 以下，且目前至少兩項技術條件同步轉弱：視為二階段退潮。
+    if has_hot_date and h < 70 and weak_count >= 2:
+        stage="🔴 過熱後退潮"
+        action="提高減碼幅度；若結構持續惡化，退出剩餘趨勢部位"
+    elif profile == "RS85領頭強股":
+        if h >= 90:
+            stage="🟠 領頭強股積極鎖利"
+            action="分批減碼／提高移動停利；不再新增部位"
+        elif h >= 85:
+            stage="🟡 領頭強股高熱觀察"
+            action="停止加碼、續抱觀察；接近回測較佳鎖利區"
+        elif h >= 70:
+            stage="🟢 領頭強股續抱"
+            action="停止追價但不急著退出；RS85領頭股可容忍較高過熱"
+        else:
+            stage="🟢 趨勢持有"
+            action="尚未進入領頭強股獲利保護區；依右側結構續抱"
+    elif profile == "可交易強股":
+        if h >= 80:
+            stage="🟠 積極鎖利"
+            action="已超過第一鎖利門檻；分批減碼並提高移動停利"
+        elif h >= 70:
+            stage="🟡 開始鎖利"
+            action="進入回測較佳第一獲利保護區；先分批鎖利，不必一次全退"
+        elif h >= 60:
+            stage="🟡 接近獲利保護區"
+            action="停止追價，準備進入分批鎖利模式"
+        else:
+            stage="🟢 趨勢持有"
+            action="尚未進入獲利保護區；依右側結構續抱"
+    else:
+        if h >= 80:
+            stage="🟠 積極鎖利"
+            action="進入一般鴨嘴回測較佳獲利區；分批減碼／提高移動停利"
+        elif h >= 70:
+            stage="🟡 高熱觀察"
+            action="已偏熱但尚未到一般鴨嘴主要鎖利門檻；停止追價並準備減碼"
+        else:
+            stage="🟢 趨勢持有"
+            action="尚未進入一般鴨嘴獲利保護區；依結構續抱"
+
+    hist=(
+        f"v1.2｜{profile}：{ref['策略']}；真正觸發中位報酬 {ref['觸發中位報酬%']:.2f}%、"
+        f"勝率 {ref['觸發勝率%']:.1f}%、中位第 {ref['觸發中位持有日']} 交易日、"
+        f"60日內觸發率 {ref['有效觸發率%']:.1f}%"
+    )
+    secondary="過熱後若 RS 自持有高點回落 ≥5，再把減碼升級；目前頁面未保存完整持有期 RS 高點，因此先列為下一確認條件。"
+    return {
+        "獲利階段":stage,
+        "獲利動作":action,
+        "獲利門檻":f"過熱 {ref['門檻']}",
+        "獲利管理類型":profile,
+        "回測參考":hist,
+        "二階段確認":secondary,
+    }
+
+
 def stock_action_plan(left, right, heat, rs, complete, formal, pre, exit_today, today_new, rec, ma20=None, ma20chg=0):
-    """把左/右/過熱三軸翻譯成可操作的動作標籤與下一步條件。"""
+    """把左/右/過熱三軸翻譯成可操作的動作標籤與下一步條件。
+
+    v3.4：過熱門檻依 v1.2 回測分層。RS>=85 的領頭強股不再在 70 分就直接進入減碼；
+    一般／可交易股則維持較早的獲利保護。
+    """
     l=_num(left,0) or 0; r=_num(right,0) or 0; h=_num(heat,0) or 0
     rsn=_num(rs); comp=_num(complete,0) or 0; recv=_num(rec,0) or 0
     pre_s=text(pre,"")
+    leader=rsn is not None and rsn>=85
 
     if exit_today:
         tag="🛑 退出"
-    elif h>=85 and r>=60:
+    elif leader and h>=90 and formal:
         tag="🟠 分批減碼"
-    elif h>=70 and r>=60:
+    elif leader and h>=85 and formal:
+        tag="⚠️ 停止追價"
+    elif leader and h>=70 and formal and r>=60:
+        tag="🚀 偏多持有"
+    elif (not leader) and h>=80 and formal:
+        tag="🟠 分批減碼"
+    elif (not leader) and h>=70 and formal:
         tag="⚠️ 停止追價"
     elif l>=65 and r>=65 and h<70:
         tag="↗️ 可逐步加碼"
@@ -604,10 +738,11 @@ def stock_action_plan(left, right, heat, rs, complete, formal, pre, exit_today, 
     else:
         tag="⏳ 等待"
 
-    # 下一個加碼/升級條件：只列當下還缺的重要條件，避免每列都一樣。
     need=[]
     if exit_today:
         need=["重新形成A級預備或正式鴨嘴","右側重新≥58"]
+    elif leader and h>=70:
+        need=["先不加碼","RS維持≥85","領頭股過熱<90或回檔守住結構"]
     elif h>=70:
         need=["先不加碼","過熱<70且右側維持≥65"]
     else:
@@ -639,7 +774,6 @@ def stock_action_plan(left, right, heat, rs, complete, formal, pre, exit_today, 
     else:
         change="—"
     return tag, add_condition, invalid_condition, change
-
 
 def overheat_label(score):
     x=_num(score,0) or 0
@@ -967,12 +1101,18 @@ def build_stock_lr_table(master, strong, recovery, formal_rs=None):
         if exit_today: right-=30; rreason.append("今日退出")
         right=max(0,min(100,right))
 
+        # 右側分數算完後，用完整資訊重建獲利／出場階段。
+        profit_plan=stock_profit_exit_plan(
+            heat,rs,right,formal,today_new,exit_today,has_hot_date=has_hot_date,
+            ma20chg=_num(r.get("MA20較前日")),spreadchg=_num(r.get("開口較前日"))
+        )
+
         if exit_today:
             phase="🛑 右側失敗／退出觀察"
             action="停止新增部位；依原停損/退場規則降低部位，等下一次觸發"
-        elif (overheat or heat>=70) and right>=60:
-            phase="⚠️ 右側過熱／向上減碼"
-            action=f"右側仍強，但過熱程度 {heat:.0f}/100（{overheat_label(heat)}）；不追高，持有者分批鎖利並提高移動停利"
+        elif profit_plan["獲利階段"].startswith("🔴"):
+            phase="🔴 右側退潮／風險退出"
+            action=profit_plan["獲利動作"]
         elif left>=65 and right>=60:
             phase="↗️ 左轉右確認"
             action="原左側試單可轉為基本部位；後續只有價格繼續證明才加碼"
@@ -995,6 +1135,9 @@ def build_stock_lr_table(master, strong, recovery, formal_rs=None):
             phase="⏳ 尚未形成優勢"
             action="目前不屬高品質左側或右側機會，等待條件改善"
 
+        if profit_plan["獲利階段"].startswith(("🟡","🟠")):
+            action=f"{action}｜獲利管理：{profit_plan['獲利動作']}"
+
         op_tag, add_cond, invalid_cond, change_tag = stock_action_plan(
             left,right,heat,rs,complete,formal,pre,exit_today,today_new,rec,
             ma20=_num(r.get("MA20")),ma20chg=ma20chg
@@ -1003,6 +1146,9 @@ def build_stock_lr_table(master, strong, recovery, formal_rs=None):
             "左側分數":round(left,1),"右側分數":round(right,1),
             "過熱程度":round(heat,1),"過熱等級":overheat_label(heat),
             "操作標籤":op_tag,"今日升降級":change_tag,
+            "獲利階段":profit_plan["獲利階段"],"獲利動作":profit_plan["獲利動作"],
+            "獲利門檻":profit_plan["獲利門檻"],"獲利管理類型":profit_plan["獲利管理類型"],
+            "回測參考":profit_plan["回測參考"],"二階段確認":profit_plan["二階段確認"],
             "加碼條件":add_cond,"失效條件":invalid_cond,
             "左右側階段":phase,"系統建議":action,
             "左側依據":"；".join(lreason[:5]) or "—","右側依據":"；".join(rreason[:5]) or "—"
@@ -1075,7 +1221,8 @@ def stock_one_line(row) -> str:
     cult=stock_cultivation_summary(row)
     heat=_num(row.get("過熱程度"))
     heat_s=f"{heat:.0f}/100" if heat is not None else "—"
-    return f"{action}｜{phase}；鴨嘴：{duck}；培育：{cult}；過熱：{heat_s}。"
+    profit=_clean_cell(row.get("獲利階段")) or "⚪ 尚未進入獲利管理"
+    return f"{action}｜{profit}｜{phase}；鴨嘴：{duck}；培育：{cult}；過熱：{heat_s}。"
 
 
 def stock_decision_compact(df: pd.DataFrame) -> pd.DataFrame:
@@ -1084,6 +1231,8 @@ def stock_decision_compact(df: pd.DataFrame) -> pd.DataFrame:
     for c in ["代號","名稱","市場","收盤"]:
         if c in df.columns: out[c]=df[c]
     out["操作"]=df.apply(lambda r:_clean_cell(r.get("操作標籤")) or "⏳ 等待",axis=1)
+    if "獲利階段" in df.columns:
+        out["獲利/出場"]=df.apply(lambda r:_clean_cell(r.get("獲利階段")) or "—",axis=1)
     out["左右側"]=df.apply(lambda r:f"{_num(r.get('左側分數'),0):.0f} / {_num(r.get('右側分數'),0):.0f}",axis=1)
     out["過熱"]=df.apply(lambda r:f"{_num(r.get('過熱程度'),0):.0f}",axis=1)
     out["鴨嘴"]=df.apply(stock_duck_summary,axis=1)
@@ -1472,7 +1621,7 @@ def _manual_stock_lookup(manager):
 
 st.title("📈 台股分析中心")
 st.markdown(
-    '<div class="hero-sub">RS 市場廣度 × 鴨嘴型態 × 培育中心｜正式網頁版 v3.3.1｜背景掃描 × 個股決策中心 × 全市場RS</div>',
+    '<div class="hero-sub">RS 市場廣度 × 鴨嘴型態 × 培育中心｜正式網頁版 v3.4｜獲利階段 × 出場回測 × 個股決策中心</div>',
     unsafe_allow_html=True
 )
 
@@ -1633,7 +1782,7 @@ with tabs[0]:
 
 with tabs[1]:
     st.subheader("🎯 個股決策中心")
-    st.caption("把左右側決策、鴨嘴型態、培育中心與估值放在同一頁。先用精簡主表找標的，再看單檔決策卡；原始鴨嘴／培育清單收在頁面最下方。")
+    st.caption("把左右側、鴨嘴、培育中心、估值與 v1.2 出場回測整合在同一頁。主表先看「現在怎麼做＋獲利/出場階段」，單檔卡再看下一動作；詳細文字收進展開區。")
 
     # 市場環境只保留真正會影響個股決策的摘要，避免一進頁面先被大段文字淹沒。
     cards([
@@ -1660,6 +1809,14 @@ with tabs[1]:
             ("🟠 分批減碼",f"{int(ac.get('🟠 分批減碼',0)):,} 檔","高右側＋極度過熱"),
             ("🛑 退出",f"{int(ac.get('🛑 退出',0)):,} 檔","結構失效／今日退出"),
         ])
+        if "獲利階段" in stock_lr.columns:
+            ps=stock_lr["獲利階段"].fillna("").astype(str)
+            cards([
+                ("🟢 趨勢持有",f"{int(ps.str.startswith('🟢').sum()):,} 檔","尚未到主要獲利保護區"),
+                ("🟡 獲利保護",f"{int(ps.str.startswith('🟡').sum()):,} 檔","停止追價／開始鎖利"),
+                ("🟠 積極鎖利",f"{int(ps.str.startswith('🟠').sum()):,} 檔","分批減碼／提高移動停利"),
+                ("🔴 退潮／退出",f"{int(ps.str.startswith('🔴').sum()):,} 檔","結構風險優先處理"),
+            ])
 
     if stock_lr.empty:
         st.info("全市場整合資料尚未產生；跑一次正式資料更新後即可使用。")
@@ -1701,7 +1858,7 @@ with tabs[1]:
             asc=[True,False,False,False][:len(sort_cols)]
             sx=sx.sort_values(sort_cols,ascending=asc,na_position="last")
         compact=stock_decision_compact(sx)
-        st.caption(f"符合目前篩選：{len(sx):,} 檔。RS 優先採全市場正式排名；若舊 baseline 尚未補齊，暫以強勢／復甦名單備援，真正無資料才顯示「—」。")
+        st.caption(f"符合目前篩選：{len(sx):,} 檔。RS 優先採全市場正式排名；「獲利/出場」依 v1.2 驗證門檻分層：可交易強股70、一般鴨嘴80、RS85領頭強股90。")
         st.dataframe(compact,hide_index=True,use_container_width=True,height=520)
 
         st.write("### ② 單檔決策卡")
@@ -1724,19 +1881,32 @@ with tabs[1]:
             fair_v=_num(r.get("合理價"))
 
             st.markdown(f"#### {_clean_cell(r.get('代號'))} {_clean_cell(r.get('名稱'))}")
+            profit_stage=_clean_cell(r.get("獲利階段")) or "⚪ 尚未進入獲利管理"
+            profit_action=_clean_cell(r.get("獲利動作")) or "—"
+            profit_threshold=_clean_cell(r.get("獲利門檻")) or "—"
+            profit_profile=_clean_cell(r.get("獲利管理類型")) or "—"
+            next_step = profit_action if profit_stage.startswith(("🟡","🟠","🔴")) else (_clean_cell(r.get("加碼條件")) or "等待條件改善")
+
             decision_cards([
                 ("現在怎麼做",_clean_cell(r.get("操作標籤")) or "⏳ 等待",f"{_clean_cell(r.get('左右側階段')) or '—'}｜左 {left_v:.0f}／右 {right_v:.0f}／過熱 {heat_v:.0f}"),
-                ("為什麼",_short_text(r.get("系統建議"),90),f"左：{_short_text(r.get('左側依據'),48)}｜右：{_short_text(r.get('右側依據'),48)}"),
-                ("加碼條件",_short_text(r.get("加碼條件"),90),"只有條件繼續被價格／基本面證明才升級部位"),
-                ("失效／退出",_short_text(r.get("失效條件"),90),"退出／減碼／過熱警示優先於加碼訊號"),
+                ("獲利／出場階段",profit_stage,f"{profit_profile}｜主要門檻 {profit_threshold}"),
+                ("下一個動作",_short_text(next_step,90),_short_text(r.get("二階段確認"),78)),
+                ("失效／退出",_short_text(r.get("失效條件"),90),"結構失效負責風險控制；過熱負責把贏家賣得更漂亮"),
             ])
             decision_cards([
                 ("鴨嘴",duck_s,f"完成度 {safe_num(r.get('鴨嘴完成度%'),0,'%')}｜{_clean_cell(r.get('預備鴨嘴狀態')) or '無預備標記'}"),
-                ("培育中心",cult_s,f"EPS年增 {safe_num(eps_v,1,'%')}｜{_clean_cell(r.get('培育中心類別')) or '—'}"),
                 ("RS／復甦",f"RS {safe_num(rs_v,1)}",f"{_clean_cell(r.get('RS來源')) or '資料不足'}｜復甦分數 {safe_num(rec_v,1)}"),
+                ("培育中心",cult_s,f"EPS年增 {safe_num(eps_v,1,'%')}｜{_clean_cell(r.get('培育中心類別')) or '—'}"),
                 ("估值",val_s,f"合理價 {safe_num(fair_v,2)}｜{_clean_cell(r.get('估值狀態')) or '—'}"),
             ])
             st.info(f"**一句話判讀：** {stock_one_line(r)}")
+            with st.expander("查看完整判讀／回測依據", expanded=False):
+                st.write(f"**系統建議：** {_clean_cell(r.get('系統建議')) or '—'}")
+                st.write(f"**左側依據：** {_clean_cell(r.get('左側依據')) or '—'}")
+                st.write(f"**右側依據：** {_clean_cell(r.get('右側依據')) or '—'}")
+                st.write(f"**加碼條件：** {_clean_cell(r.get('加碼條件')) or '—'}")
+                st.write(f"**回測參考：** {_clean_cell(r.get('回測參考')) or '—'}")
+                st.caption("v1.2 回測以鴨嘴新進為共同進場基準；既有持股的管理類型使用目前 RS／右側狀態做代理，不代表進場當日一定完全屬於同一回測族群。")
 
         st.write("### ③ 多股橫向比較")
         st.caption("可選 2～5 檔，把原本散在後面的大量分析欄位收斂成同一張表。")
@@ -1749,7 +1919,7 @@ with tabs[1]:
         if selected_multi:
             cm=compare_source.loc[[compare_map[x] for x in selected_multi]].copy()
             cmp=stock_decision_compact(cm)
-            # 多股比較多帶四個最關鍵的文字欄，仍控制在單頁可讀範圍。
+            # 多股比較只再帶加碼／失效兩個文字欄；獲利/出場階段已在主表欄位中。
             cmp["加碼條件"]=cm["加碼條件"].map(lambda v:_short_text(v,42)).values if "加碼條件" in cm.columns else "—"
             cmp["失效條件"]=cm["失效條件"].map(lambda v:_short_text(v,42)).values if "失效條件" in cm.columns else "—"
             st.dataframe(cmp,hide_index=True,use_container_width=True,height=min(360,85+48*len(cmp)))
@@ -1970,4 +2140,4 @@ with tabs[7]:
     with open(DEFAULT_RS,"rb") as f: d1.download_button("下載 RS 最新結果",f.read(),file_name="rs_latest.xlsx",mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",use_container_width=True)
     with open(DEFAULT_DUCK,"rb") as f: d2.download_button("下載鴨嘴最新結果",f.read(),file_name="duck_latest.xlsx",mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",use_container_width=True)
 
-st.divider(); st.caption(f"正式版 v3.3.1｜個股決策中心 × 全市場RS｜RS：{rs_date}｜鴨嘴：{duck_date}｜量化篩選與市場廣度工具，不構成投資建議。")
+st.divider(); st.caption(f"正式版 v3.4｜獲利階段 × 出場回測 v1.2 × 個股決策中心｜RS：{rs_date}｜鴨嘴：{duck_date}｜量化篩選與市場廣度工具，不構成投資建議。")
