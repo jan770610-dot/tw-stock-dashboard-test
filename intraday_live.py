@@ -8,6 +8,7 @@ Design goals
 3. Fetch TWSE/TPEx MIS quotes during the session and recompute the same RS
    strong-stock core plus a Wade-style *intraday trial* score.
 4. Make trial/estimated fields explicit in the UI.
+5. Run full-market scans in a background worker so automatic updates never block the UI.
 
 The quote transport intentionally uses only Python stdlib so the dashboard does
 not need a new package merely for the intraday feature.
@@ -23,6 +24,7 @@ import datetime as dt
 import json
 import math
 import time
+import threading
 
 import pandas as pd
 import streamlit as st
@@ -79,8 +81,8 @@ def _fetch_batch(channels: list[str], timeout: int = 8) -> tuple[list[dict], str
         return [], f"{type(e).__name__}: {e}"
 
 
-@st.cache_data(ttl=25, show_spinner=False)
-def fetch_mis_quotes(universe_json: str, batch_size: int = 80, workers: int = 6) -> tuple[pd.DataFrame, list[str]]:
+def _fetch_mis_quotes_raw(universe_json: str, batch_size: int = 80, workers: int = 6) -> tuple[pd.DataFrame, list[str]]:
+    """Pure-Python quote fetcher. Safe to call from the background worker (no Streamlit API)."""
     universe = json.loads(universe_json)
     channels = [_channel(str(r["code"]), str(r["market"])) for r in universe]
     batches = [channels[i:i + batch_size] for i in range(0, len(channels), batch_size)]
@@ -99,7 +101,6 @@ def fetch_mis_quotes(universe_json: str, batch_size: int = 80, workers: int = 6)
         code = _norm_code(m.get("c") or "")
         if not code:
             ch = str(m.get("ch") or "")
-            # ch often looks like 2330.tw; keep a conservative fallback.
             code = ch.split(".")[0].split("_")[-1]
         if not code:
             continue
@@ -107,8 +108,6 @@ def fetch_mis_quotes(universe_json: str, batch_size: int = 80, workers: int = 6)
         last = _f(m.get("z"))
         traded = last is not None
         if last is None:
-            # No trade yet: use the reference close only so breadth doesn't
-            # falsely classify the stock as missing.  Mark it as not traded.
             last = prev
         if last is None:
             continue
@@ -136,9 +135,18 @@ def fetch_mis_quotes(universe_json: str, batch_size: int = 80, workers: int = 6)
     return q, errors
 
 
+@st.cache_data(ttl=25, show_spinner=False)
+def fetch_mis_quotes(universe_json: str, batch_size: int = 80, workers: int = 6) -> tuple[pd.DataFrame, list[str]]:
+    return _fetch_mis_quotes_raw(universe_json, batch_size=batch_size, workers=workers)
+
+
+def _load_baseline_raw(path_s: str) -> pd.DataFrame:
+    return pd.read_pickle(path_s, compression="gzip")
+
+
 @st.cache_data(ttl=300, show_spinner=False)
 def load_baseline(path_s: str, mtime_ns: int) -> pd.DataFrame:
-    return pd.read_pickle(path_s, compression="gzip")
+    return _load_baseline_raw(path_s)
 
 
 def _ratio_strength(v) -> float:
@@ -226,11 +234,18 @@ def _code_set(df: pd.DataFrame) -> set[str]:
     return set(df["代號"].astype(str).str.replace(r"\.0$", "", regex=True).str.strip())
 
 
-def build_snapshot(daily: pd.DataFrame, strong: pd.DataFrame) -> dict:
-    base = load_baseline(str(BASELINE), BASELINE.stat().st_mtime_ns).copy()
+def build_snapshot(daily: pd.DataFrame, strong: pd.DataFrame, use_streamlit_cache: bool = True) -> dict:
+    if use_streamlit_cache:
+        base = load_baseline(str(BASELINE), BASELINE.stat().st_mtime_ns).copy()
+    else:
+        base = _load_baseline_raw(str(BASELINE)).copy()
     base["code"] = base["code"].astype(str)
     universe = base[["code", "market"]].drop_duplicates("code").to_dict("records")
-    q, errors = fetch_mis_quotes(json.dumps(universe, ensure_ascii=False, separators=(",", ":")))
+    universe_json = json.dumps(universe, ensure_ascii=False, separators=(",", ":"))
+    if use_streamlit_cache:
+        q, errors = fetch_mis_quotes(universe_json)
+    else:
+        q, errors = _fetch_mis_quotes_raw(universe_json)
     if q.empty:
         raise RuntimeError("TWSE MIS did not return any usable quotes")
 
@@ -388,7 +403,7 @@ def build_snapshot(daily: pd.DataFrame, strong: pd.DataFrame) -> dict:
     if qt is not None and qt.astype(str).str.len().gt(0).any():
         newest_time = qt.astype(str).replace("", pd.NA).dropna().max()
 
-    # Per-stock diagnostics used by the v3.1 change radar and manual lookup.
+    # Per-stock diagnostics used by the background change radar and manual lookup.
     # These are still intraday trial values; formal inclusion/exit is confirmed after close.
     x["cond_rs"] = x["rs_live"] > RS_THRESHOLD
     x["cond_price_ma200"] = x["last"] > x["ma200_live"]
@@ -425,14 +440,14 @@ def build_snapshot(daily: pd.DataFrame, strong: pd.DataFrame) -> dict:
     x["ma20_gap_pct"] = (x["last"] / x["ma20_live"] - 1.0) * 100.0
 
     live_cols = [
-        "code", "name", "market", "last", "ret_pct", "rs_live",
+        "code", "name", "market", "last", "ret_pct", "rs_live", "ret250",
         "ma20_live", "ma50_live", "ma60_live", "ma200_live", "amount_est",
         "strong_live", "strong_cond_count", "strong_missing", "near_strong",
         "duck_price_live", "ma20_gap_pct",
     ]
     live_stocks = x[live_cols].copy()
     live_stocks = live_stocks.rename(columns={
-        "code": "代號", "name": "名稱", "market": "市場", "last": "盤中價", "ret_pct": "漲跌幅%", "rs_live": "盤中RS",
+        "code": "代號", "name": "名稱", "market": "市場", "last": "盤中價", "ret_pct": "漲跌幅%", "rs_live": "盤中RS", "ret250": "250日報酬試算",
         "ma20_live": "盤中MA20", "ma50_live": "盤中MA50", "ma60_live": "盤中MA60", "ma200_live": "盤中MA200", "amount_est": "盤中成交金額估算",
         "strong_live": "盤中強勢", "strong_cond_count": "強勢條件通過數", "strong_missing": "強勢尚缺條件", "near_strong": "即將強勢",
         "duck_price_live": "盤中鴨嘴價格結構", "ma20_gap_pct": "月線乖離率%",
@@ -481,6 +496,306 @@ def build_snapshot(daily: pd.DataFrame, strong: pd.DataFrame) -> dict:
     }
 
 
+
+def _codes_from_live(snapshot: dict, col: str, watch_codes: set[str] | None = None) -> set[str]:
+    stocks = snapshot.get("stocks") if snapshot else None
+    if stocks is None or stocks.empty or col not in stocks.columns:
+        return set()
+    mask = stocks[col].fillna(False).astype(bool)
+    if watch_codes is not None:
+        mask = mask & stocks["代號"].astype(str).isin(watch_codes)
+    return set(stocks.loc[mask, "代號"].astype(str))
+
+
+class IntradayBackgroundManager:
+    """Process-shared background scanner.
+
+    The worker never calls Streamlit APIs. It fetches and calculates a full-market
+    snapshot in a daemon thread, then atomically swaps the completed snapshot.
+    Front-end fragments only read the last completed result, so the user never
+    waits for MIS/network + 2,000-stock calculations during an automatic refresh.
+    """
+
+    def __init__(self):
+        self._lock = threading.RLock()
+        self._wake = threading.Event()
+        self._stop = threading.Event()
+        self._daily: pd.DataFrame | None = None
+        self._strong: pd.DataFrame | None = None
+        self._official_strong: set[str] = set()
+        self._official_duck: set[str] = set()
+        self._duck_watch: set[str] = set()
+        self._formal_date = "—"
+        self._config_sig = None
+        self._interval = 90.0
+        self._enabled = False
+        self._force_once = False
+        self._snapshot: dict | None = None
+        self._previous_snapshot: dict | None = None
+        self._events = {"new_strong": set(), "out_strong": set(), "new_duck": set(), "near": set(), "compare_label": ""}
+        self._event_log: list[dict] = []
+        self._version = 0
+        self._running = False
+        self._last_started: dt.datetime | None = None
+        self._last_completed: dt.datetime | None = None
+        self._last_error: str | None = None
+        self._thread = threading.Thread(target=self._loop, name="tw-intraday-background", daemon=True)
+        self._thread.start()
+
+    def configure(
+        self,
+        daily: pd.DataFrame,
+        strong: pd.DataFrame,
+        official_strong_codes: set[str] | None = None,
+        official_duck_codes: set[str] | None = None,
+        duck_watch_codes: set[str] | None = None,
+        formal_date: str = "—",
+        interval_seconds: int = 90,
+        enabled: bool = True,
+        ensure_once: bool = False,
+    ) -> None:
+        official_strong_codes = set(official_strong_codes or set())
+        official_duck_codes = set(official_duck_codes or set())
+        duck_watch_codes = set(duck_watch_codes or set())
+        sig = (
+            str(formal_date), len(daily), len(strong), len(official_strong_codes),
+            len(official_duck_codes), len(duck_watch_codes),
+            BASELINE.stat().st_mtime_ns if BASELINE.exists() else 0,
+        )
+        should_wake = False
+        with self._lock:
+            if sig != self._config_sig:
+                old_date = self._formal_date
+                self._daily = daily.copy(deep=True)
+                self._strong = strong.copy(deep=True)
+                self._official_strong = official_strong_codes
+                self._official_duck = official_duck_codes
+                self._duck_watch = duck_watch_codes
+                self._formal_date = str(formal_date)
+                self._config_sig = sig
+                # A new formal date/baseline invalidates yesterday's intraday history.
+                if old_date != "—" and old_date != self._formal_date:
+                    self._snapshot = None
+                    self._previous_snapshot = None
+                    self._events = {"new_strong": set(), "out_strong": set(), "new_duck": set(), "near": set(), "compare_label": ""}
+                    self._event_log = []
+                    self._version = 0
+                should_wake = True
+            new_interval = float(max(30, int(interval_seconds)))
+            if new_interval != self._interval or bool(enabled) != self._enabled:
+                self._interval = new_interval
+                self._enabled = bool(enabled)
+                should_wake = True
+            if (ensure_once or self._enabled) and self._snapshot is None:
+                self._force_once = True
+                should_wake = True
+        if should_wake:
+            self._wake.set()
+
+    def request_refresh(self) -> None:
+        with self._lock:
+            self._force_once = True
+        self._wake.set()
+
+    def get_state(self) -> dict:
+        with self._lock:
+            return {
+                "snapshot": self._snapshot,
+                "previous_snapshot": self._previous_snapshot,
+                "events": {
+                    "new_strong": set(self._events.get("new_strong", set())),
+                    "out_strong": set(self._events.get("out_strong", set())),
+                    "new_duck": set(self._events.get("new_duck", set())),
+                    "near": set(self._events.get("near", set())),
+                    "compare_label": self._events.get("compare_label", ""),
+                },
+                "event_log": list(self._event_log),
+                "version": self._version,
+                "running": self._running,
+                "enabled": self._enabled,
+                "interval_seconds": self._interval,
+                "last_started": self._last_started.strftime("%Y-%m-%d %H:%M:%S") if self._last_started else None,
+                "last_completed": self._last_completed.strftime("%Y-%m-%d %H:%M:%S") if self._last_completed else None,
+                "last_error": self._last_error,
+            }
+
+    def _accept_snapshot(self, snap: dict) -> None:
+        prev = self._snapshot
+        current_strong = _codes_from_live(snap, "盤中強勢")
+        current_duck = _codes_from_live(snap, "盤中鴨嘴價格結構", self._duck_watch)
+        near = _codes_from_live(snap, "即將強勢")
+        if prev is None:
+            compare_strong = set(self._official_strong)
+            compare_duck = set(self._official_duck)
+            compare_label = f"相對 {self._formal_date} 正式"
+        else:
+            compare_strong = _codes_from_live(prev, "盤中強勢")
+            compare_duck = _codes_from_live(prev, "盤中鴨嘴價格結構", self._duck_watch)
+            compare_label = f"相對上一批約 {int(self._interval)} 秒前"
+        new_strong = current_strong - compare_strong
+        out_strong = compare_strong - current_strong
+        new_duck = current_duck - compare_duck
+
+        stocks = snap.get("stocks")
+        name_map = {}
+        if stocks is not None and not stocks.empty:
+            name_map = dict(zip(stocks["代號"].astype(str), stocks.get("名稱", pd.Series("", index=stocks.index)).astype(str)))
+        t = str(snap.get("snapshot_time") or "")[-8:]
+        for typ, codes in [
+            ("🔥 新進強勢", new_strong),
+            ("⚠️ 暫時退出", out_strong),
+            ("🦆 鴨嘴價格結構新進", new_duck),
+        ]:
+            for code in sorted(codes):
+                self._event_log.append({"時間": t, "類型": typ, "代號": code, "名稱": name_map.get(code, "")})
+        self._event_log = self._event_log[-300:]
+        self._previous_snapshot = prev
+        self._snapshot = snap
+        self._events = {
+            "new_strong": new_strong,
+            "out_strong": out_strong,
+            "new_duck": new_duck,
+            "near": near,
+            "compare_label": compare_label,
+        }
+        self._version += 1
+
+    def _loop(self) -> None:
+        while not self._stop.is_set():
+            with self._lock:
+                ready = self._daily is not None and self._strong is not None and BASELINE.exists()
+                enabled = self._enabled
+                force = self._force_once
+                interval = self._interval
+                last_completed = self._last_completed
+                last_started = self._last_started
+                daily = self._daily
+                strong = self._strong
+            now = dt.datetime.now(TZ)
+            # After a failed attempt, wait until the next interval instead of hammering MIS in a tight retry loop.
+            anchor = last_completed or last_started
+            due = anchor is None or (now - anchor).total_seconds() >= interval
+            if ready and (force or (enabled and due)):
+                with self._lock:
+                    self._force_once = False
+                    self._running = True
+                    self._last_started = dt.datetime.now(TZ)
+                    self._last_error = None
+                    daily_local = daily.copy(deep=False)
+                    strong_local = strong.copy(deep=False)
+                try:
+                    snap = build_snapshot(daily_local, strong_local, use_streamlit_cache=False)
+                except Exception as e:
+                    with self._lock:
+                        self._last_error = f"{type(e).__name__}: {e}"
+                        self._running = False
+                else:
+                    with self._lock:
+                        self._accept_snapshot(snap)
+                        self._last_completed = dt.datetime.now(TZ)
+                        self._running = False
+                continue
+
+            if enabled and last_completed is not None:
+                wait_s = max(1.0, min(15.0, interval - (now - last_completed).total_seconds()))
+            else:
+                wait_s = 15.0
+            self._wake.clear()
+            self._wake.wait(wait_s)
+
+
+@st.cache_resource(show_spinner=False)
+def get_background_manager() -> IntradayBackgroundManager:
+    return IntradayBackgroundManager()
+
+
+def refresh_single_stock(snapshot: dict, code: str) -> dict:
+    """Fetch only one stock and recompute its intraday diagnostics.
+
+    RS is reranked against the last completed full-market snapshot, so this action
+    is fast and does not trigger another 2,000-stock scan.
+    """
+    if not snapshot or snapshot.get("stocks") is None:
+        raise RuntimeError("尚未有背景市場快照")
+    code = _norm_code(code)
+    stocks = snapshot["stocks"]
+    hit = stocks[stocks["代號"].astype(str) == code]
+    if hit.empty:
+        raise RuntimeError(f"背景快照找不到股票 {code}")
+    old = hit.iloc[0]
+    market = str(old.get("市場") or "TWSE")
+    universe_json = json.dumps([{"code": code, "market": market}], ensure_ascii=False, separators=(",", ":"))
+    q, errors = _fetch_mis_quotes_raw(universe_json, batch_size=1, workers=1)
+    if q.empty:
+        raise RuntimeError(errors[0] if errors else "MIS 沒有回傳此股票行情")
+    qr = q.iloc[0]
+    base = _load_baseline_raw(str(BASELINE))
+    base["code"] = base["code"].astype(str)
+    bh = base[base["code"] == code]
+    if bh.empty:
+        raise RuntimeError(f"盤中基準檔找不到股票 {code}")
+    b = bh.iloc[0]
+
+    last = _f(qr.get("last"))
+    prev_close = _f(b.get("prev_close"))
+    if last is None or prev_close in (None, 0):
+        raise RuntimeError("最新價或前收資料不足")
+    ma20 = (_f(b.get("sum_close_19"), 0) + last) / 20.0
+    ma50 = (_f(b.get("sum_close_49"), 0) + last) / 50.0
+    ma60 = (_f(b.get("sum_close_59"), 0) + last) / 60.0
+    ma200 = (_f(b.get("sum_close_199"), 0) + last) / 200.0
+    rs_base = _f(b.get("rs_base_close"))
+    ret250 = last / rs_base - 1.0 if rs_base not in (None, 0) else None
+
+    rs_live = _f(old.get("盤中RS"))
+    if ret250 is not None and "250日報酬試算" in stocks.columns:
+        others = pd.to_numeric(stocks.loc[stocks["代號"].astype(str) != code, "250日報酬試算"], errors="coerce").dropna()
+        vals = pd.concat([others.reset_index(drop=True), pd.Series([ret250])], ignore_index=True)
+        rs_live = float(vals.rank(method="average", pct=True).iloc[-1] * 100.0)
+
+    high_live = _f(qr.get("high_live"), last)
+    low_live = _f(qr.get("low_live"), last)
+    high250 = max(_f(b.get("max_high_249"), last), high_live)
+    low250 = min(_f(b.get("min_low_249"), last), low_live)
+    amount_est = last * (_f(qr.get("volume_lots"), 0.0) or 0.0) * 1000.0
+    conds = {
+        "RS>85": rs_live is not None and rs_live > RS_THRESHOLD,
+        "股價>MA200": last > ma200,
+        "MA50>MA200": ma50 > ma200,
+        "成交額>3000萬": amount_est > AMOUNT_MIN,
+        "距52週高點≤25%": last >= high250 * (1.0 - MAX_BELOW_52W_HIGH),
+        "高於52週低點≥30%": last >= low250 * (1.0 + MIN_ABOVE_52W_LOW),
+    }
+    count = sum(bool(v) for v in conds.values())
+    missing = [k for k, v in conds.items() if not v]
+    strong_live = count == 6
+    near = (
+        (not strong_live) and count >= 5 and (rs_live or 0) >= 80.0 and amount_est >= 20_000_000.0
+        and last > ma200 and ma50 > ma200 and last >= high250 * 0.70 and last >= low250 * 1.25
+    )
+    return {
+        "代號": code,
+        "名稱": str(old.get("名稱") or qr.get("name_live") or ""),
+        "市場": market,
+        "盤中價": last,
+        "漲跌幅%": (last / prev_close - 1.0) * 100.0,
+        "盤中RS": rs_live,
+        "250日報酬試算": ret250,
+        "盤中MA20": ma20,
+        "盤中MA50": ma50,
+        "盤中MA60": ma60,
+        "盤中MA200": ma200,
+        "盤中成交金額估算": amount_est,
+        "盤中強勢": strong_live,
+        "強勢條件通過數": count,
+        "強勢尚缺條件": "、".join(missing) if missing else "已全部符合",
+        "即將強勢": near,
+        "盤中鴨嘴價格結構": bool(last > ma20 > ma60),
+        "月線乖離率%": (last / ma20 - 1.0) * 100.0 if ma20 else None,
+        "單檔抓取時間": dt.datetime.now(TZ).strftime("%Y-%m-%d %H:%M:%S"),
+    }
+
+
 def _fmt(v, digits=1, suffix=""):
     x = _f(v)
     return "—" if x is None else f"{x:,.{digits}f}{suffix}"
@@ -493,17 +808,20 @@ def _formal_num(row, name):
         return None
 
 
-def _render_once(daily: pd.DataFrame, strong: pd.DataFrame, all_ok: pd.DataFrame, pre: pd.DataFrame, rs_latest: pd.Series):
+def _render_once(daily: pd.DataFrame, strong: pd.DataFrame, all_ok: pd.DataFrame, pre: pd.DataFrame, rs_latest: pd.Series, snap_override: dict | None = None):
     now = dt.datetime.now(TZ)
     if now.weekday() >= 5 or not (dt.time(8, 30) <= now.time() <= dt.time(14, 0)):
         st.info("目前不在台股一般交易附近時段；盤中雷達仍可手動讀取 MIS 的最新可用行情，但正式判讀請以收盤資料為準。")
 
-    try:
-        snap = build_snapshot(daily, strong)
-    except Exception as e:
-        st.error(f"盤中行情暫時無法建立：{e}")
-        st.caption("正式盤後系統不受影響。若剛部署此功能，先手動執行一次『每日台股自動更新』，讓 Actions 產生 intraday_baseline.pkl.gz。")
-        return
+    if snap_override is not None:
+        snap = snap_override
+    else:
+        try:
+            snap = build_snapshot(daily, strong)
+        except Exception as e:
+            st.error(f"盤中行情暫時無法建立：{e}")
+            st.caption("正式盤後系統不受影響。若剛部署此功能，先手動執行一次『每日台股自動更新』，讓 Actions 產生 intraday_baseline.pkl.gz。")
+            return
 
     if snap["coverage"] < 80:
         st.warning(f"盤中報價覆蓋率只有 {snap['coverage']:.1f}%，這次訊號僅供參考，不建議用來調整部位。")
@@ -578,21 +896,54 @@ def _render_once(daily: pd.DataFrame, strong: pd.DataFrame, all_ok: pd.DataFrame
 
 def render_intraday_panel(daily: pd.DataFrame, strong: pd.DataFrame, all_ok: pd.DataFrame, pre: pd.DataFrame, rs_latest: pd.Series):
     st.subheader("📡 盤中即時市場雷達")
-    st.caption("盤中＝試算；收盤＝正式。這一頁不寫回 rs_latest.xlsx / duck_latest.xlsx。")
+    st.caption("v3.2：全市場行情與計算在背景執行；頁面只讀最後完成快照，不會在自動刷新時等待網路。")
     if not BASELINE.exists():
-        st.warning("尚未找到 intraday_baseline.pkl.gz。部署這個版本後，請手動跑一次『每日台股自動更新』；新的 workflow 會自動建立盤中基準檔。")
+        st.warning("尚未找到 intraday_baseline.pkl.gz。部署這個版本後，請手動跑一次『每日台股自動更新』。")
         return
 
-    auto = st.toggle("盤中自動更新", value=True, key="intraday_auto_refresh")
-    seconds = st.select_slider("刷新頻率", options=[30, 45, 60, 90, 120], value=60, format_func=lambda x: f"{x} 秒")
-    if auto and hasattr(st, "fragment"):
-        @st.fragment(run_every=f"{seconds}s")
+    auto = st.toggle("背景自動掃描", value=True, key="intraday_auto_refresh")
+    seconds = st.select_slider("背景掃描頻率", options=[60, 90, 120], value=90, format_func=lambda x: f"{x} 秒")
+    manager = get_background_manager()
+    official_strong = _code_set(strong)
+    official_duck = _code_set(all_ok)
+    duck_watch = official_duck | _code_set(pre)
+    formal_date = str(rs_latest.get("日期", "—")) if hasattr(rs_latest, "get") else "—"
+    manager.configure(
+        daily, strong,
+        official_strong_codes=official_strong,
+        official_duck_codes=official_duck,
+        duck_watch_codes=duck_watch,
+        formal_date=formal_date,
+        interval_seconds=seconds,
+        enabled=auto,
+        ensure_once=True,
+    )
+    if st.button("🔄 背景立即重掃", type="primary", use_container_width=True):
+        manager.request_refresh()
+        st.toast("已要求背景重掃；目前畫面繼續使用上一批完成資料。")
+
+    def _show_state():
+        state = manager.get_state()
+        snap = state.get("snapshot")
+        if not snap:
+            if state.get("running"):
+                st.info("背景正在建立第一批行情；你可以繼續操作，不需要等待。")
+            elif state.get("last_error"):
+                st.error(f"背景行情建立失敗：{state.get('last_error')}")
+            else:
+                st.info("背景掃描已啟動。")
+            return
+        if state.get("running"):
+            st.caption(f"🔄 下一批背景處理中｜目前顯示：{state.get('last_completed') or snap.get('snapshot_time','—')}")
+        else:
+            st.caption(f"🟢 最近完成：{state.get('last_completed') or snap.get('snapshot_time','—')}")
+        _render_once(daily, strong, all_ok, pre, rs_latest, snap_override=snap)
+
+    if hasattr(st, "fragment") and auto:
+        @st.fragment(run_every="30s")
         def _frag():
-            _render_once(daily, strong, all_ok, pre, rs_latest)
+            _show_state()
         _frag()
     else:
-        if not hasattr(st, "fragment"):
-            st.info("目前 Streamlit 版本不支援局部自動刷新；可用下方按鈕手動更新，或升級 Streamlit 後自動啟用。")
-        if st.button("立即刷新盤中行情", type="primary", use_container_width=True):
-            fetch_mis_quotes.clear()
-        _render_once(daily, strong, all_ok, pre, rs_latest)
+        _show_state()
+

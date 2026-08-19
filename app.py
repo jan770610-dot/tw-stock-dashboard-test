@@ -1073,7 +1073,7 @@ left_signal_phase=risk_signal_phase(left_alert,left_signal_stats,left_reduce_sta
 early_signal_phase=early_signal_phase(early_signal_stats)
 exposure_plan=market_exposure_plan(rs_latest,market_lr,quality,early_signal_stats,left_alert,left_reduce_stats)
 
-# ===== v3.1 單一儀表板：盤中變化雷達 + 手動個股即時查詢 =====
+# ===== v3.2 單一儀表板：背景掃描 + 前台只讀快照 =====
 TAIPEI_TZ = ZoneInfo("Asia/Taipei")
 now_tpe = dt.datetime.now(TAIPEI_TZ)
 today_tpe = now_tpe.strftime("%Y-%m-%d")
@@ -1152,62 +1152,21 @@ def _event_table(stocks: pd.DataFrame, codes: set[str], limit=30) -> pd.DataFram
     return z[show].head(limit)
 
 
-def _append_intraday_events(event_type: str, codes: set[str], stocks: pd.DataFrame, snap_time: str):
-    if not codes:
-        return
-    log = st.session_state.get("v31_event_log", [])
-    name_map = {}
-    if stocks is not None and not stocks.empty and "代號" in stocks.columns:
-        name_map = dict(zip(stocks["代號"].astype(str), stocks.get("名稱", pd.Series("", index=stocks.index)).astype(str)))
-    for code in sorted(codes):
-        log.append({"時間": snap_time[-8:], "類型": event_type, "代號": code, "名稱": name_map.get(code, "")})
-    st.session_state["v31_event_log"] = log[-200:]
-
-
-def _render_change_radar(snap: dict):
+def _render_change_radar(snap: dict, bg_state: dict):
     stocks = snap.get("stocks")
     if stocks is None or stocks.empty:
         return
-    stocks = stocks.copy()
-    stocks["代號"] = stocks["代號"].map(_norm_stock_code)
-
-    cur_strong = set(stocks.loc[stocks.get("盤中強勢", False).fillna(False), "代號"].astype(str))
-    # 鴨嘴價格結構只追蹤「昨日正式符合 + 即將可能符合」候選池，避免全市場僅因 MA20>MA60 產生大量雜訊。
-    duck_watch_codes = _codes_from_df(all_ok) | _codes_from_df(pre)
-    if "盤中鴨嘴價格結構" in stocks.columns:
-        duck_mask = stocks["盤中鴨嘴價格結構"].fillna(False) & stocks["代號"].isin(duck_watch_codes)
-        cur_duck = set(stocks.loc[duck_mask, "代號"].astype(str))
-    else:
-        cur_duck = set()
-    near_codes = set(stocks.loc[stocks.get("即將強勢", False).fillna(False), "代號"].astype(str)) if "即將強勢" in stocks.columns else set()
-
-    prev_strong = st.session_state.get("v31_prev_strong_codes")
-    prev_duck = st.session_state.get("v31_prev_duck_codes")
-    if prev_strong is None:
-        compare_strong = _codes_from_df(strong)
-        compare_duck = _codes_from_df(all_ok)
-        compare_label = f"相對 {latest_date} 正式"
-    else:
-        compare_strong = set(prev_strong)
-        compare_duck = set(prev_duck or set())
-        compare_label = "相對上一輪約90秒前"
-
-    new_strong = cur_strong - compare_strong
-    out_strong = compare_strong - cur_strong
-    new_duck = cur_duck - compare_duck
-
-    snap_time = str(snap.get("snapshot_time") or "")
-    _append_intraday_events("🔥 新進強勢", new_strong, stocks, snap_time)
-    _append_intraday_events("⚠️ 暫時退出", out_strong, stocks, snap_time)
-    _append_intraday_events("🦆 鴨嘴價格結構新進", new_duck, stocks, snap_time)
-    st.session_state["v31_prev_strong_codes"] = cur_strong
-    st.session_state["v31_prev_duck_codes"] = cur_duck
-    st.session_state["v31_latest_snapshot"] = snap
+    events = bg_state.get("events") or {}
+    new_strong = set(events.get("new_strong") or set())
+    out_strong = set(events.get("out_strong") or set())
+    new_duck = set(events.get("new_duck") or set())
+    near_codes = set(events.get("near") or set())
+    compare_label = str(events.get("compare_label") or f"相對 {latest_date} 正式")
 
     st.write("#### 🔔 盤中個股變化雷達")
     st.caption(
-        f"{compare_label}｜每 90 秒掃描全市場；只有這一區跟上方摘要局部更新。"
-        "『鴨嘴價格結構』是盤中價格/均線試算，正式完整鴨嘴仍以盤後確認。"
+        f"{compare_label}｜全市場掃描在背景執行；這裡只讀取已完成結果。"
+        "詳細清單預設收合，避免新事件出現時把整個頁面高度突然撐開。"
     )
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("🔥 本輪新進強勢", f"{len(new_strong)} 檔")
@@ -1216,46 +1175,64 @@ def _render_change_radar(snap: dict):
     c4.metric("🦆 鴨嘴結構新進", f"{len(new_duck)} 檔")
 
     if new_strong:
-        st.success(f"🔥 本輪有 {len(new_strong)} 檔新進盤中強勢條件。")
-        st.dataframe(_event_table(stocks, new_strong, 20), hide_index=True, use_container_width=True, height=min(360, 38 + 35 * min(len(new_strong), 8)))
-    if near_codes:
-        with st.expander(f"🌱 即將符合強勢：{len(near_codes)} 檔（只差一項且門檻已接近）", expanded=False):
-            st.dataframe(_event_table(stocks, near_codes, 40), hide_index=True, use_container_width=True, height=360)
-    if out_strong:
-        with st.expander(f"⚠️ 本輪暫時退出：{len(out_strong)} 檔", expanded=False):
-            st.dataframe(_event_table(stocks, out_strong, 30), hide_index=True, use_container_width=True, height=320)
-    if new_duck:
-        with st.expander(f"🦆 本輪新進鴨嘴價格結構：{len(new_duck)} 檔", expanded=False):
-            st.dataframe(_event_table(stocks, new_duck, 30), hide_index=True, use_container_width=True, height=320)
+        st.success(f"🔥 最新背景掃描發現 {len(new_strong)} 檔新進強勢；展開下方可查看。")
+    with st.expander(f"🔥 本輪新進強勢：{len(new_strong)} 檔", expanded=False):
+        if new_strong:
+            st.dataframe(_event_table(stocks, new_strong, 40), hide_index=True, use_container_width=True, height=360)
+        else:
+            st.caption("本輪沒有新進強勢。")
+    with st.expander(f"🌱 即將符合強勢：{len(near_codes)} 檔", expanded=False):
+        if near_codes:
+            st.dataframe(_event_table(stocks, near_codes, 80), hide_index=True, use_container_width=True, height=420)
+        else:
+            st.caption("目前沒有只差一項且已接近門檻的股票。")
+    with st.expander(f"⚠️ 本輪暫時退出：{len(out_strong)} 檔", expanded=False):
+        if out_strong:
+            st.dataframe(_event_table(stocks, out_strong, 50), hide_index=True, use_container_width=True, height=360)
+        else:
+            st.caption("本輪沒有暫時退出。")
+    with st.expander(f"🦆 本輪新進鴨嘴價格結構：{len(new_duck)} 檔", expanded=False):
+        if new_duck:
+            st.dataframe(_event_table(stocks, new_duck, 50), hide_index=True, use_container_width=True, height=360)
+        else:
+            st.caption("本輪沒有新進鴨嘴價格結構。")
 
-    log = st.session_state.get("v31_event_log", [])
+    log = bg_state.get("event_log") or []
     if log:
-        with st.expander(f"🕘 今日盤中事件紀錄（最近 {min(len(log), 200)} 筆）", expanded=False):
+        with st.expander(f"🕘 今日盤中事件紀錄（最近 {min(len(log), 300)} 筆）", expanded=False):
             st.dataframe(pd.DataFrame(log[::-1]), hide_index=True, use_container_width=True, height=360)
 
 
-def _render_trial_summary():
-    try:
-        from intraday_live import build_snapshot
-        snap = build_snapshot(daily, strong)
-    except Exception as e:
-        st.error(f"今日試算資料暫時無法建立：{e}")
-        st.caption(f"目前先顯示最新正式資料 {latest_date}；正式盤後系統不受影響。")
+def _render_trial_summary(bg_state: dict):
+    snap = bg_state.get("snapshot")
+    running = bool(bg_state.get("running"))
+    last_error = bg_state.get("last_error")
+    if not snap:
+        if running:
+            st.info("🔄 背景正在建立第一批全市場行情；你可以繼續使用下面功能，不需要等在這裡。")
+        elif last_error:
+            st.error(f"背景盤中行情暫時無法建立：{last_error}")
+        else:
+            st.info("背景掃描已啟動，第一批完成後會顯示盤中試算。")
         return
 
     trial_exposure, trial_exposure_label = _trial_exposure_reference(snap)
     mode_title = "📡 今日盤中試算" if dashboard_mode == "intraday" else "🧾 今日收盤試算（等待正式更新）"
+    status_text = "🔄 背景正在處理下一批；目前畫面維持上一批完成資料" if running else "🟢 背景待命／等待下一批"
     mode_note = (
-        "市場摘要與個股變化雷達每 90 秒局部更新；下方查詢/正式表格不會跟著重跑。"
+        "背景每 90 秒掃描全市場；前台每 30 秒只讀記憶體中的完成結果，不等待行情抓取與運算。"
         if dashboard_mode == "intraday"
-        else "13:30 後停止自動刷新；保留最後可用行情，等待 18:05 正式資料更新。"
+        else "13:30 後不再連續背景掃描；保留最後完成結果，等待 18:05 正式資料。"
     )
 
     st.write(f"### {mode_title}")
     st.caption(
-        f"{mode_note}｜比較基準：{latest_date} 正式收盤｜"
-        f"最後抓取：{snap.get('snapshot_time','—')}｜報價覆蓋率：{_fmt_trial(snap.get('coverage'),1,'%')}"
+        f"{mode_note}｜{status_text}｜比較基準：{latest_date} 正式收盤｜"
+        f"背景完成：{bg_state.get('last_completed') or snap.get('snapshot_time','—')}｜"
+        f"報價覆蓋率：{_fmt_trial(snap.get('coverage'),1,'%')}"
     )
+    if last_error:
+        st.warning(f"上一輪背景更新失敗：{last_error}；目前仍顯示上一批成功資料。")
 
     c1, c2, c3, c4, c5, c6 = st.columns(6)
     c1.metric("RS 強勢股", f"{int(snap.get('strong_count',0)):,} 檔", _metric_delta(snap.get("strong_count"), strong_count, 0, " 檔"))
@@ -1283,34 +1260,29 @@ def _render_trial_summary():
         ("風險／減碼", risk_now, f"昨日正式：{left_signal_phase}"),
         ("盤中強弱", f"Wade {_fmt_trial(snap.get('wade'),1)}", f"上漲 {_fmt_trial(snap.get('advance_ratio'),1,'%')}｜新高/新低 {snap.get('new_high',0)}/{snap.get('new_low',0)}"),
     ])
-    _render_change_radar(snap)
+    _render_change_radar(snap, bg_state)
 
 
-def _manual_stock_lookup():
+def _manual_stock_lookup(manager):
     st.write("### 🔎 個股最新狀況（手動查詢）")
     st.caption(
-        "沒有觸發變化的個股也可以查。只有你按『查詢最新狀況』時才主動更新一次，"
-        "不會自己重整這個區塊；盤中數值仍屬試算。"
+        "搜尋時直接讀『最近完成的背景快照』，不會再重抓 2,000 檔，所以幾乎立即顯示。"
+        "若你要更接近當下的價格，可再按『⚡ 只更新這一檔』，只向 MIS 抓單一股票。"
     )
-    with st.form("v31_manual_lookup_form", clear_on_submit=False):
-        q = st.text_input("輸入股票代號或名稱", key="v31_manual_lookup_input", placeholder="例如 2330、台積電")
-        submitted = st.form_submit_button("🔄 查詢最新狀況", type="primary", use_container_width=True)
-
+    with st.form("v32_manual_lookup_form", clear_on_submit=False):
+        q = st.text_input("輸入股票代號或名稱", key="v32_manual_lookup_input", placeholder="例如 2330、台積電")
+        submitted = st.form_submit_button("🔎 查詢最近背景資料", type="primary", use_container_width=True)
     if submitted and q.strip():
-        try:
-            from intraday_live import build_snapshot, fetch_mis_quotes
-            fetch_mis_quotes.clear()
-            with st.spinner("正在抓取最新盤中行情並重算個股狀態…"):
-                snap = build_snapshot(daily, strong)
-            st.session_state["v31_manual_snapshot"] = snap
-            st.session_state["v31_manual_last_query"] = q.strip()
-            st.session_state["v31_latest_snapshot"] = snap
-        except Exception as e:
-            st.error(f"個股最新行情查詢失敗：{e}")
+        st.session_state["v32_manual_last_query"] = q.strip()
+        st.session_state.pop("v32_single_override", None)
 
-    query = st.session_state.get("v31_manual_last_query")
-    snap = st.session_state.get("v31_manual_snapshot") or st.session_state.get("v31_latest_snapshot")
-    if not query or not snap or snap.get("stocks") is None:
+    query = st.session_state.get("v32_manual_last_query")
+    bg_state = manager.get_state()
+    snap = bg_state.get("snapshot")
+    if not query:
+        return
+    if not snap or snap.get("stocks") is None:
+        st.info("背景第一批行情尚未完成；完成後再按一次查詢即可。")
         return
 
     stocks = snap["stocks"].copy()
@@ -1323,10 +1295,22 @@ def _manual_stock_lookup():
     if hit.empty:
         st.warning(f"找不到「{qq}」的盤中資料。")
         return
+    sort_cols = [c for c in ["盤中強勢", "即將強勢", "盤中RS"] if c in hit.columns]
+    if sort_cols:
+        hit = hit.sort_values(sort_cols, ascending=[False] * len(sort_cols), na_position="last")
+    r = hit.iloc[0].copy()
 
-    hit = hit.sort_values([c for c in ["盤中強勢", "即將強勢", "盤中RS"] if c in hit.columns], ascending=False, na_position="last")
-    r = hit.iloc[0]
-    st.caption(f"查詢：{qq}｜資料抓取時間：{snap.get('snapshot_time','—')}｜最多顯示前 20 筆符合名稱/代號的結果")
+    override = st.session_state.get("v32_single_override")
+    if override and str(override.get("代號")) == str(r.get("代號")):
+        for k, v in override.items():
+            r[k] = v
+        source_time = override.get("單檔抓取時間", "—")
+        source_label = "單檔即時抓取"
+    else:
+        source_time = bg_state.get("last_completed") or snap.get("snapshot_time", "—")
+        source_label = "背景快照"
+
+    st.caption(f"查詢：{qq}｜資料來源：{source_label}｜時間：{source_time}｜背景全市場版本：#{bg_state.get('version',0)}")
     c1, c2, c3, c4, c5 = st.columns(5)
     c1.metric("股票", f"{r.get('代號','—')} {r.get('名稱','')}")
     c2.metric("最新盤中價", _fmt_trial(r.get("盤中價"), 2), _fmt_trial(r.get("漲跌幅%"), 2, "%"))
@@ -1341,13 +1325,23 @@ def _manual_stock_lookup():
     else:
         st.info(f"目前尚未符合盤中強勢條件｜尚缺：{r.get('強勢尚缺條件','—')}")
 
+    if st.button("⚡ 只更新這一檔（不重掃全市場）", key="v32_force_single", use_container_width=True):
+        try:
+            from intraday_live import refresh_single_stock
+            with st.spinner(f"只抓 {r.get('代號')} 最新行情…"):
+                fresh = refresh_single_stock(snap, str(r.get("代號")))
+            st.session_state["v32_single_override"] = fresh
+            st.rerun()
+        except Exception as e:
+            st.error(f"單檔即時更新失敗：{e}")
+
     show = [c for c in ["代號", "名稱", "市場", "盤中價", "漲跌幅%", "盤中RS", "盤中MA20", "盤中MA50", "盤中MA60", "盤中MA200", "月線乖離率%", "盤中強勢", "即將強勢", "強勢條件通過數", "強勢尚缺條件", "盤中鴨嘴價格結構"] if c in hit.columns]
     st.dataframe(hit[show].head(20), hide_index=True, use_container_width=True, height=min(500, 70 + 35 * min(len(hit), 12)))
 
 
 st.title("📈 台股分析中心")
 st.markdown(
-    '<div class="hero-sub">RS 市場廣度 × 鴨嘴型態 × 培育中心｜正式網頁版 v3.1｜盤中變化雷達 × 手動個股即時查詢</div>',
+    '<div class="hero-sub">RS 市場廣度 × 鴨嘴型態 × 培育中心｜正式網頁版 v3.2｜背景掃描 × 無阻塞盤中雷達</div>',
     unsafe_allow_html=True
 )
 
@@ -1358,14 +1352,15 @@ message = update_status.get("message", "")
 if dashboard_mode == "intraday":
     st.markdown(
         f'<div class="status-strip status-ok"><b>目前模式：</b>📡 今日盤中試算　｜　'
-        f'<b>正式比較基準：</b>{latest_date}　｜　<b>市場＋個股變化：</b>90秒局部掃描　｜　'
-        f'<b>最近正式排程：</b>{html.escape(str(last_run))}</div>',
+        f'<b>正式比較基準：</b>{latest_date}　｜　<b>背景掃描：</b>90秒　｜　'
+        f'<b>前台同步：</b>30秒只讀記憶體　｜　<b>最近正式排程：</b>{html.escape(str(last_run))}</div>',
         unsafe_allow_html=True
     )
 elif dashboard_mode == "close_trial":
     st.markdown(
         f'<div class="status-strip status-warn"><b>目前模式：</b>🧾 今日收盤試算（等待正式更新）　｜　'
-        f'<b>正式比較基準：</b>{latest_date}　｜　<b>18:05：</b>正式更新後自動切換</div>',
+        f'<b>正式比較基準：</b>{latest_date}　｜　<b>盤中背景連續掃描：</b>已停止　｜　'
+        f'<b>18:05：</b>正式更新後自動切換</div>',
         unsafe_allow_html=True
     )
 else:
@@ -1384,30 +1379,65 @@ elif u_status == "error" and message:
     st.error(message)
 
 if dashboard_mode in {"intraday", "close_trial"}:
-    # 只讓「上方摘要」自動更新，避免使用者正在看的表格/搜尋/捲動位置被打斷。
-    if dashboard_mode == "intraday":
-        auto_top = st.toggle(
-            "市場＋個股變化雷達自動掃描（90 秒，只更新這一區）",
-            value=True,
-            key="v30_top_auto_refresh",
-            help="關閉後，市場摘要與個股變化雷達都停止自動掃描。下方手動個股查詢與正式資料不會自己刷新。"
-        )
-        if auto_top and hasattr(st, "fragment"):
-            @st.fragment(run_every="90s")
-            def _top_market_fragment():
-                _render_trial_summary()
-            _top_market_fragment()
-        else:
-            if auto_top and not hasattr(st, "fragment"):
-                st.info("目前 Streamlit 版本不支援局部刷新；已停止自動掃描，避免中斷使用。你仍可用下方手動個股查詢。")
-            _render_trial_summary()
-    else:
-        _render_trial_summary()
+    from intraday_live import get_background_manager
+    bg_manager = get_background_manager()
+    official_strong_codes = _codes_from_df(strong)
+    official_duck_codes = _codes_from_df(all_ok)
+    duck_watch_codes = official_duck_codes | _codes_from_df(pre)
 
-    _manual_stock_lookup()
+    if dashboard_mode == "intraday":
+        ctrl1, ctrl2 = st.columns([3, 1])
+        auto_scan = ctrl1.toggle(
+            "背景全市場掃描（90 秒）",
+            value=True,
+            key="v32_background_scan",
+            help="背景執行行情抓取與約2,000檔運算；不會讓前台等待。關閉後仍可用手動單檔查詢。"
+        )
+        bg_manager.configure(
+            daily, strong,
+            official_strong_codes=official_strong_codes,
+            official_duck_codes=official_duck_codes,
+            duck_watch_codes=duck_watch_codes,
+            formal_date=latest_date,
+            interval_seconds=90,
+            enabled=auto_scan,
+            ensure_once=True,
+        )
+        if ctrl2.button("🔄 背景立即重掃", key="v32_bg_force", use_container_width=True):
+            bg_manager.request_refresh()
+            st.toast("已要求背景重掃；畫面不會卡住。")
+
+        if hasattr(st, "fragment"):
+            @st.fragment(run_every="30s")
+            def _memory_view_fragment():
+                _render_trial_summary(bg_manager.get_state())
+            _memory_view_fragment()
+        else:
+            st.info("目前 Streamlit 版本不支援局部刷新；背景仍會掃描，但畫面需手動重新整理才會讀到新快照。")
+            _render_trial_summary(bg_manager.get_state())
+    else:
+        # 收盤後只確保有一批最後行情，不再連續掃描。
+        bg_manager.configure(
+            daily, strong,
+            official_strong_codes=official_strong_codes,
+            official_duck_codes=official_duck_codes,
+            duck_watch_codes=duck_watch_codes,
+            formal_date=latest_date,
+            interval_seconds=90,
+            enabled=False,
+            ensure_once=True,
+        )
+        state_now = bg_manager.get_state()
+        _render_trial_summary(state_now)
+        if not state_now.get("snapshot") or state_now.get("running"):
+            st.caption("背景正在建立收盤後最後一批資料；可稍後按下方『讀取背景最新結果』，不用等它跑完。")
+        if st.button("📥 讀取背景最新結果", key="v32_read_close", use_container_width=True):
+            st.rerun()
+
+    _manual_stock_lookup(bg_manager)
     st.caption(
-        "⬇️ 再往下為「最新正式收盤／歷史詳細資料」，主要拿來比較與查核；"
-        "不會因上方 90 秒市場/個股變化掃描而重新整理。"
+        "⬇️ 再往下為『最新正式收盤／歷史詳細資料』。背景掃描與行情計算不在前台執行，"
+        "因此不會因 90 秒更新而卡住你正在看的表格或搜尋。"
     )
 else:
     st.write("### 今日決策摘要")
