@@ -1,0 +1,169 @@
+name: 個股進場時機回測 v1.0
+
+on:
+  workflow_dispatch:
+    inputs:
+      start_date:
+        description: "回測開始日 YYYY-MM-DD"
+        required: true
+        default: "2023-01-03"
+        type: string
+      end_date:
+        description: "回測結束日 YYYY-MM-DD；留白 = 最新正式資料日"
+        required: false
+        default: ""
+        type: string
+      max_forward:
+        description: "固定觀察窗（交易日）"
+        required: true
+        default: "60"
+        type: choice
+        options:
+          - "40"
+          - "60"
+          - "80"
+      cooldown:
+        description: "同股票同策略最少間隔交易日"
+        required: true
+        default: "10"
+        type: choice
+        options:
+          - "5"
+          - "10"
+          - "20"
+      fetch_missing:
+        description: "自動補抓缺少的官方歷史行情；已有seed/cache建議false"
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+concurrency:
+  group: tw-stock-daily-update
+  cancel-in-progress: false
+
+jobs:
+  backtest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+    env:
+      TZ: Asia/Taipei
+      PYTHONUNBUFFERED: "1"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: automation/requirements.txt
+
+      - name: Install automation packages
+        run: python -m pip install -r automation/requirements.txt
+
+      - name: Resolve formal end date
+        id: dates
+        shell: bash
+        env:
+          MANUAL_END: ${{ inputs.end_date }}
+        run: |
+          if [ -n "$MANUAL_END" ]; then
+            END_DATE="$MANUAL_END"
+          else
+            END_DATE=$(python - <<'PYDATE'
+          import json
+          from pathlib import Path
+          p=Path('update_status.json')
+          if p.exists():
+              try:
+                  x=json.loads(p.read_text(encoding='utf-8'))
+                  print(x.get('target_date') or x.get('rs_date') or '')
+              except Exception:
+                  print('')
+          else:
+              print('')
+          PYDATE
+            )
+          fi
+          if [ -z "$END_DATE" ]; then
+            echo "找不到最新正式資料日" >&2
+            exit 2
+          fi
+          echo "end=$END_DATE" >> "$GITHUB_OUTPUT"
+          echo "END_DATE=$END_DATE"
+
+      - name: Restore entry/exit daily history cache
+        uses: actions/cache@v5
+        with:
+          path: automation/rs/cache
+          key: entry-backtest-history-v1-${{ runner.os }}-${{ inputs.start_date }}-${{ steps.dates.outputs.end }}-${{ github.run_id }}
+          restore-keys: |
+            entry-backtest-history-v1-${{ runner.os }}-${{ inputs.start_date }}-
+            exit-backtest-history-v1-${{ runner.os }}-${{ inputs.start_date }}-
+            exit-backtest-history-v1-${{ runner.os }}-
+            tw-stock-runtime-v25-${{ runner.os }}-
+            tw-stock-runtime-${{ runner.os }}-
+
+      - name: Bootstrap RS history on cache miss
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ ! -d automation/rs/cache ] || ! find automation/rs/cache -maxdepth 1 -name '20??????.csv' -print -quit | grep -q .; then
+            echo "RS history cache miss; downloading bootstrap seed..."
+            mkdir -p /tmp/tw-stock-seed
+            gh release download seed-v2 --pattern "bootstrap_seed_v2.zip" --dir /tmp/tw-stock-seed
+            unzip -q /tmp/tw-stock-seed/bootstrap_seed_v2.zip -d .
+            test -d automation/rs/cache
+          else
+            echo "RS daily history cache restored."
+          fi
+
+      - name: Run entry timing backtest
+        shell: bash
+        env:
+          FETCH_MISSING: ${{ inputs.fetch_missing }}
+        run: |
+          EXTRA=""
+          if [ "$FETCH_MISSING" = "true" ]; then
+            EXTRA="--fetch-missing"
+          fi
+          python -u automation/backtest_entry_strategies.py \
+            --start "${{ inputs.start_date }}" \
+            --end "${{ steps.dates.outputs.end }}" \
+            --max-forward "${{ inputs.max_forward }}" \
+            --cooldown "${{ inputs.cooldown }}" \
+            --workers 2 \
+            $EXTRA
+
+      - name: Show entry backtest status
+        run: |
+          cat entry_backtest_status.json
+          echo "--- top entry strategies ---"
+          python - <<'PY'
+          import pandas as pd
+          x=pd.read_csv('entry_backtest_summary.csv')
+          cols=['排名','策略','類型','樣本數','10日中位報酬%','20日中位報酬%','20日勝率%','20日中位MFE%','20日中位MAE%','年度正報酬率%','綜合分數','可靠度']
+          print(x[cols].head(12).to_string(index=False))
+          PY
+
+      - name: Commit entry backtest results
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add entry_backtest_latest.xlsx entry_backtest_summary.csv entry_backtest_annual.csv entry_backtest_status.json
+          if git diff --cached --quiet; then
+            echo "No entry backtest result changes."
+          else
+            git commit -m "research: update entry timing backtest v1.0 ${{ steps.dates.outputs.end }}"
+            git pull --rebase origin main
+            git push origin HEAD:main
+          fi
