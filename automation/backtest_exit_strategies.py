@@ -445,87 +445,144 @@ def _entry_cohorts(row: pd.Series) -> List[str]:
 
 
 def simulate_trades(signals: pd.DataFrame, start: dt.date, end: dt.date, max_hold: int) -> Tuple[pd.DataFrame, dict]:
-    groups = {str(code): g.sort_values("date").reset_index(drop=True) for code, g in signals.groupby("code", observed=True)}
+    """Optimized event simulator.
 
-    entries = []
-    skipped_future = 0
-    for code, g in groups.items():
-        for i in np.flatnonzero(g["new"].to_numpy(dtype=bool)):
-            sig_day = g.at[i, "date"].date()
-            if sig_day < start or sig_day > end:
-                continue
-            cohorts = _entry_cohorts(g.iloc[i])
-            if not cohorts:
-                continue
-            entry_idx = i + 1
-            # Full common horizon is required for fair peak/giveback comparison.
-            if entry_idx >= len(g) or entry_idx + max_hold >= len(g):
-                skipped_future += 1
-                continue
-            entries.append((code, i, entry_idx, cohorts))
-
-    print(f"[trade] entry events with full {max_hold}-session horizon={len(entries)}; skipped recent={skipped_future}", flush=True)
-    rows: List[dict] = []
+    v1 created one Python dict for every event x rule while repeatedly slicing
+    pandas DataFrames. With ~40k duck-new events and ~25 rules that expands to
+    >1M strategy-trade rows and is unnecessarily slow.  v1.1 converts each
+    stock to NumPy arrays once, evaluates every rule for an event as a compact
+    boolean matrix, stores numeric results in preallocated arrays, then builds
+    one compact DataFrame at the end.
+    """
     benchmark_rules = [r for r in BENCHMARKS if int(r[1].replace("hold", "")) <= max_hold]
     if max_hold not in {20, 40, 60}:
         benchmark_rules.append((f"固定持有{max_hold}日", f"hold{max_hold}", "基準"))
     all_rules = STRATEGIES + benchmark_rules
+    rule_names = np.array([r[0] for r in all_rules], dtype=object)
+    rule_keys = np.array([r[1] for r in all_rules], dtype=object)
+    rule_types = np.array([r[2] for r in all_rules], dtype=object)
+    nr = len(all_rules)
 
-    def first_hit(mask: np.ndarray) -> Optional[int]:
-        idx = np.flatnonzero(mask)
-        return int(idx[0]) if idx.size else None
+    stock_blocks: Dict[str, dict] = {}
+    entries: List[Tuple[str, int, int, bool, bool]] = []
+    skipped_future = 0
 
-    for n, (code, sig_idx, entry_idx, cohorts) in enumerate(entries, 1):
-        g = groups[code]
-        sig = g.iloc[sig_idx]
-        ent = g.iloc[entry_idx]
-        entry_price = _num(ent.get("open")) or _num(ent.get("close"))
+    needed_num = [
+        "open", "high", "low", "close", "heat", "bias20", "rs", "right",
+        "ma20_change", "ma60_change", "spread_change", "ma20", "ma60",
+    ]
+    for code, g in signals.groupby("code", observed=True, sort=False):
+        g = g.sort_values("date").reset_index(drop=True)
+        block = {
+            "date": pd.to_datetime(g["date"], errors="coerce").to_numpy(dtype="datetime64[ns]"),
+            "duck": g["duck"].fillna(False).to_numpy(dtype=bool),
+            "new": g["new"].fillna(False).to_numpy(dtype=bool),
+            "name": g.get("name", pd.Series("", index=g.index)).fillna("").astype(str).to_numpy(dtype=object),
+            "market": g.get("market", pd.Series("", index=g.index)).fillna("").astype(str).to_numpy(dtype=object),
+        }
+        for c in needed_num:
+            block[c] = pd.to_numeric(g[c], errors="coerce").to_numpy(dtype=np.float32)
+        stock_blocks[str(code)] = block
+
+        for i in np.flatnonzero(block["new"]):
+            sig_day = pd.Timestamp(block["date"][i]).date()
+            if sig_day < start or sig_day > end:
+                continue
+            heat0 = _num(block["heat"][i], 100) or 100
+            right0 = _num(block["right"][i], 0) or 0
+            rs0 = _num(block["rs"][i])
+            cohort_tradeable = bool(heat0 < 70 and right0 >= 58)
+            cohort_rs85 = bool(heat0 < 70 and rs0 is not None and rs0 >= 85)
+            entry_idx = int(i) + 1
+            # Need max_hold signal days plus the T+1 exit execution row.
+            if entry_idx >= len(block["close"]) or entry_idx + max_hold >= len(block["close"]):
+                skipped_future += 1
+                continue
+            entries.append((str(code), int(i), entry_idx, cohort_tradeable, cohort_rs85))
+
+    n_events = len(entries)
+    print(f"[trade] entry events with full {max_hold}-session horizon={n_events}; skipped recent={skipped_future}", flush=True)
+    if n_events == 0:
+        return pd.DataFrame(), {"entry_events": 0, "skipped_recent_no_full_horizon": skipped_future, "rule_count": nr}
+
+    shape = (n_events, nr)
+    f32 = lambda: np.full(shape, np.nan, dtype=np.float32)
+    ret_mat = f32(); cap_mat = f32(); give_mat = f32(); mae_mat = f32(); post5_mat = f32(); post10_mat = f32()
+    exit_price_mat = f32()
+    hold_mat = np.zeros(shape, dtype=np.int16)
+    trigger_mat = np.zeros(shape, dtype=bool)
+    exit_sig_dates = np.full(shape, np.datetime64("NaT"), dtype="datetime64[ns]")
+    exit_dates = np.full(shape, np.datetime64("NaT"), dtype="datetime64[ns]")
+
+    event_code = np.empty(n_events, dtype=object)
+    event_name = np.empty(n_events, dtype=object)
+    event_market = np.empty(n_events, dtype=object)
+    sig_dates = np.empty(n_events, dtype="datetime64[ns]")
+    ent_dates = np.empty(n_events, dtype="datetime64[ns]")
+    entry_price_arr = np.full(n_events, np.nan, dtype=np.float32)
+    entry_rs_arr = np.full(n_events, np.nan, dtype=np.float32)
+    entry_right_arr = np.full(n_events, np.nan, dtype=np.float32)
+    entry_heat_arr = np.full(n_events, np.nan, dtype=np.float32)
+    cohort_tradeable_arr = np.zeros(n_events, dtype=bool)
+    cohort_rs85_arr = np.zeros(n_events, dtype=bool)
+
+    strategy_key_to_col = {k: j for j, k in enumerate(rule_keys.tolist())}
+
+    for n, (code, sig_idx, entry_idx, cohort_tradeable, cohort_rs85) in enumerate(entries):
+        b = stock_blocks[code]
+        opens_all = b["open"]; closes_all = b["close"]
+        entry_price = _num(opens_all[entry_idx]) or _num(closes_all[entry_idx])
         if entry_price is None or entry_price <= 0:
             continue
+        entry_price = float(entry_price)
 
-        horizon_end = entry_idx + max_hold - 1
-        path = g.iloc[entry_idx:horizon_end + 1].copy()
-        opens = pd.to_numeric(path["open"], errors="coerce").to_numpy(dtype=float)
-        closes = pd.to_numeric(path["close"], errors="coerce").to_numpy(dtype=float)
-        highs = pd.to_numeric(path["high"], errors="coerce").to_numpy(dtype=float)
-        lows = pd.to_numeric(path["low"], errors="coerce").to_numpy(dtype=float)
-        heat = pd.to_numeric(path["heat"], errors="coerce").fillna(-999).to_numpy(dtype=float)
-        bias = pd.to_numeric(path["bias20"], errors="coerce").fillna(-999).to_numpy(dtype=float)
-        rs = pd.to_numeric(path["rs"], errors="coerce").to_numpy(dtype=float)
-        right = pd.to_numeric(path["right"], errors="coerce").fillna(0).to_numpy(dtype=float)
-        ma20chg = pd.to_numeric(path["ma20_change"], errors="coerce").to_numpy(dtype=float)
-        ma60chg = pd.to_numeric(path["ma60_change"], errors="coerce").to_numpy(dtype=float)
-        spreadchg = pd.to_numeric(path["spread_change"], errors="coerce").to_numpy(dtype=float)
-        ma20 = pd.to_numeric(path["ma20"], errors="coerce").to_numpy(dtype=float)
-        ma60 = pd.to_numeric(path["ma60"], errors="coerce").to_numpy(dtype=float)
-        duck = path["duck"].to_numpy(dtype=bool)
+        sl = slice(entry_idx, entry_idx + max_hold)
+        closes = b["close"][sl].astype(np.float64, copy=False)
+        highs = b["high"][sl].astype(np.float64, copy=False)
+        lows = b["low"][sl].astype(np.float64, copy=False)
+        heat = b["heat"][sl].astype(np.float64, copy=False)
+        bias = b["bias20"][sl].astype(np.float64, copy=False)
+        rs = b["rs"][sl].astype(np.float64, copy=False)
+        right = b["right"][sl].astype(np.float64, copy=False)
+        ma20chg = b["ma20_change"][sl].astype(np.float64, copy=False)
+        ma60chg = b["ma60_change"][sl].astype(np.float64, copy=False)
+        spreadchg = b["spread_change"][sl].astype(np.float64, copy=False)
+        ma20 = b["ma20"][sl].astype(np.float64, copy=False)
+        ma60 = b["ma60"][sl].astype(np.float64, copy=False)
+        duck = b["duck"][sl]
+
+        # Replace missing OHLC defensively with close/entry values for path metrics.
+        safe_close = np.where(np.isfinite(closes) & (closes > 0), closes, entry_price)
+        safe_high = np.where(np.isfinite(highs) & (highs > 0), highs, safe_close)
+        safe_low = np.where(np.isfinite(lows) & (lows > 0), lows, safe_close)
 
         rs_for_peak = np.where(np.isfinite(rs), rs, -np.inf)
         peak_rs = np.maximum.accumulate(rs_for_peak)
         rs85_arm = np.maximum.accumulate(rs_for_peak >= 85)
-        right70_arm = np.maximum.accumulate(right >= 70)
-        right60_arm = np.maximum.accumulate(right >= 60)
-        right50_arm = np.maximum.accumulate(right >= 50)
-        hot70_arm = np.maximum.accumulate(heat >= 70)
+        right70_arm = np.maximum.accumulate(np.where(np.isfinite(right), right, 0) >= 70)
+        right60_arm = np.maximum.accumulate(np.where(np.isfinite(right), right, 0) >= 60)
+        right50_arm = np.maximum.accumulate(np.where(np.isfinite(right), right, 0) >= 50)
+        hot70_arm = np.maximum.accumulate(np.where(np.isfinite(heat), heat, -999) >= 70)
 
         rs_drop5 = np.isfinite(rs) & (rs <= peak_rs - 5.0)
         rs_drop10 = np.isfinite(rs) & (rs <= peak_rs - 10.0)
         ma20_down = np.isfinite(ma20chg) & (ma20chg <= 0)
         ma60_down = np.isfinite(ma60chg) & (ma60chg <= 0)
         spread_down = np.isfinite(spreadchg) & (spreadchg <= 0)
-        below_ma20 = np.isfinite(ma20) & (closes < ma20)
-        below_ma60 = np.isfinite(ma60) & (closes < ma60)
+        below_ma20 = np.isfinite(ma20) & (safe_close < ma20)
+        below_ma60 = np.isfinite(ma60) & (safe_close < ma60)
         weak_count = (
-            spread_down.astype(int) + ma20_down.astype(int) + rs_drop5.astype(int)
-            + below_ma20.astype(int) + (right < 60).astype(int)
+            spread_down.astype(np.int8) + ma20_down.astype(np.int8) + rs_drop5.astype(np.int8)
+            + below_ma20.astype(np.int8) + (np.where(np.isfinite(right), right, 0) < 60).astype(np.int8)
         )
 
-        masks: Dict[str, np.ndarray] = {
-            "heat70": heat >= 70,
-            "heat80": heat >= 80,
-            "heat85": heat >= 85,
-            "heat90": heat >= 90,
-            "bias8": bias >= 8,
+        masks = np.zeros((max_hold, nr), dtype=bool)
+        base_masks = {
+            "heat70": np.where(np.isfinite(heat), heat, -999) >= 70,
+            "heat80": np.where(np.isfinite(heat), heat, -999) >= 80,
+            "heat85": np.where(np.isfinite(heat), heat, -999) >= 85,
+            "heat90": np.where(np.isfinite(heat), heat, -999) >= 90,
+            "bias8": np.where(np.isfinite(bias), bias, -999) >= 8,
             "rs_cross85": rs85_arm & np.isfinite(rs) & (rs < 85),
             "rs_drop5": rs_drop5,
             "rs_drop10": rs_drop10,
@@ -535,102 +592,131 @@ def simulate_trades(signals: pd.DataFrame, start: dt.date, end: dt.date, max_hol
             "below_ma20": below_ma20,
             "below_ma60": below_ma60,
             "duck_exit": ~duck,
-            "right_cross70": right70_arm & (right < 70),
-            "right_cross60": right60_arm & (right < 60),
-            "right_cross50": right50_arm & (right < 50),
+            "right_cross70": right70_arm & (np.where(np.isfinite(right), right, 0) < 70),
+            "right_cross60": right60_arm & (np.where(np.isfinite(right), right, 0) < 60),
+            "right_cross50": right50_arm & (np.where(np.isfinite(right), right, 0) < 50),
             "hot70_spread": hot70_arm & spread_down,
             "hot70_ma20": hot70_arm & ma20_down,
             "hot70_rs5": hot70_arm & rs_drop5,
             "hot70_below_ma20": hot70_arm & below_ma20,
             "hot70_2weak": hot70_arm & (weak_count >= 2),
         }
+        for k, m in base_masks.items():
+            j = strategy_key_to_col[k]
+            masks[:, j] = m
         for fixed in sorted({int(r[1].replace("hold", "")) for r in benchmark_rules}):
-            k = f"hold{fixed}"
-            m = np.zeros(max_hold, dtype=bool)
-            m[fixed - 1] = True
-            masks[k] = m
+            j = strategy_key_to_col[f"hold{fixed}"]
+            masks[fixed - 1, j] = True
 
-        oracle_high = max(float(np.nanmax(highs)), float(entry_price))
-        oracle_low = min(float(np.nanmin(lows)), float(entry_price))
+        has_hit = masks.any(axis=0)
+        offsets = masks.argmax(axis=0).astype(np.int16)
+        offsets[~has_hit] = max_hold - 1
+        hit_idx = entry_idx + offsets.astype(np.int64)
+        exit_idx = hit_idx + 1
+
+        exit_open = opens_all[exit_idx].astype(np.float64, copy=False)
+        exit_close = closes_all[exit_idx].astype(np.float64, copy=False)
+        exit_price = np.where(np.isfinite(exit_open) & (exit_open > 0), exit_open, exit_close)
+        valid_exit = np.isfinite(exit_price) & (exit_price > 0)
+
+        cum_high = np.maximum.accumulate(np.maximum(safe_high, entry_price))
+        cum_low = np.minimum.accumulate(np.minimum(safe_low, entry_price))
+        local_high = np.maximum(cum_high[offsets], np.where(valid_exit, exit_price, entry_price))
+        local_low = np.minimum(cum_low[offsets], np.where(valid_exit, exit_price, entry_price))
+        oracle_high = max(float(cum_high[-1]), entry_price)
         oracle_mfe = (oracle_high / entry_price - 1.0) * 100.0
-        oracle_mae = (oracle_low / entry_price - 1.0) * 100.0
-        peak_local = int(np.nanargmax(highs)) if np.isfinite(highs).any() else 0
-        peak_day = path.iloc[peak_local]["date"].date().isoformat()
-        days_to_peak = peak_local + 1
 
-        for rule_name, key, rule_type in all_rules:
-            offset = first_hit(masks[key])
-            forced = offset is None
-            if forced:
-                offset = max_hold - 1
-            hit_idx = entry_idx + int(offset)
-            exit_exec_idx = hit_idx + 1
-            if exit_exec_idx >= len(g):
-                continue
-            hit = g.iloc[hit_idx]
-            outrow = g.iloc[exit_exec_idx]
-            exit_price = _num(outrow.get("open")) or _num(outrow.get("close"))
-            if exit_price is None or exit_price <= 0:
-                continue
+        ret = np.full(nr, np.nan, dtype=np.float64)
+        ret[valid_exit] = (exit_price[valid_exit] / entry_price - 1.0) * 100.0
+        mae = (local_low / entry_price - 1.0) * 100.0
+        give = oracle_mfe - ret
+        cap = np.full(nr, np.nan, dtype=np.float64)
+        if oracle_mfe > 0.001:
+            cap[valid_exit] = np.clip(ret[valid_exit] / oracle_mfe * 100.0, -300.0, 120.0)
 
-            upto = int(offset) + 1
-            local_high = max(float(np.nanmax(highs[:upto])), float(exit_price), float(entry_price))
-            local_low = min(float(np.nanmin(lows[:upto])), float(exit_price), float(entry_price))
-            ret = (exit_price / entry_price - 1.0) * 100.0
-            mfe_to_exit = (local_high / entry_price - 1.0) * 100.0
-            mae_to_exit = (local_low / entry_price - 1.0) * 100.0
-            giveback60 = oracle_mfe - ret
-            capture60 = (ret / oracle_mfe * 100.0) if oracle_mfe > 0.001 else np.nan
-            if pd.notna(capture60):
-                capture60 = float(np.clip(capture60, -300, 120))
+        post5 = np.full(nr, np.nan, dtype=np.float64)
+        post10 = np.full(nr, np.nan, dtype=np.float64)
+        idx5 = exit_idx + 5
+        ok5 = valid_exit & (idx5 < len(closes_all))
+        if ok5.any():
+            p5 = closes_all[idx5[ok5]].astype(np.float64, copy=False)
+            good = np.isfinite(p5) & (p5 > 0)
+            tmp = np.flatnonzero(ok5)
+            post5[tmp[good]] = (p5[good] / exit_price[tmp[good]] - 1.0) * 100.0
+        idx10 = exit_idx + 10
+        ok10 = valid_exit & (idx10 < len(closes_all))
+        if ok10.any():
+            p10 = closes_all[idx10[ok10]].astype(np.float64, copy=False)
+            good = np.isfinite(p10) & (p10 > 0)
+            tmp = np.flatnonzero(ok10)
+            post10[tmp[good]] = (p10[good] / exit_price[tmp[good]] - 1.0) * 100.0
 
-            post5 = post10 = np.nan
-            if exit_exec_idx + 5 < len(g):
-                p5 = _num(g.iloc[exit_exec_idx + 5].get("close"))
-                if p5 is not None: post5 = (p5 / exit_price - 1.0) * 100.0
-            if exit_exec_idx + 10 < len(g):
-                p10 = _num(g.iloc[exit_exec_idx + 10].get("close"))
-                if p10 is not None: post10 = (p10 / exit_price - 1.0) * 100.0
+        ret_mat[n] = ret.astype(np.float32)
+        cap_mat[n] = cap.astype(np.float32)
+        give_mat[n] = give.astype(np.float32)
+        mae_mat[n] = mae.astype(np.float32)
+        post5_mat[n] = post5.astype(np.float32)
+        post10_mat[n] = post10.astype(np.float32)
+        exit_price_mat[n] = np.where(valid_exit, exit_price, np.nan).astype(np.float32)
+        hold_mat[n] = (exit_idx - entry_idx).astype(np.int16)
+        trigger_mat[n] = has_hit
+        exit_sig_dates[n] = b["date"][hit_idx]
+        exit_dates[n] = b["date"][exit_idx]
 
-            base = {
-                "代號": code,
-                "名稱": str(ent.get("name") or sig.get("name") or ""),
-                "市場": str(ent.get("market") or sig.get("market") or ""),
-                "進場訊號日": sig["date"].date().isoformat(),
-                "進場日": ent["date"].date().isoformat(),
-                "進場價": round(float(entry_price), 4),
-                "進場RS": round(_num(sig.get("rs"), np.nan), 2) if _num(sig.get("rs")) is not None else np.nan,
-                "進場右側": round(_num(sig.get("right"), np.nan), 2) if _num(sig.get("right")) is not None else np.nan,
-                "進場過熱": round(_num(sig.get("heat"), np.nan), 2) if _num(sig.get("heat")) is not None else np.nan,
-                "策略": rule_name,
-                "策略代碼": key,
-                "類型": rule_type,
-                "出場訊號日": hit["date"].date().isoformat(),
-                "出場日": outrow["date"].date().isoformat(),
-                "出場價": round(float(exit_price), 4),
-                "持有交易日": int(exit_exec_idx - entry_idx),
-                "策略有觸發": not forced,
-                "報酬%": round(float(ret), 4),
-                "出場前MFE%": round(float(mfe_to_exit), 4),
-                "出場前MAE%": round(float(mae_to_exit), 4),
-                f"{max_hold}日最佳可能漲幅%": round(float(oracle_mfe), 4),
-                f"{max_hold}日最大不利%": round(float(oracle_mae), 4),
-                f"{max_hold}日峰值捕捉率%": round(float(capture60), 4) if pd.notna(capture60) else np.nan,
-                f"相對{max_hold}日高點回吐%": round(float(giveback60), 4),
-                "固定窗高點日": peak_day,
-                "進場後高點第幾日": int(days_to_peak),
-                "出場後5日%": round(float(post5), 4) if pd.notna(post5) else np.nan,
-                "出場後10日%": round(float(post10), 4) if pd.notna(post10) else np.nan,
-            }
-            base["群組_可交易"] = "新進且可交易" in cohorts
-            base["群組_RS85未過熱"] = "新進+RS85+未過熱" in cohorts
-            rows.append(base)
+        event_code[n] = code
+        event_name[n] = str(b["name"][sig_idx] or "")
+        event_market[n] = str(b["market"][sig_idx] or "")
+        sig_dates[n] = b["date"][sig_idx]
+        ent_dates[n] = b["date"][entry_idx]
+        entry_price_arr[n] = np.float32(entry_price)
+        entry_rs_arr[n] = np.float32(b["rs"][sig_idx]) if np.isfinite(b["rs"][sig_idx]) else np.nan
+        entry_right_arr[n] = np.float32(b["right"][sig_idx]) if np.isfinite(b["right"][sig_idx]) else np.nan
+        entry_heat_arr[n] = np.float32(b["heat"][sig_idx]) if np.isfinite(b["heat"][sig_idx]) else np.nan
+        cohort_tradeable_arr[n] = cohort_tradeable
+        cohort_rs85_arr[n] = cohort_rs85
 
-        if n == 1 or n % 250 == 0 or n == len(entries):
-            print(f"[trade] {n}/{len(entries)} entry events simulated", flush=True)
+        done = n + 1
+        if done == 1 or done % 1000 == 0 or done == n_events:
+            print(f"[trade] {done}/{n_events} entry events simulated", flush=True)
 
-    trades = pd.DataFrame(rows)
-    return trades, {"entry_events": len(entries), "skipped_recent_no_full_horizon": skipped_future}
+    # Flatten compact numeric matrices. Categories prevent repeated strategy/code/name
+    # strings from ballooning memory while keeping downstream groupby semantics.
+    rep_event = np.repeat(np.arange(n_events), nr)
+    tiled_rule = np.tile(np.arange(nr), n_events)
+    trades = pd.DataFrame({
+        "代號": pd.Categorical(event_code[rep_event]),
+        "名稱": pd.Categorical(event_name[rep_event]),
+        "市場": pd.Categorical(event_market[rep_event]),
+        "進場訊號日": sig_dates[rep_event],
+        "進場日": ent_dates[rep_event],
+        "進場價": entry_price_arr[rep_event],
+        "進場RS": entry_rs_arr[rep_event],
+        "進場右側": entry_right_arr[rep_event],
+        "進場過熱": entry_heat_arr[rep_event],
+        "策略": pd.Categorical(rule_names[tiled_rule]),
+        "策略代碼": pd.Categorical(rule_keys[tiled_rule]),
+        "類型": pd.Categorical(rule_types[tiled_rule]),
+        "出場訊號日": exit_sig_dates.reshape(-1),
+        "出場日": exit_dates.reshape(-1),
+        "出場價": exit_price_mat.reshape(-1),
+        "持有交易日": hold_mat.reshape(-1),
+        "策略有觸發": trigger_mat.reshape(-1),
+        "報酬%": ret_mat.reshape(-1),
+        "出場前MAE%": mae_mat.reshape(-1),
+        f"{max_hold}日峰值捕捉率%": cap_mat.reshape(-1),
+        f"相對{max_hold}日高點回吐%": give_mat.reshape(-1),
+        "出場後5日%": post5_mat.reshape(-1),
+        "出場後10日%": post10_mat.reshape(-1),
+        "群組_可交易": cohort_tradeable_arr[rep_event],
+        "群組_RS85未過熱": cohort_rs85_arr[rep_event],
+    })
+    trades = trades[pd.to_numeric(trades["出場價"], errors="coerce").notna()].reset_index(drop=True)
+    return trades, {
+        "entry_events": n_events,
+        "skipped_recent_no_full_horizon": skipped_future,
+        "rule_count": nr,
+        "optimization": "v1.1 numpy-matrix",
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -653,7 +739,7 @@ def summarize_trades(trades: pd.DataFrame, max_hold: int) -> pd.DataFrame:
     for cohort, view in _cohort_views(trades):
         if view.empty:
             continue
-        for (strategy, key, kind), g in view.groupby(["策略", "策略代碼", "類型"], dropna=False):
+        for (strategy, key, kind), g in view.groupby(["策略", "策略代碼", "類型"], dropna=False, observed=True):
             ret = pd.to_numeric(g["報酬%"], errors="coerce")
             cap = pd.to_numeric(g[peak_col], errors="coerce")
             give = pd.to_numeric(g[give_col], errors="coerce")
@@ -742,7 +828,7 @@ def annual_summary(trades: pd.DataFrame, max_hold: int) -> pd.DataFrame:
         x = view.copy()
         x["年度"] = pd.to_datetime(x["進場日"], errors="coerce").dt.year
         q = (
-            x.groupby(["策略", "類型", "年度"], dropna=False)
+            x.groupby(["策略", "類型", "年度"], dropna=False, observed=True)
             .agg(
                 樣本數=("報酬%", "count"),
                 中位報酬=("報酬%", "median"),
@@ -886,6 +972,34 @@ def heat_event_study(signals: pd.DataFrame, start: dt.date, end: dt.date) -> Tup
 # ---------------------------------------------------------------------------
 # Excel / status output
 # ---------------------------------------------------------------------------
+def select_excel_trade_detail(trades: pd.DataFrame, summary: pd.DataFrame, max_rows: int = 320000) -> pd.DataFrame:
+    """Keep Excel readable and below the one-sheet row ceiling.
+
+    Full strategy-event results remain in memory for ranking.  Excel receives
+    only the #1 strategy from each cohort plus fixed-hold benchmarks.  This is
+    enough to audit the recommendation while avoiding ~1M detail rows.
+    """
+    if trades is None or trades.empty:
+        return pd.DataFrame()
+    keys = set()
+    if summary is not None and not summary.empty:
+        top = summary[(summary["類型"] != "基準") & (pd.to_numeric(summary["群組排名"], errors="coerce") == 1)]
+        keys.update(top["策略代碼"].astype(str).tolist())
+    keys.update([k for k in trades[trades["類型"].astype(str) == "基準"]["策略代碼"].astype(str).unique().tolist()])
+    detail = trades[trades["策略代碼"].astype(str).isin(keys)].copy()
+    detail = detail.sort_values(["進場日", "代號", "策略"]).reset_index(drop=True)
+    if len(detail) > max_rows:
+        # Prefer all leader rows; thin benchmark detail deterministically if needed.
+        lead = detail[detail["類型"].astype(str) != "基準"]
+        bench = detail[detail["類型"].astype(str) == "基準"]
+        room = max(0, max_rows - len(lead))
+        if room < len(bench):
+            step = max(1, int(math.ceil(len(bench) / max(1, room))))
+            bench = bench.iloc[::step].head(room)
+        detail = pd.concat([lead, bench], ignore_index=True).head(max_rows)
+    return detail
+
+
 def write_outputs(
     summary: pd.DataFrame,
     best: pd.DataFrame,
@@ -896,8 +1010,6 @@ def write_outputs(
     status: dict,
 ) -> None:
     summary.to_csv(OUT_SUMMARY, index=False, encoding="utf-8-sig")
-    OUT_STATUS.write_text(json.dumps(status, ensure_ascii=False, indent=2), encoding="utf-8")
-
     notes = pd.DataFrame({
         "說明": [
             "第一階段只比較可逐日、Point-in-time 重建的技術/RS/右側/過熱出場條件；歷史基本面與估值不硬塞入回測。",
@@ -908,8 +1020,13 @@ def write_outputs(
             "綜合分數：30%中位報酬、25%峰值捕捉、20%低回吐、15%出場後10日不再續漲、10%低MAE；觸發率太低會小幅折扣。",
             "綜合分數只用來排序研究優先級，不代表已找到永遠有效的最佳參數；需再看年度穩定度與較長歷史。",
             "最近進場事件若沒有完整最大持有窗，會排除在公平比較之外。",
+            "v1.1：排行榜仍使用全部策略×全部事件；Excel 的交易明細只保留各進場群組第1名策略與固定持有基準，避免明細超過單表合理容量。",
         ]
     })
+
+    trade_detail = select_excel_trade_detail(trades, summary)
+    status["excel_trade_detail_rows"] = int(len(trade_detail))
+    OUT_STATUS.write_text(json.dumps(status, ensure_ascii=False, indent=2), encoding="utf-8")
 
     with pd.ExcelWriter(OUT_XLSX, engine="xlsxwriter") as writer:
         book = writer.book
@@ -924,7 +1041,7 @@ def write_outputs(
             ("年度穩定度", annual),
             ("過熱事件統計", heat_summary),
             ("過熱事件明細", heat_detail),
-            ("交易明細", trades),
+            ("交易明細_精選", trade_detail),
             ("說明", notes),
         ]
         for name, df in sheets:
@@ -955,7 +1072,7 @@ def write_outputs(
 
 def run(start: dt.date, end: dt.date, max_hold: int, fetch_missing: bool, workers: int) -> int:
     warmup_start = start - dt.timedelta(days=WARMUP_CALENDAR_DAYS)
-    print("=== 個股出場策略回測 ===", flush=True)
+    print("=== 個股出場策略回測 v1.1（高速矩陣版）===", flush=True)
     print(f"正式研究區間: {start} ~ {end}", flush=True)
     print(f"RS/均線暖機: {warmup_start} 起", flush=True)
     print(f"最大共同持有窗: {max_hold} 交易日", flush=True)
@@ -964,6 +1081,7 @@ def run(start: dt.date, end: dt.date, max_hold: int, fetch_missing: bool, worker
     raw, cache_meta = load_market_cache(warmup_start, end)
     print(f"[data] {cache_meta}", flush=True)
     signals = compute_signals(raw)
+    del raw
     valid_rs = signals[(signals["date"].dt.date >= start) & signals["rs"].notna()]
     print(
         f"[signal] rows={len(signals):,}; research RS rows={len(valid_rs):,}; "
@@ -971,10 +1089,13 @@ def run(start: dt.date, end: dt.date, max_hold: int, fetch_missing: bool, worker
         flush=True,
     )
 
+    print("[phase] simulate exit rules", flush=True)
     trades, trade_meta = simulate_trades(signals, start, end, max_hold=max_hold)
+    print(f"[phase] compact trade rows={len(trades):,}; summarize", flush=True)
     summary = summarize_trades(trades, max_hold=max_hold)
     annual = annual_summary(trades, max_hold=max_hold)
     best = best_by_metric(summary)
+    print("[phase] heat-event study", flush=True)
     heat_detail, heat_summary = heat_event_study(signals, start, end)
 
     status = {
