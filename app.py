@@ -1075,6 +1075,11 @@ exposure_plan=market_exposure_plan(rs_latest,market_lr,quality,early_signal_stat
 st.title("📈 台股分析中心")
 st.markdown('<div class="hero-sub">RS 市場廣度 × 鴨嘴型態 × 培育中心｜正式網頁版 v2.9｜操作儀表板版</div>',unsafe_allow_html=True)
 
+# 盤中雷達快捷按鈕
+if st.button("📡 開啟盤中即時市場雷達", type="primary", use_container_width=True):
+    st.switch_page("pages/1_📡_盤中雷達.py")
+st.page_link("pages/1_📡_盤中雷達.py", label="📡 進入盤中即時市場雷達")
+
 u_status=update_status.get("status","unknown")
 last_run=update_status.get("last_run_taipei","—")
 message=update_status.get("message","")
