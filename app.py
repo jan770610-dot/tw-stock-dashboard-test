@@ -17,6 +17,7 @@ APP_DIR = Path(__file__).resolve().parent
 DEFAULT_RS = APP_DIR / "rs_latest.xlsx"
 DEFAULT_DUCK = APP_DIR / "duck_latest.xlsx"
 STATUS_FILE = APP_DIR / "update_status.json"
+INTRADAY_BASELINE_FILE = APP_DIR / "intraday_baseline.pkl.gz"
 ACTIONS_URL = "https://github.com/jan770610-dot/tw-stock-dashboard-test/actions/workflows/daily-update.yml"
 
 st.set_page_config(page_title="台股分析中心", page_icon="📈", layout="wide", initial_sidebar_state="expanded")
@@ -164,6 +165,33 @@ def filter_stock_table(df, query):
 def load_update_status():
     try: return json.loads(STATUS_FILE.read_text(encoding="utf-8"))
     except Exception: return {}
+
+
+@st.cache_data(show_spinner=False)
+def _load_all_market_formal_rs(path_s: str, mtime_ns: int) -> pd.DataFrame:
+    """從每日更新後建立的 intraday baseline 讀取全市場正式 RS。
+
+    formal_rs 由 automation/build_intraday_baseline.py 直接用最新正式交易日
+    的 250 交易日報酬全市場百分位計算，與 RS 主系統的排名定義一致。
+    舊版 baseline 尚未有 formal_rs 時回傳空表，由既有強勢/復甦 RS 備援。
+    """
+    try:
+        b = pd.read_pickle(path_s, compression="gzip")
+    except Exception:
+        return pd.DataFrame(columns=["代號", "RS_全市場正式", "RS正式日期"])
+    if b is None or b.empty or "code" not in b.columns or "formal_rs" not in b.columns:
+        return pd.DataFrame(columns=["代號", "RS_全市場正式", "RS正式日期"])
+    z = b[[c for c in ["code", "formal_rs", "base_date"] if c in b.columns]].copy()
+    z["代號"] = z["code"].astype(str).str.replace(r"\.0$", "", regex=True).str.strip()
+    z["RS_全市場正式"] = pd.to_numeric(z["formal_rs"], errors="coerce")
+    z["RS正式日期"] = z["base_date"].astype(str) if "base_date" in z.columns else ""
+    return z[["代號", "RS_全市場正式", "RS正式日期"]].drop_duplicates("代號", keep="last")
+
+
+def load_all_market_formal_rs() -> pd.DataFrame:
+    if not INTRADAY_BASELINE_FILE.exists():
+        return pd.DataFrame(columns=["代號", "RS_全市場正式", "RS正式日期"])
+    return _load_all_market_formal_rs(str(INTRADAY_BASELINE_FILE), INTRADAY_BASELINE_FILE.stat().st_mtime_ns)
 
 
 def card(label, value, delta=""):
@@ -827,7 +855,7 @@ def index_lr_assessment(row, prefix, label):
     else: phase="⏳ 等待"; action="尚無明顯左右側優勢"
     return {"名稱":label,"收盤":close,"左側分數":round(left,1),"右側分數":round(right,1),"階段":phase,"建議":action,"依據":"；".join(reasons)}
 
-def build_stock_lr_table(master, strong, recovery):
+def build_stock_lr_table(master, strong, recovery, formal_rs=None):
     """個股左右側量化代理。
     左側偏重估值、基本面與跌深修復；右側偏重價格趨勢、鴨嘴完成度與 RS。
     """
@@ -836,7 +864,14 @@ def build_stock_lr_table(master, strong, recovery):
     if "代號" not in x.columns: return pd.DataFrame()
     x["代號"]=x["代號"].astype(str).str.replace(r"\.0$","",regex=True)
 
-    # 合併 RS。強勢名單與復甦名單只有符合者才有值；其餘不硬造 RS。
+    # RS 優先順序：全市場正式 RS → 強勢名單 RS → 復甦候選 RS。
+    # v3.3.1 起全市場正式 RS 由 intraday_baseline 每日盤後一起產生，
+    # 因此不再只有「強勢／復甦」股票才看得到 RS。
+    if formal_rs is not None and not formal_rs.empty and "代號" in formal_rs.columns:
+        a0=formal_rs[[c for c in ["代號","RS_全市場正式","RS正式日期"] if c in formal_rs.columns]].copy()
+        a0["代號"]=a0["代號"].astype(str).str.replace(r"\.0$","",regex=True)
+        a0=a0.drop_duplicates("代號",keep="last")
+        x=x.merge(a0,on="代號",how="left")
     if strong is not None and not strong.empty and "代號" in strong.columns:
         a=strong[[c for c in ["代號","RS"] if c in strong.columns]].copy()
         a["代號"]=a["代號"].astype(str).str.replace(r"\.0$","",regex=True)
@@ -847,9 +882,18 @@ def build_stock_lr_table(master, strong, recovery):
         b["代號"]=b["代號"].astype(str).str.replace(r"\.0$","",regex=True)
         b=b.rename(columns={"RS":"RS_復甦"}).drop_duplicates("代號")
         x=x.merge(b,on="代號",how="left")
+    if "RS_全市場正式" not in x.columns: x["RS_全市場正式"]=pd.NA
+    if "RS正式日期" not in x.columns: x["RS正式日期"]=""
     if "RS_強勢" not in x.columns: x["RS_強勢"]=pd.NA
     if "RS_復甦" not in x.columns: x["RS_復甦"]=pd.NA
-    x["RS判讀"]=pd.to_numeric(x["RS_強勢"],errors="coerce").combine_first(pd.to_numeric(x["RS_復甦"],errors="coerce"))
+    rs_all=pd.to_numeric(x["RS_全市場正式"],errors="coerce")
+    rs_strong=pd.to_numeric(x["RS_強勢"],errors="coerce")
+    rs_recovery=pd.to_numeric(x["RS_復甦"],errors="coerce")
+    x["RS判讀"]=rs_all.combine_first(rs_strong).combine_first(rs_recovery)
+    x["RS來源"]=pd.Series("資料不足",index=x.index,dtype="object")
+    x.loc[rs_recovery.notna(),"RS來源"]="正式復甦候選"
+    x.loc[rs_strong.notna(),"RS來源"]="正式強勢名單"
+    x.loc[rs_all.notna(),"RS來源"]="全市場正式"
 
     rows=[]
     for _,r in x.iterrows():
@@ -1044,7 +1088,8 @@ def stock_decision_compact(df: pd.DataFrame) -> pd.DataFrame:
     out["過熱"]=df.apply(lambda r:f"{_num(r.get('過熱程度'),0):.0f}",axis=1)
     out["鴨嘴"]=df.apply(stock_duck_summary,axis=1)
     out["培育"]=df.apply(stock_cultivation_summary,axis=1)
-    if "RS判讀" in df.columns: out["RS"]=pd.to_numeric(df["RS判讀"],errors="coerce").round(1)
+    if "RS判讀" in df.columns:
+        out["RS"]=df.apply(lambda r: (f"{_num(r.get('RS判讀')):.1f}" if _num(r.get('RS判讀')) is not None else "—"),axis=1)
     out["估值"]=df.apply(stock_valuation_summary,axis=1)
     if "今日升降級" in df.columns: out["今日變化"]=df["今日升降級"].map(lambda v:_clean_cell(v) or "—")
     return out.reset_index(drop=True)
@@ -1144,7 +1189,8 @@ next_trigger=next_market_trigger(rs_latest,market_lr)
 short_trigger=short_market_trigger(rs_latest,market_lr)
 twii_lr=index_lr_assessment(rs_latest,"twii","加權")
 twoii_lr=index_lr_assessment(rs_latest,"twoii","櫃買")
-stock_lr=build_stock_lr_table(master,strong,recovery)
+formal_rs_all=load_all_market_formal_rs()
+stock_lr=build_stock_lr_table(master,strong,recovery,formal_rs_all)
 pre_status=pre.get("預備鴨嘴狀態",pd.Series(dtype=str)).fillna("").astype(str) if not pre.empty else pd.Series(dtype=str)
 pre_a=int(pre_status.str.contains("A級").sum()) if not pre_status.empty else 0
 pre_b=int(pre_status.str.contains("B級").sum()) if not pre_status.empty else 0
@@ -1426,7 +1472,7 @@ def _manual_stock_lookup(manager):
 
 st.title("📈 台股分析中心")
 st.markdown(
-    '<div class="hero-sub">RS 市場廣度 × 鴨嘴型態 × 培育中心｜正式網頁版 v3.3｜背景掃描 × 個股決策中心</div>',
+    '<div class="hero-sub">RS 市場廣度 × 鴨嘴型態 × 培育中心｜正式網頁版 v3.3.1｜背景掃描 × 個股決策中心 × 全市場RS</div>',
     unsafe_allow_html=True
 )
 
@@ -1655,7 +1701,7 @@ with tabs[1]:
             asc=[True,False,False,False][:len(sort_cols)]
             sx=sx.sort_values(sort_cols,ascending=asc,na_position="last")
         compact=stock_decision_compact(sx)
-        st.caption(f"符合目前篩選：{len(sx):,} 檔。主表刻意拿掉長篇分析文字；先看操作、左右側、過熱、鴨嘴、培育、RS 與估值。")
+        st.caption(f"符合目前篩選：{len(sx):,} 檔。RS 優先採全市場正式排名；若舊 baseline 尚未補齊，暫以強勢／復甦名單備援，真正無資料才顯示「—」。")
         st.dataframe(compact,hide_index=True,use_container_width=True,height=520)
 
         st.write("### ② 單檔決策卡")
@@ -1687,7 +1733,7 @@ with tabs[1]:
             decision_cards([
                 ("鴨嘴",duck_s,f"完成度 {safe_num(r.get('鴨嘴完成度%'),0,'%')}｜{_clean_cell(r.get('預備鴨嘴狀態')) or '無預備標記'}"),
                 ("培育中心",cult_s,f"EPS年增 {safe_num(eps_v,1,'%')}｜{_clean_cell(r.get('培育中心類別')) or '—'}"),
-                ("RS／復甦",f"RS {safe_num(rs_v,1)}",f"復甦分數 {safe_num(rec_v,1)}"),
+                ("RS／復甦",f"RS {safe_num(rs_v,1)}",f"{_clean_cell(r.get('RS來源')) or '資料不足'}｜復甦分數 {safe_num(rec_v,1)}"),
                 ("估值",val_s,f"合理價 {safe_num(fair_v,2)}｜{_clean_cell(r.get('估值狀態')) or '—'}"),
             ])
             st.info(f"**一句話判讀：** {stock_one_line(r)}")
@@ -1924,4 +1970,4 @@ with tabs[7]:
     with open(DEFAULT_RS,"rb") as f: d1.download_button("下載 RS 最新結果",f.read(),file_name="rs_latest.xlsx",mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",use_container_width=True)
     with open(DEFAULT_DUCK,"rb") as f: d2.download_button("下載鴨嘴最新結果",f.read(),file_name="duck_latest.xlsx",mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",use_container_width=True)
 
-st.divider(); st.caption(f"正式版 v3.3｜背景掃描 × 個股決策中心｜RS：{rs_date}｜鴨嘴：{duck_date}｜量化篩選與市場廣度工具，不構成投資建議。")
+st.divider(); st.caption(f"正式版 v3.3.1｜個股決策中心 × 全市場RS｜RS：{rs_date}｜鴨嘴：{duck_date}｜量化篩選與市場廣度工具，不構成投資建議。")
