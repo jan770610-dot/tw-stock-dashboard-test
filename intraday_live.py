@@ -388,11 +388,54 @@ def build_snapshot(daily: pd.DataFrame, strong: pd.DataFrame) -> dict:
     if qt is not None and qt.astype(str).str.len().gt(0).any():
         newest_time = qt.astype(str).replace("", pd.NA).dropna().max()
 
-    live_cols = ["code", "name", "market", "last", "ret_pct", "rs_live", "ma20_live", "ma50_live", "ma60_live", "ma200_live", "amount_est", "strong_live"]
+    # Per-stock diagnostics used by the v3.1 change radar and manual lookup.
+    # These are still intraday trial values; formal inclusion/exit is confirmed after close.
+    x["cond_rs"] = x["rs_live"] > RS_THRESHOLD
+    x["cond_price_ma200"] = x["last"] > x["ma200_live"]
+    x["cond_ma50_ma200"] = x["ma50_live"] > x["ma200_live"]
+    x["cond_amount"] = x["amount_est"] > AMOUNT_MIN
+    x["cond_52high"] = x["last"] >= x["high250_live"] * (1.0 - MAX_BELOW_52W_HIGH)
+    x["cond_52low"] = x["last"] >= x["low250_live"] * (1.0 + MIN_ABOVE_52W_LOW)
+    cond_cols = ["cond_rs", "cond_price_ma200", "cond_ma50_ma200", "cond_amount", "cond_52high", "cond_52low"]
+    x["strong_cond_count"] = x[cond_cols].fillna(False).astype(int).sum(axis=1)
+
+    def _missing_conditions(r):
+        items = []
+        if not bool(r.get("cond_rs")): items.append("RS>85")
+        if not bool(r.get("cond_price_ma200")): items.append("股價>MA200")
+        if not bool(r.get("cond_ma50_ma200")): items.append("MA50>MA200")
+        if not bool(r.get("cond_amount")): items.append("成交額>3000萬")
+        if not bool(r.get("cond_52high")): items.append("距52週高點≤25%")
+        if not bool(r.get("cond_52low")): items.append("高於52週低點≥30%")
+        return "、".join(items) if items else "已全部符合"
+
+    x["strong_missing"] = x.apply(_missing_conditions, axis=1)
+    # "即將符合"：只差一項正式盤中強勢條件，而且所有門檻都已接近。
+    x["near_strong"] = (
+        (~x["strong_live"])
+        & (x["strong_cond_count"] >= 5)
+        & (x["rs_live"] >= 80.0)
+        & (x["amount_est"] >= 20_000_000.0)
+        & (x["last"] > x["ma200_live"])
+        & (x["ma50_live"] > x["ma200_live"])
+        & (x["last"] >= x["high250_live"] * 0.70)
+        & (x["last"] >= x["low250_live"] * 1.25)
+    )
+    x["duck_price_live"] = (x["last"] > x["ma20_live"]) & (x["ma20_live"] > x["ma60_live"])
+    x["ma20_gap_pct"] = (x["last"] / x["ma20_live"] - 1.0) * 100.0
+
+    live_cols = [
+        "code", "name", "market", "last", "ret_pct", "rs_live",
+        "ma20_live", "ma50_live", "ma60_live", "ma200_live", "amount_est",
+        "strong_live", "strong_cond_count", "strong_missing", "near_strong",
+        "duck_price_live", "ma20_gap_pct",
+    ]
     live_stocks = x[live_cols].copy()
     live_stocks = live_stocks.rename(columns={
         "code": "代號", "name": "名稱", "market": "市場", "last": "盤中價", "ret_pct": "漲跌幅%", "rs_live": "盤中RS",
-        "ma20_live": "盤中MA20", "ma50_live": "盤中MA50", "ma60_live": "盤中MA60", "ma200_live": "盤中MA200", "amount_est": "盤中成交金額估算", "strong_live": "盤中強勢",
+        "ma20_live": "盤中MA20", "ma50_live": "盤中MA50", "ma60_live": "盤中MA60", "ma200_live": "盤中MA200", "amount_est": "盤中成交金額估算",
+        "strong_live": "盤中強勢", "strong_cond_count": "強勢條件通過數", "strong_missing": "強勢尚缺條件", "near_strong": "即將強勢",
+        "duck_price_live": "盤中鴨嘴價格結構", "ma20_gap_pct": "月線乖離率%",
     })
 
     return {
@@ -523,8 +566,10 @@ def _render_once(daily: pd.DataFrame, strong: pd.DataFrame, all_ok: pd.DataFrame
         candidate_codes = _code_set(all_ok) | _code_set(pre)
         z = stocks[stocks["代號"].astype(str).isin(candidate_codes)].copy()
         if not z.empty:
-            z["月線乖離率%"] = (pd.to_numeric(z["盤中價"], errors="coerce") / pd.to_numeric(z["盤中MA20"], errors="coerce") - 1) * 100
-            z["盤中鴨嘴價格結構"] = (pd.to_numeric(z["盤中價"], errors="coerce") > pd.to_numeric(z["盤中MA20"], errors="coerce")) & (pd.to_numeric(z["盤中MA20"], errors="coerce") > pd.to_numeric(z["盤中MA60"], errors="coerce"))
+            if "月線乖離率%" not in z.columns:
+                z["月線乖離率%"] = (pd.to_numeric(z["盤中價"], errors="coerce") / pd.to_numeric(z["盤中MA20"], errors="coerce") - 1) * 100
+            if "盤中鴨嘴價格結構" not in z.columns:
+                z["盤中鴨嘴價格結構"] = (pd.to_numeric(z["盤中價"], errors="coerce") > pd.to_numeric(z["盤中MA20"], errors="coerce")) & (pd.to_numeric(z["盤中MA20"], errors="coerce") > pd.to_numeric(z["盤中MA60"], errors="coerce"))
             z = z.sort_values(["盤中鴨嘴價格結構", "月線乖離率%"], ascending=[False, False])
         st.caption("這裡即時計算價格、MA20/MA60 與乖離；正式『新進／退出』仍以鴨嘴完整條件在盤後確認。")
         show = [c for c in ["代號", "名稱", "市場", "盤中價", "漲跌幅%", "盤中MA20", "盤中MA60", "月線乖離率%", "盤中鴨嘴價格結構", "盤中RS"] if c in z.columns]
