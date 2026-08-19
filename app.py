@@ -1075,10 +1075,22 @@ exposure_plan=market_exposure_plan(rs_latest,market_lr,quality,early_signal_stat
 st.title("📈 台股分析中心")
 st.markdown('<div class="hero-sub">RS 市場廣度 × 鴨嘴型態 × 培育中心｜正式網頁版 v2.9｜操作儀表板版</div>',unsafe_allow_html=True)
 
-# 盤中雷達快捷按鈕
-if st.button("📡 開啟盤中即時市場雷達", type="primary", use_container_width=True):
-    st.switch_page("pages/1_📡_盤中雷達.py")
-st.page_link("pages/1_📡_盤中雷達.py", label="📡 進入盤中即時市場雷達")
+# 盤中雷達快捷按鈕：直接在首頁展開，避免 multipage 路徑相容性問題
+if "show_intraday_radar" not in st.session_state:
+    st.session_state["show_intraday_radar"] = False
+
+_btn_label = "✖ 關閉盤中即時市場雷達" if st.session_state["show_intraday_radar"] else "📡 開啟盤中即時市場雷達"
+if st.button(_btn_label, type="primary", use_container_width=True):
+    st.session_state["show_intraday_radar"] = not st.session_state["show_intraday_radar"]
+    st.rerun()
+
+if st.session_state["show_intraday_radar"]:
+    try:
+        from intraday_live import render_intraday_panel
+        render_intraday_panel(daily, strong, all_ok, pre, rs_latest)
+    except Exception as e:
+        st.error(f"盤中雷達載入失敗：{e}")
+        st.caption("正式盤後系統不受影響。")
 
 u_status=update_status.get("status","unknown")
 last_run=update_status.get("last_run_taipei","—")
