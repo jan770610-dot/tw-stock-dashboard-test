@@ -102,12 +102,15 @@ jobs:
       - name: Run RS and Duckbill updates
         run: python -u automation/auto_update.py --date "${{ steps.target.outputs.date }}" --attempts 3 --retry-minutes 8
 
+      - name: Build intraday baseline
+        run: python -u automation/build_intraday_baseline.py
+
       - name: Commit latest results to dashboard
         shell: bash
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add rs_latest.xlsx duck_latest.xlsx update_status.json
+          git add rs_latest.xlsx duck_latest.xlsx update_status.json intraday_baseline.pkl.gz intraday_baseline_status.json
           if git diff --cached --quiet; then
             echo "No dashboard file changes."
           else
