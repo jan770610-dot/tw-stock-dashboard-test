@@ -1,4 +1,4 @@
-name: 個股出場策略回測
+name: 個股出場策略回測 v1.1
 
 on:
   workflow_dispatch:
@@ -23,9 +23,9 @@ on:
           - "60"
           - "80"
       fetch_missing:
-        description: "自動補抓缺少的 TWSE/TPEx 官方歷史行情"
+        description: "自動補抓缺少的 TWSE/TPEx 官方歷史行情；已有seed/cache時建議false"
         required: true
-        default: true
+        default: false
         type: boolean
 
 permissions:
@@ -118,7 +118,7 @@ jobs:
             echo "RS daily history cache restored."
           fi
 
-      - name: Run exit strategy backtest
+      - name: Run exit strategy backtest v1.1
         shell: bash
         env:
           FETCH_MISSING: ${{ inputs.fetch_missing }}
