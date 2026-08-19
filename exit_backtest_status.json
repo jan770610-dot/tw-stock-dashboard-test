@@ -1,8 +1,9 @@
 {
   "status": "success",
-  "generated_at_taipei": "2026-08-19 19:30:20",
+  "generated_at_taipei": "2026-08-19 19:42:07",
   "research_start": "2023-01-03",
-  "research_end": "2026-08-19",
+  "research_end_requested": "2026-08-19",
+  "research_end_effective": "2026-08-14",
   "warmup_start": "2021-10-30",
   "max_hold_sessions": 60,
   "cache": {
@@ -25,8 +26,9 @@
     "entry_events": 42056,
     "skipped_recent_no_full_horizon": 3152,
     "rule_count": 25,
-    "optimization": "v1.1 numpy-matrix"
+    "optimization": "v1.2 numpy-matrix + triggered-only validation"
   },
+  "validation": "v1.2 actual-trigger separated; annual stability",
   "trade_rows": 1051400,
   "summary_rows": 75,
   "heat_events": 49052,
@@ -34,38 +36,42 @@
   "outputs": [
     "exit_backtest_latest.xlsx",
     "exit_backtest_summary.csv",
+    "exit_backtest_validation.csv",
     "exit_backtest_status.json"
   ],
   "current_leaders": [
     {
       "進場群組": "全部鴨嘴新進",
-      "策略": "過熱70後RS回落5",
-      "綜合分數": 73.18,
-      "中位報酬%": 0.68,
-      "中位峰值捕捉率%": 6.06,
-      "平均高點回吐%": 21.705,
-      "樣本數": 42056,
-      "有效觸發率%": 46.88
+      "策略": "過熱分數≥80",
+      "綜合分數": 73.21,
+      "觸發_中位報酬%": 9.375,
+      "觸發_勝率%": 87.93,
+      "觸發_中位持有日": 7.0,
+      "有效觸發率%": 52.75,
+      "年度正報酬率%": 100.0,
+      "可靠度": "高"
     },
     {
       "進場群組": "新進+RS85+未過熱",
       "策略": "過熱分數≥90",
-      "綜合分數": 73.18,
-      "中位報酬%": 6.754,
-      "中位峰值捕捉率%": 18.06,
-      "平均高點回吐%": 28.604,
-      "樣本數": 5154,
-      "有效觸發率%": 59.04
+      "綜合分數": 73.22,
+      "觸發_中位報酬%": 11.596,
+      "觸發_勝率%": 97.86,
+      "觸發_中位持有日": 10.0,
+      "有效觸發率%": 59.04,
+      "年度正報酬率%": 100.0,
+      "可靠度": "高"
     },
     {
       "進場群組": "新進且可交易",
       "策略": "過熱分數≥70",
-      "綜合分數": 72.73,
-      "中位報酬%": 3.813,
-      "中位峰值捕捉率%": 17.73,
-      "平均高點回吐%": 20.784,
-      "樣本數": 34128,
-      "有效觸發率%": 50.33
+      "綜合分數": 72.93,
+      "觸發_中位報酬%": 10.118,
+      "觸發_勝率%": 94.77,
+      "觸發_中位持有日": 13.0,
+      "有效觸發率%": 50.33,
+      "年度正報酬率%": 100.0,
+      "可靠度": "高"
     }
   ],
   "excel_trade_detail_rows": 252336
