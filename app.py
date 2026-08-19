@@ -18,7 +18,7 @@ DEFAULT_DUCK = APP_DIR / "duck_latest.xlsx"
 STATUS_FILE = APP_DIR / "update_status.json"
 ACTIONS_URL = "https://github.com/jan770610-dot/tw-stock-dashboard-test/actions/workflows/daily-update.yml"
 
-st.set_page_config(page_title="台股分析中心", page_icon="📈", layout="wide", initial_sidebar_state="collapsed")
+st.set_page_config(page_title="台股分析中心", page_icon="📈", layout="wide", initial_sidebar_state="expanded")
 
 st.markdown("""
 <style>
