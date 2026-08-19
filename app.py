@@ -4,6 +4,7 @@ from __future__ import annotations
 from io import BytesIO
 from pathlib import Path
 import datetime as dt
+from zoneinfo import ZoneInfo
 import html
 import json
 import math
@@ -1072,73 +1073,227 @@ left_signal_phase=risk_signal_phase(left_alert,left_signal_stats,left_reduce_sta
 early_signal_phase=early_signal_phase(early_signal_stats)
 exposure_plan=market_exposure_plan(rs_latest,market_lr,quality,early_signal_stats,left_alert,left_reduce_stats)
 
-st.title("📈 台股分析中心")
-st.markdown('<div class="hero-sub">RS 市場廣度 × 鴨嘴型態 × 培育中心｜正式網頁版 v2.9｜操作儀表板版</div>',unsafe_allow_html=True)
+# ===== v3.0 單一儀表板：盤中/收盤試算與正式資料自動切換 =====
+TAIPEI_TZ = ZoneInfo("Asia/Taipei")
+now_tpe = dt.datetime.now(TAIPEI_TZ)
+today_tpe = now_tpe.strftime("%Y-%m-%d")
+is_weekday = now_tpe.weekday() < 5
+is_market_session = is_weekday and dt.time(9, 0) <= now_tpe.time() <= dt.time(13, 30)
+formal_today_ready = latest_date == today_tpe
 
-# 盤中雷達快捷按鈕：直接在首頁展開，避免 multipage 路徑相容性問題
-if "show_intraday_radar" not in st.session_state:
-    st.session_state["show_intraday_radar"] = False
-
-_btn_label = "✖ 關閉盤中即時市場雷達" if st.session_state["show_intraday_radar"] else "📡 開啟盤中即時市場雷達"
-if st.button(_btn_label, type="primary", use_container_width=True):
-    st.session_state["show_intraday_radar"] = not st.session_state["show_intraday_radar"]
-    st.rerun()
-
-if st.session_state["show_intraday_radar"]:
-    try:
-        from intraday_live import render_intraday_panel
-        render_intraday_panel(daily, strong, all_ok, pre, rs_latest)
-    except Exception as e:
-        st.error(f"盤中雷達載入失敗：{e}")
-        st.caption("正式盤後系統不受影響。")
-
-u_status=update_status.get("status","unknown")
-last_run=update_status.get("last_run_taipei","—")
-message=update_status.get("message","")
-if rs_date==duck_date:
-    cls="status-ok" if u_status in {"success","ready","bootstrap"} else "status-warn"
-    st.markdown(f'<div class="status-strip {cls}"><b>資料日：</b>{latest_date}　｜　<b>自動更新：</b>週一至週五 18:05 啟動　｜　<b>最近排程：</b>{html.escape(str(last_run))}</div>',unsafe_allow_html=True)
+if formal_today_ready:
+    dashboard_mode = "formal"
+elif is_market_session:
+    dashboard_mode = "intraday"
+elif is_weekday and now_tpe.time() > dt.time(13, 30):
+    dashboard_mode = "close_trial"
 else:
-    st.markdown(f'<div class="status-strip status-warn"><b>資料日期不同：</b>RS {rs_date}／鴨嘴 {duck_date}。排程會保留各系統最後成功結果。</div>',unsafe_allow_html=True)
-if u_status in {"partial","no_new_data"} and message: st.warning(message)
-elif u_status=="error" and message: st.error(message)
+    dashboard_mode = "previous_close"
 
-st.write("### 今日決策摘要")
-decision_cards([
-    ("市場在哪裡",f"{market_signal(stage)}｜{stage}",f"{water}；{stage_plain(stage)}"),
-    ("總曝險參考",exposure_plan["顯示"],f"{exposure_plan['層級']}｜{exposure_plan['說明']}"),
-    ("現在怎麼做",operation_level,market_lr["左右側建議"]),
-    ("早期轉強",early_signal_phase,signal_current_text(early_signal_stats)),
-    ("風險／減碼",left_signal_phase,signal_current_text(left_reduce_stats if risk_signal_level(left_alert)=="reduce" else left_signal_stats)),
-    ("下一個升級／降級條件",short_trigger,next_trigger),
-])
+
+def _trial_exposure_reference(snap: dict) -> tuple[str, str]:
+    stage_now = str(snap.get("stage") or "")
+    lo, hi = {
+        "低檔續弱": (10, 25), "低檔整理": (15, 30), "低檔回升": (25, 45),
+        "中段走弱": (20, 35), "中段整理": (30, 50), "中段回升": (45, 65),
+        "高檔轉弱": (20, 40), "高檔整理": (40, 60), "高檔續強": (55, 75),
+    }.get(stage_now, (25, 45))
+    w = _num(snap.get("wade"), 50) or 50
+    risk_now = str(snap.get("risk") or "")
+    if w >= 65:
+        lo += 5; hi += 5
+    elif w < 45:
+        lo -= 5; hi -= 5
+    if risk_now.startswith("🟡"):
+        hi -= 10
+    elif risk_now.startswith("🟠"):
+        lo = min(lo, 25); hi = min(hi, 40)
+    lo = max(0, min(90, int(round(lo / 5) * 5)))
+    hi = max(lo + 5, min(95, int(round(hi / 5) * 5)))
+    label = "盤中試算" if dashboard_mode == "intraday" else "收盤試算"
+    return f"{lo}–{hi}%", label
+
+
+def _metric_delta(cur, prev, digits=1, suffix=""):
+    a = _num(cur); b = _num(prev)
+    if a is None or b is None:
+        return None
+    d = a - b
+    return f"較{latest_date}正式 {d:+.{digits}f}{suffix}"
+
+
+def _render_trial_summary():
+    try:
+        from intraday_live import build_snapshot
+        snap = build_snapshot(daily, strong)
+    except Exception as e:
+        st.error(f"今日試算資料暫時無法建立：{e}")
+        st.caption(f"目前先顯示最新正式資料 {latest_date}；正式盤後系統不受影響。")
+        return
+
+    trial_exposure, trial_exposure_label = _trial_exposure_reference(snap)
+    mode_title = "📡 今日盤中試算" if dashboard_mode == "intraday" else "🧾 今日收盤試算（等待正式更新）"
+    mode_note = (
+        "上方摘要每 90 秒局部更新；下方表格、搜尋、分頁不會跟著重跑。"
+        if dashboard_mode == "intraday"
+        else "13:30 後停止自動刷新；保留最後可用行情，等待 18:05 正式資料更新。"
+    )
+
+    st.write(f"### {mode_title}")
+    st.caption(
+        f"{mode_note}｜比較基準：{latest_date} 正式收盤｜"
+        f"最後抓取：{snap.get('snapshot_time','—')}｜報價覆蓋率：{_fmt_trial(snap.get('coverage'),1,'%')}"
+    )
+
+    c1, c2, c3, c4, c5, c6 = st.columns(6)
+    c1.metric(
+        "RS 強勢股",
+        f"{int(snap.get('strong_count',0)):,} 檔",
+        _metric_delta(snap.get("strong_count"), strong_count, 0, " 檔"),
+    )
+    c2.metric(
+        "Wade 試算",
+        _fmt_trial(snap.get("wade"), 1),
+        _metric_delta(snap.get("wade"), wade_score, 1),
+    )
+    c3.metric(
+        "上漲比例",
+        _fmt_trial(snap.get("advance_ratio"), 1, "%"),
+        _metric_delta(snap.get("advance_ratio"), advance_ratio, 1, " pct"),
+    )
+    c4.metric("市場階段", str(snap.get("stage") or "—"), f"{latest_date}：{stage}")
+    c5.metric("市場水位", str(snap.get("water") or "—"), f"{latest_date}：{water}")
+    c6.metric("總曝險參考", trial_exposure, trial_exposure_label)
+
+    risk_now = str(snap.get("risk") or "未觸發")
+    early_now = str(snap.get("early") or "未觸發")
+    action_now = str(snap.get("action") or "觀望等待")
+    if risk_now.startswith("🟠"):
+        st.warning(f"**今日試算風險：{risk_now}**｜操作：{action_now}")
+    elif risk_now.startswith("🟡"):
+        st.warning(f"**今日試算風險：{risk_now}**｜操作：{action_now}")
+    elif early_now.startswith("🟢"):
+        st.success(f"**今日試算轉強：{early_now}**｜操作：{action_now}")
+    else:
+        st.info(f"**今日試算：{snap.get('wade_state','—')}**｜風險：{risk_now}｜操作：{action_now}")
+
+    decision_cards([
+        ("今天市場在哪裡", f"{snap.get('stage','—')}｜{snap.get('water','—')}",
+         f"昨日正式：{stage}｜{water}"),
+        ("現在怎麼做", action_now, f"昨日正式：{operation_level}"),
+        ("總曝險參考", trial_exposure, f"昨日正式：{exposure_plan['顯示']}"),
+        ("早期轉強", early_now, f"昨日正式：{early_signal_phase}"),
+        ("風險／減碼", risk_now, f"昨日正式：{left_signal_phase}"),
+        ("盤中強弱", f"Wade {_fmt_trial(snap.get('wade'),1)}",
+         f"上漲 {_fmt_trial(snap.get('advance_ratio'),1,'%')}｜新高/新低 {snap.get('new_high',0)}/{snap.get('new_low',0)}"),
+    ])
+
+
+def _fmt_trial(v, digits=1, suffix=""):
+    x = _num(v)
+    return "—" if x is None else f"{x:,.{digits}f}{suffix}"
+
+
+st.title("📈 台股分析中心")
 st.markdown(
-    f'<div class="focus-box"><b>今天只看三件事：</b><br>'
-    f'① 部位：總曝險參考 <b>{html.escape(exposure_plan["顯示"])}</b>（{html.escape(exposure_plan["層級"])}）<br>'
-    f'② 訊號：早期轉強 {html.escape(early_signal_phase)}；風險/減碼 {html.escape(left_signal_phase)}<br>'
-    f'③ 操作：{html.escape(operation_level)}；{html.escape(next_trigger)}<br>'
-    f'<span class="small-note">曝險百分比是相對於你自行設定的股票最大風險預算，不是總資產配置。分數不是未來上漲機率；左右側評分為本系統量化代理，不是 Wade 官方公式。</span></div>',
+    '<div class="hero-sub">RS 市場廣度 × 鴨嘴型態 × 培育中心｜正式網頁版 v3.0｜盤中／正式單一儀表板</div>',
     unsafe_allow_html=True
 )
-st.markdown(stage_flow_html(stage),unsafe_allow_html=True)
 
-st.write("### 市場關鍵數據")
-cards([
-    ("歷史水位",water,f"全期 P{safe_num(full_rank,1)}／近3年 P{safe_num(rolling_rank,1)}"),
-    ("RS 強勢股",safe_num(strong_count,0," 檔"),f"占比 {safe_num(strong_pct,2,'%')}／單日 {safe_num(change,0,' 檔')}"),
-    ("Wade市場內部",safe_num(wade_score,1," 分"),f"今日 {signed_num(wade_day_change)}／5日 {signed_num(wade_change5)}"),
-    ("大盤左右側",market_lr["左右側階段"],f"左 {market_lr['左側分數']:.0f}／右 {market_lr['右側分數']:.0f}"),
-    ("總曝險參考",exposure_plan["顯示"],exposure_plan["層級"]),
-    ("資料完整度",f"{quality['資料完整度標籤']}／{quality['資料完整度']:.0f}","今天應有資料是否齊全"),
-    ("訊號一致度",f"{quality['訊號一致度標籤']}／{quality['訊號一致度']:.0f}","RS、Wade、廣度、多時間週期是否同向"),
-    ("鴨嘴符合",f"{len(all_ok):,} 檔",f"新進 {len(duck_new):,}／退出 {len(duck_exit):,}／A級 {pre_a:,}"),
-    ("復甦候選",f"{len(recovery):,} 檔","觀察 → 左側試單 → 接近右側確認"),
-])
+u_status = update_status.get("status", "unknown")
+last_run = update_status.get("last_run_taipei", "—")
+message = update_status.get("message", "")
 
-tabs=st.tabs(["🏠 總覽","↔️ 左右側決策","📊 RS／市場廣度","🧭 Wade大盤強弱","🌱 復甦候選","🦆 鴨嘴系統","🔥 鴨嘴×培育中心","📐 台指期","🧪 資料品質","🔄 更新資料"])
+if dashboard_mode == "intraday":
+    st.markdown(
+        f'<div class="status-strip status-ok"><b>目前模式：</b>📡 今日盤中試算　｜　'
+        f'<b>正式比較基準：</b>{latest_date}　｜　<b>上方摘要：</b>90秒局部更新　｜　'
+        f'<b>最近正式排程：</b>{html.escape(str(last_run))}</div>',
+        unsafe_allow_html=True
+    )
+elif dashboard_mode == "close_trial":
+    st.markdown(
+        f'<div class="status-strip status-warn"><b>目前模式：</b>🧾 今日收盤試算（等待正式更新）　｜　'
+        f'<b>正式比較基準：</b>{latest_date}　｜　<b>18:05：</b>正式更新後自動切換</div>',
+        unsafe_allow_html=True
+    )
+else:
+    cls = "status-ok" if u_status in {"success", "ready", "bootstrap"} else "status-warn"
+    mode_text = "✅ 今日正式收盤" if dashboard_mode == "formal" else "🕘 最新正式收盤"
+    st.markdown(
+        f'<div class="status-strip {cls}"><b>目前模式：</b>{mode_text}　｜　'
+        f'<b>資料日：</b>{latest_date}　｜　<b>自動更新：</b>週一至週五 18:05　｜　'
+        f'<b>最近排程：</b>{html.escape(str(last_run))}</div>',
+        unsafe_allow_html=True
+    )
+
+if u_status in {"partial", "no_new_data"} and message:
+    st.warning(message)
+elif u_status == "error" and message:
+    st.error(message)
+
+if dashboard_mode in {"intraday", "close_trial"}:
+    # 只讓「上方摘要」自動更新，避免使用者正在看的表格/搜尋/捲動位置被打斷。
+    if dashboard_mode == "intraday":
+        auto_top = st.toggle(
+            "上方摘要自動更新（90 秒，只更新這一區）",
+            value=True,
+            key="v30_top_auto_refresh",
+            help="關閉後，上方盤中摘要也不會自動更新。下方詳細資料原本就不會跟著自動刷新。"
+        )
+        if auto_top and hasattr(st, "fragment"):
+            @st.fragment(run_every="90s")
+            def _top_market_fragment():
+                _render_trial_summary()
+            _top_market_fragment()
+        else:
+            if auto_top and not hasattr(st, "fragment"):
+                st.info("目前 Streamlit 版本不支援局部刷新；已改為不自動重整，避免中斷使用。")
+            _render_trial_summary()
+    else:
+        _render_trial_summary()
+
+    st.caption(
+        "⬇️ 下方為「最新正式收盤／歷史詳細資料」，主要拿來比較與查核；"
+        "不會因上方 90 秒盤中更新而重新整理。"
+    )
+else:
+    st.write("### 今日決策摘要")
+    decision_cards([
+        ("市場在哪裡", f"{market_signal(stage)}｜{stage}", f"{water}；{stage_plain(stage)}"),
+        ("總曝險參考", exposure_plan["顯示"], f"{exposure_plan['層級']}｜{exposure_plan['說明']}"),
+        ("現在怎麼做", operation_level, market_lr["左右側建議"]),
+        ("早期轉強", early_signal_phase, signal_current_text(early_signal_stats)),
+        ("風險／減碼", left_signal_phase, signal_current_text(left_reduce_stats if risk_signal_level(left_alert)=="reduce" else left_signal_stats)),
+        ("下一個升級／降級條件", short_trigger, next_trigger),
+    ])
+    st.markdown(
+        f'<div class="focus-box"><b>今天只看三件事：</b><br>'
+        f'① 部位：總曝險參考 <b>{html.escape(exposure_plan["顯示"])}</b>（{html.escape(exposure_plan["層級"])}）<br>'
+        f'② 訊號：早期轉強 {html.escape(early_signal_phase)}；風險/減碼 {html.escape(left_signal_phase)}<br>'
+        f'③ 操作：{html.escape(operation_level)}；{html.escape(next_trigger)}<br>'
+        f'<span class="small-note">曝險百分比是相對於你自行設定的股票最大風險預算，不是總資產配置。</span></div>',
+        unsafe_allow_html=True
+    )
+    st.markdown(stage_flow_html(stage), unsafe_allow_html=True)
+
+    st.write("### 市場關鍵數據")
+    cards([
+        ("歷史水位", water, f"全期 P{safe_num(full_rank,1)}／近3年 P{safe_num(rolling_rank,1)}"),
+        ("RS 強勢股", safe_num(strong_count,0," 檔"), f"占比 {safe_num(strong_pct,2,'%')}／單日 {safe_num(change,0,' 檔')}"),
+        ("Wade市場內部", safe_num(wade_score,1," 分"), f"今日 {signed_num(wade_day_change)}／5日 {signed_num(wade_change5)}"),
+        ("大盤左右側", market_lr["左右側階段"], f"左 {market_lr['左側分數']:.0f}／右 {market_lr['右側分數']:.0f}"),
+        ("總曝險參考", exposure_plan["顯示"], exposure_plan["層級"]),
+        ("資料完整度", f"{quality['資料完整度標籤']}／{quality['資料完整度']:.0f}", "今天應有資料是否齊全"),
+        ("訊號一致度", f"{quality['訊號一致度標籤']}／{quality['訊號一致度']:.0f}", "RS、Wade、廣度、多時間週期是否同向"),
+        ("鴨嘴符合", f"{len(all_ok):,} 檔", f"新進 {len(duck_new):,}／退出 {len(duck_exit):,}／A級 {pre_a:,}"),
+        ("復甦候選", f"{len(recovery):,} 檔", "觀察 → 左側試單 → 接近右側確認"),
+    ])
+
+tabs=st.tabs(["🏠 正式基準","↔️ 左右側決策","📊 RS／市場廣度","🧭 Wade大盤強弱","🌱 復甦候選","🦆 鴨嘴系統","🔥 鴨嘴×培育中心","📐 台指期","🧪 資料品質","🔄 更新資料"])
 
 with tabs[0]:
-    st.subheader("今日一眼看懂")
+    st.subheader("正式收盤基準／歷史比較")
     decision_cards([
         ("市場狀態",f"{market_signal(stage)}｜{stage}",stage_plain(stage)),
         ("總曝險參考",exposure_plan["顯示"],f"{exposure_plan['層級']}｜{exposure_plan['說明']}"),
@@ -1442,4 +1597,4 @@ with tabs[9]:
     with open(DEFAULT_RS,"rb") as f: d1.download_button("下載 RS 最新結果",f.read(),file_name="rs_latest.xlsx",mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",use_container_width=True)
     with open(DEFAULT_DUCK,"rb") as f: d2.download_button("下載鴨嘴最新結果",f.read(),file_name="duck_latest.xlsx",mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",use_container_width=True)
 
-st.divider(); st.caption(f"正式版 v2.9｜操作儀表板｜RS：{rs_date}｜鴨嘴：{duck_date}｜量化篩選與市場廣度工具，不構成投資建議。")
+st.divider(); st.caption(f"正式版 v3.0｜盤中／正式單一儀表板｜RS：{rs_date}｜鴨嘴：{duck_date}｜量化篩選與市場廣度工具，不構成投資建議。")
