@@ -15,6 +15,7 @@ fetched with the existing RS official-data fetcher when --fetch-missing is used.
 Outputs are written at repository root:
   - exit_backtest_latest.xlsx
   - exit_backtest_summary.csv
+  - exit_backtest_validation.csv
   - exit_backtest_status.json
 
 This is research tooling, not an order-execution engine.
@@ -43,6 +44,7 @@ HOLIDAY_FILE = CACHE_DIR / "nontrading_dates.txt"
 STATUS_FILE = ROOT / "update_status.json"
 OUT_XLSX = ROOT / "exit_backtest_latest.xlsx"
 OUT_SUMMARY = ROOT / "exit_backtest_summary.csv"
+OUT_VALIDATION = ROOT / "exit_backtest_validation.csv"
 OUT_STATUS = ROOT / "exit_backtest_status.json"
 
 DEFAULT_START = dt.date(2023, 1, 3)
@@ -715,7 +717,7 @@ def simulate_trades(signals: pd.DataFrame, start: dt.date, end: dt.date, max_hol
         "entry_events": n_events,
         "skipped_recent_no_full_horizon": skipped_future,
         "rule_count": nr,
-        "optimization": "v1.1 numpy-matrix",
+        "optimization": "v1.2 numpy-matrix + triggered-only validation",
     }
 
 
@@ -730,145 +732,256 @@ def _cohort_views(trades: pd.DataFrame):
         yield "新進+RS85+未過熱", trades[trades["群組_RS85未過熱"].fillna(False).astype(bool)]
 
 
-def summarize_trades(trades: pd.DataFrame, max_hold: int) -> pd.DataFrame:
-    if trades.empty:
-        return pd.DataFrame()
+def _metric_pack(g: pd.DataFrame, max_hold: int, prefix: str = "") -> dict:
+    """Return a compact metric set for one policy/trigger subset."""
     peak_col = f"{max_hold}日峰值捕捉率%"
     give_col = f"相對{max_hold}日高點回吐%"
+    ret = pd.to_numeric(g.get("報酬%"), errors="coerce")
+    cap = pd.to_numeric(g.get(peak_col), errors="coerce")
+    give = pd.to_numeric(g.get(give_col), errors="coerce")
+    mae = pd.to_numeric(g.get("出場前MAE%"), errors="coerce")
+    p5 = pd.to_numeric(g.get("出場後5日%"), errors="coerce")
+    p10 = pd.to_numeric(g.get("出場後10日%"), errors="coerce")
+    hold = pd.to_numeric(g.get("持有交易日"), errors="coerce")
+    def f(s, fn, digits=3):
+        try:
+            v = getattr(s, fn)()
+            return round(float(v), digits) if pd.notna(v) else np.nan
+        except Exception:
+            return np.nan
+    return {
+        f"{prefix}平均報酬%": f(ret, "mean"),
+        f"{prefix}中位報酬%": f(ret, "median"),
+        f"{prefix}勝率%": round(float((ret > 0).mean() * 100.0), 2) if len(ret) else np.nan,
+        f"{prefix}平均持有日": f(hold, "mean", 2),
+        f"{prefix}中位持有日": f(hold, "median", 1),
+        f"{prefix}平均峰值捕捉率%": f(cap, "mean", 2),
+        f"{prefix}中位峰值捕捉率%": f(cap, "median", 2),
+        f"{prefix}平均高點回吐%": f(give, "mean"),
+        f"{prefix}中位高點回吐%": f(give, "median"),
+        f"{prefix}平均MAE%": f(mae, "mean"),
+        f"{prefix}平均出場後5日%": f(p5, "mean"),
+        f"{prefix}平均出場後10日%": f(p10, "mean"),
+    }
+
+
+def summarize_trades(trades: pd.DataFrame, max_hold: int) -> pd.DataFrame:
+    """v1.2: separate actual signal hits from max-hold fallback outcomes.
+
+    The old all-event policy metrics are preserved for comparability.  New
+    ``觸發_`` columns describe only cases where the exit signal really fired;
+    ``未觸發_`` columns show the cohort that simply reached the common max hold.
+    """
+    if trades.empty:
+        return pd.DataFrame()
     rows = []
     for cohort, view in _cohort_views(trades):
         if view.empty:
             continue
         for (strategy, key, kind), g in view.groupby(["策略", "策略代碼", "類型"], dropna=False, observed=True):
-            ret = pd.to_numeric(g["報酬%"], errors="coerce")
-            cap = pd.to_numeric(g[peak_col], errors="coerce")
-            give = pd.to_numeric(g[give_col], errors="coerce")
-            mae = pd.to_numeric(g["出場前MAE%"], errors="coerce")
-            p5 = pd.to_numeric(g["出場後5日%"], errors="coerce")
-            p10 = pd.to_numeric(g["出場後10日%"], errors="coerce")
-            hold = pd.to_numeric(g["持有交易日"], errors="coerce")
-            trigger = g["策略有觸發"].astype(bool)
-            rows.append({
+            trigger = g["策略有觸發"].fillna(False).astype(bool)
+            hit = g[trigger].copy()
+            miss = g[~trigger].copy()
+            row = {
                 "進場群組": cohort,
                 "策略": strategy,
                 "策略代碼": key,
                 "類型": kind,
-                "樣本數": int(ret.notna().sum()),
-                "有效觸發率%": round(float(trigger.mean() * 100.0), 2),
-                "平均報酬%": round(float(ret.mean()), 3),
-                "中位報酬%": round(float(ret.median()), 3),
-                "勝率%": round(float((ret > 0).mean() * 100.0), 2),
-                "平均持有日": round(float(hold.mean()), 2),
-                "中位持有日": round(float(hold.median()), 1),
-                "平均峰值捕捉率%": round(float(cap.mean()), 2),
-                "中位峰值捕捉率%": round(float(cap.median()), 2),
-                "平均高點回吐%": round(float(give.mean()), 3),
-                "中位高點回吐%": round(float(give.median()), 3),
-                "平均MAE%": round(float(mae.mean()), 3),
-                "平均出場後5日%": round(float(p5.mean()), 3),
-                "平均出場後10日%": round(float(p10.mean()), 3),
-            })
+                "樣本數": int(len(g)),
+                "觸發樣本數": int(len(hit)),
+                "未觸發樣本數": int(len(miss)),
+                "有效觸發率%": round(float(trigger.mean() * 100.0), 2) if len(g) else np.nan,
+            }
+            # Existing columns = policy performance, including max-hold fallback.
+            row.update(_metric_pack(g, max_hold=max_hold, prefix=""))
+            # Actual signal quality only.
+            row.update(_metric_pack(hit, max_hold=max_hold, prefix="觸發_"))
+            # What happened when the rule never fired within the common window.
+            row.update(_metric_pack(miss, max_hold=max_hold, prefix="未觸發_"))
+            rows.append(row)
     out = pd.DataFrame(rows)
     if out.empty:
         return out
 
-    # Transparent composite score. Benchmarks are shown but not given a recommendation rank.
-    out["綜合分數"] = np.nan
-    out["群組排名"] = np.nan
+    out["政策分數"] = np.nan
+    out["訊號分數"] = np.nan
+
+    def pct_rank(series: pd.Series, higher=True):
+        ss = pd.to_numeric(series, errors="coerce")
+        if not higher:
+            ss = -ss
+        return ss.rank(pct=True, method="average").fillna(0.0) * 100.0
+
     for cohort, idx in out.groupby("進場群組").groups.items():
-        sub = out.loc[idx].copy()
-        cand = sub["類型"] != "基準"
-        cidx = sub.index[cand]
+        cidx = pd.Index([i for i in idx if str(out.at[i, "類型"]) != "基準"])
         if len(cidx) == 0:
             continue
-        def pct_rank(series: pd.Series, higher=True):
-            ss = pd.to_numeric(series, errors="coerce")
-            if not higher:
-                ss = -ss
-            return ss.rank(pct=True, method="average").fillna(0.0) * 100.0
-        comp = (
+        policy = (
             0.30 * pct_rank(out.loc[cidx, "中位報酬%"], True)
             + 0.25 * pct_rank(out.loc[cidx, "中位峰值捕捉率%"], True)
             + 0.20 * pct_rank(out.loc[cidx, "平均高點回吐%"], False)
             + 0.15 * pct_rank(out.loc[cidx, "平均出場後10日%"], False)
             + 0.10 * pct_rank(out.loc[cidx, "平均MAE%"], True)
         )
-        trig = pd.to_numeric(out.loc[cidx, "有效觸發率%"], errors="coerce").fillna(0)
-        reliability_factor = np.where(trig >= 40, 1.0, np.where(trig >= 20, 0.92, 0.82))
-        comp = comp * reliability_factor
-        out.loc[cidx, "綜合分數"] = comp.round(2)
-        eligible = cidx[pd.to_numeric(out.loc[cidx, "有效觸發率%"], errors="coerce").fillna(0).to_numpy() >= 25.0]
-        if len(eligible):
-            out.loc[eligible, "群組排名"] = out.loc[eligible, "綜合分數"].rank(ascending=False, method="min").astype(float)
+        out.loc[cidx, "政策分數"] = policy.round(2)
 
-    out["是否進入綜合排名"] = np.where(
-        (out["類型"] != "基準") & (pd.to_numeric(out["有效觸發率%"], errors="coerce").fillna(0) >= 25.0),
-        "是", "否"
-    )
+        signal = (
+            0.30 * pct_rank(out.loc[cidx, "觸發_中位報酬%"], True)
+            + 0.25 * pct_rank(out.loc[cidx, "觸發_中位峰值捕捉率%"], True)
+            + 0.20 * pct_rank(out.loc[cidx, "觸發_平均高點回吐%"], False)
+            + 0.15 * pct_rank(out.loc[cidx, "觸發_平均出場後10日%"], False)
+            + 0.10 * pct_rank(out.loc[cidx, "觸發_平均MAE%"], True)
+        )
+        tr = pd.to_numeric(out.loc[cidx, "有效觸發率%"], errors="coerce").fillna(0)
+        ntr = pd.to_numeric(out.loc[cidx, "觸發樣本數"], errors="coerce").fillna(0)
+        reliability_factor = np.where(
+            (tr >= 40) & (ntr >= 150), 1.0,
+            np.where((tr >= 25) & (ntr >= 70), 0.92, 0.80)
+        )
+        out.loc[cidx, "訊號分數"] = (signal * reliability_factor).round(2)
 
-    def reliability(r):
-        n = int(r.get("樣本數", 0) or 0)
-        tr = float(r.get("有效觸發率%", 0) or 0)
-        if n >= 150 and tr >= 40: return "高"
-        if n >= 70 and tr >= 25: return "中"
-        return "需擴充樣本"
-    out["可靠度"] = out.apply(reliability, axis=1)
-    return out.sort_values(["進場群組", "類型", "群組排名", "綜合分數"], ascending=[True, True, True, False], na_position="last")
-
+    # Final validation rank is added after annual stability is known.
+    out["年度穩定分數"] = np.nan
+    out["綜合分數"] = np.nan
+    out["群組排名"] = np.nan
+    out["是否進入綜合排名"] = "否"
+    out["可靠度"] = "待年度驗證"
+    return out
 
 def annual_summary(trades: pd.DataFrame, max_hold: int) -> pd.DataFrame:
+    """Year-by-year policy and actual-trigger results."""
     if trades.empty:
         return pd.DataFrame()
-    peak_col = f"{max_hold}日峰值捕捉率%"
-    give_col = f"相對{max_hold}日高點回吐%"
-    parts = []
+    rows = []
     for cohort, view in _cohort_views(trades):
         if view.empty:
             continue
         x = view.copy()
         x["年度"] = pd.to_datetime(x["進場日"], errors="coerce").dt.year
-        q = (
-            x.groupby(["策略", "類型", "年度"], dropna=False, observed=True)
-            .agg(
-                樣本數=("報酬%", "count"),
-                中位報酬=("報酬%", "median"),
-                勝率=("報酬%", lambda ss: float((pd.to_numeric(ss, errors="coerce") > 0).mean() * 100.0)),
-                中位峰值捕捉=(peak_col, "median"),
-                平均高點回吐=(give_col, "mean"),
-                平均持有日=("持有交易日", "mean"),
-            )
-            .reset_index()
-        )
-        q.insert(0, "進場群組", cohort)
-        parts.append(q)
-    if not parts:
-        return pd.DataFrame()
-    out = pd.concat(parts, ignore_index=True)
-    return out.rename(columns={
-        "中位報酬": "中位報酬%",
-        "勝率": "勝率%",
-        "中位峰值捕捉": "中位峰值捕捉率%",
-        "平均高點回吐": "平均高點回吐%",
-    }).round(3)
+        for (strategy, key, kind, year), g in x.groupby(["策略", "策略代碼", "類型", "年度"], dropna=False, observed=True):
+            trigger = g["策略有觸發"].fillna(False).astype(bool)
+            hit = g[trigger]
+            row = {
+                "進場群組": cohort,
+                "策略": strategy,
+                "策略代碼": key,
+                "類型": kind,
+                "年度": int(year) if pd.notna(year) else year,
+                "樣本數": int(len(g)),
+                "觸發樣本數": int(len(hit)),
+                "未觸發樣本數": int((~trigger).sum()),
+                "有效觸發率%": round(float(trigger.mean() * 100.0), 2) if len(g) else np.nan,
+            }
+            row.update({f"全樣本_{k}": v for k, v in _metric_pack(g, max_hold, prefix="").items()})
+            row.update(_metric_pack(hit, max_hold, prefix="觸發_"))
+            rows.append(row)
+    return pd.DataFrame(rows)
 
 
-def best_by_metric(summary: pd.DataFrame) -> pd.DataFrame:
-    if summary.empty:
+def annual_stability_summary(annual: pd.DataFrame, min_trigger_year_samples: int = 30) -> pd.DataFrame:
+    if annual is None or annual.empty:
         return pd.DataFrame()
     rows = []
-    base = summary[(summary["類型"] != "基準") & (pd.to_numeric(summary["有效觸發率%"], errors="coerce").fillna(0) >= 25.0)].copy()
-    for cohort, g in base.groupby("進場群組"):
+    for (cohort, strategy, key, kind), g in annual.groupby(["進場群組", "策略", "策略代碼", "類型"], observed=True):
+        valid = g[pd.to_numeric(g["觸發樣本數"], errors="coerce").fillna(0) >= min_trigger_year_samples].copy()
+        med = pd.to_numeric(valid.get("觸發_中位報酬%"), errors="coerce") if not valid.empty else pd.Series(dtype=float)
+        pos = int((med > 0).sum()) if len(med) else 0
+        nyr = int(len(valid))
+        rows.append({
+            "進場群組": cohort,
+            "策略": strategy,
+            "策略代碼": key,
+            "類型": kind,
+            "年度有效年數": nyr,
+            "年度正中位報酬年數": pos,
+            "年度正報酬率%": round(pos / nyr * 100.0, 1) if nyr else np.nan,
+            "跨年中位報酬%": round(float(med.median()), 3) if len(med) else np.nan,
+            "最差年度中位報酬%": round(float(med.min()), 3) if len(med) else np.nan,
+            "最佳年度中位報酬%": round(float(med.max()), 3) if len(med) else np.nan,
+            "最低年度觸發率%": round(float(pd.to_numeric(valid["有效觸發率%"], errors="coerce").min()), 2) if nyr else np.nan,
+            "年度穩定分數": round(pos / nyr * 100.0, 2) if nyr else np.nan,
+        })
+    return pd.DataFrame(rows)
+
+
+def apply_validation_ranking(summary: pd.DataFrame, stability: pd.DataFrame) -> pd.DataFrame:
+    """Combine policy, actual-trigger quality, and year consistency.
+
+    This is a research-priority score, not an optimized trading parameter.
+    """
+    if summary is None or summary.empty:
+        return summary
+    out = summary.copy()
+    if stability is not None and not stability.empty:
+        keep = [
+            "進場群組", "策略代碼", "年度有效年數", "年度正中位報酬年數",
+            "年度正報酬率%", "跨年中位報酬%", "最差年度中位報酬%",
+            "最佳年度中位報酬%", "最低年度觸發率%", "年度穩定分數",
+        ]
+        out = out.drop(columns=[c for c in keep[2:] if c in out.columns], errors="ignore")
+        out = out.merge(stability[keep], on=["進場群組", "策略代碼"], how="left")
+    else:
+        out["年度有效年數"] = 0
+        out["年度正中位報酬年數"] = 0
+        out["年度正報酬率%"] = np.nan
+        out["年度穩定分數"] = np.nan
+
+    out["綜合分數"] = np.nan
+    out["群組排名"] = np.nan
+    out["是否進入綜合排名"] = "否"
+
+    for cohort, idx in out.groupby("進場群組").groups.items():
+        cidx = pd.Index([i for i in idx if str(out.at[i, "類型"]) != "基準"])
+        if len(cidx) == 0:
+            continue
+        p = pd.to_numeric(out.loc[cidx, "政策分數"], errors="coerce").fillna(0)
+        s = pd.to_numeric(out.loc[cidx, "訊號分數"], errors="coerce").fillna(0)
+        y = pd.to_numeric(out.loc[cidx, "年度穩定分數"], errors="coerce").fillna(0)
+        score = 0.40 * p + 0.45 * s + 0.15 * y
+        out.loc[cidx, "綜合分數"] = score.round(2)
+
+        tr = pd.to_numeric(out.loc[cidx, "有效觸發率%"], errors="coerce").fillna(0)
+        ntr = pd.to_numeric(out.loc[cidx, "觸發樣本數"], errors="coerce").fillna(0)
+        yrs = pd.to_numeric(out.loc[cidx, "年度有效年數"], errors="coerce").fillna(0)
+        eligible_mask = (tr >= 25) & (ntr >= 70) & (yrs >= 2)
+        eligible = cidx[eligible_mask.to_numpy()]
+        if len(eligible):
+            out.loc[eligible, "群組排名"] = out.loc[eligible, "綜合分數"].rank(ascending=False, method="min").astype(float)
+            out.loc[eligible, "是否進入綜合排名"] = "是"
+
+    def reliability(r):
+        n = int(_num(r.get("觸發樣本數"), 0) or 0)
+        tr = float(_num(r.get("有效觸發率%"), 0) or 0)
+        yrs = int(_num(r.get("年度有效年數"), 0) or 0)
+        if n >= 150 and tr >= 40 and yrs >= 3: return "高"
+        if n >= 70 and tr >= 25 and yrs >= 2: return "中"
+        return "需擴充樣本"
+    out["可靠度"] = out.apply(reliability, axis=1)
+    return out.sort_values(["進場群組", "類型", "群組排名", "綜合分數"], ascending=[True, True, True, False], na_position="last")
+
+def best_by_metric(summary: pd.DataFrame) -> pd.DataFrame:
+    if summary is None or summary.empty:
+        return pd.DataFrame()
+    rows = []
+    base = summary[
+        (summary["類型"] != "基準")
+        & (summary["是否進入綜合排名"].astype(str) == "是")
+    ].copy()
+    for cohort, g in base.groupby("進場群組", observed=True):
         if g.empty:
             continue
         specs = [
-            ("綜合第一", "綜合分數", True),
-            ("中位報酬最高", "中位報酬%", True),
-            ("峰值捕捉最好", "中位峰值捕捉率%", True),
-            ("高點回吐最小", "平均高點回吐%", False),
-            ("出場後10日最弱", "平均出場後10日%", False),
-            ("持有期風險最低", "平均MAE%", True),
+            ("v1.2驗證第一", "綜合分數", True),
+            ("實際觸發中位報酬最高", "觸發_中位報酬%", True),
+            ("實際觸發峰值捕捉最好", "觸發_中位峰值捕捉率%", True),
+            ("實際觸發高點回吐最小", "觸發_平均高點回吐%", False),
+            ("實際觸發後10日最弱", "觸發_平均出場後10日%", False),
+            ("年度一致性最好", "年度穩定分數", True),
+            ("最差年度表現最好", "最差年度中位報酬%", True),
         ]
         for label, col, higher in specs:
+            if col not in g.columns:
+                continue
             z = g.dropna(subset=[col])
             if z.empty:
                 continue
@@ -878,9 +991,10 @@ def best_by_metric(summary: pd.DataFrame) -> pd.DataFrame:
                 "評比": label,
                 "策略": r["策略"],
                 "數值": r[col],
-                "樣本數": r["樣本數"],
-                "有效觸發率%": r["有效觸發率%"],
-                "可靠度": r["可靠度"],
+                "觸發樣本數": r.get("觸發樣本數"),
+                "有效觸發率%": r.get("有效觸發率%"),
+                "年度正報酬率%": r.get("年度正報酬率%"),
+                "可靠度": r.get("可靠度"),
             })
     return pd.DataFrame(rows)
 
@@ -1004,12 +1118,22 @@ def write_outputs(
     summary: pd.DataFrame,
     best: pd.DataFrame,
     annual: pd.DataFrame,
+    stability: pd.DataFrame,
     heat_summary: pd.DataFrame,
     heat_detail: pd.DataFrame,
     trades: pd.DataFrame,
     status: dict,
 ) -> None:
     summary.to_csv(OUT_SUMMARY, index=False, encoding="utf-8-sig")
+    validation_cols = [c for c in [
+        "進場群組","策略","類型","群組排名","綜合分數","政策分數","訊號分數","年度穩定分數",
+        "樣本數","觸發樣本數","未觸發樣本數","有效觸發率%",
+        "觸發_中位報酬%","觸發_勝率%","觸發_中位持有日","觸發_中位峰值捕捉率%",
+        "觸發_平均高點回吐%","觸發_平均出場後10日%",
+        "年度有效年數","年度正中位報酬年數","年度正報酬率%","跨年中位報酬%","最差年度中位報酬%",
+        "可靠度"
+    ] if c in summary.columns]
+    summary[validation_cols].to_csv(OUT_VALIDATION, index=False, encoding="utf-8-sig")
     notes = pd.DataFrame({
         "說明": [
             "第一階段只比較可逐日、Point-in-time 重建的技術/RS/右側/過熱出場條件；歷史基本面與估值不硬塞入回測。",
@@ -1017,10 +1141,12 @@ def write_outputs(
             "RS：250交易日報酬在同一交易日全市場做百分位排名。",
             "進場：T日收盤確認『鴨嘴今日新進』，T+1日開盤成交；出場亦為T日收盤確認、T+1日開盤成交，避免收盤訊號偷看未來。",
             "峰值捕捉率與高點回吐都使用相同的最大持有窗，避免不同策略因觀察期間不同而失真。",
-            "綜合分數：30%中位報酬、25%峰值捕捉、20%低回吐、15%出場後10日不再續漲、10%低MAE；觸發率太低會小幅折扣。",
+            "政策分數沿用v1.1全事件評分；訊號分數只看真正觸發案例；v1.2最終綜合分數=40%政策分數＋45%訊號分數＋15%年度穩定分數。",
             "綜合分數只用來排序研究優先級，不代表已找到永遠有效的最佳參數；需再看年度穩定度與較長歷史。",
             "最近進場事件若沒有完整最大持有窗，會排除在公平比較之外。",
             "v1.1：排行榜仍使用全部策略×全部事件；Excel 的交易明細只保留各進場群組第1名策略與固定持有基準，避免明細超過單表合理容量。",
+            "v1.2：將『實際觸發』與『60日內未觸發而強制結算』完全拆開；最終驗證分數同時看政策結果、實際觸發品質與年度一致性。",
+            "年度穩定：單一年度至少30筆實際觸發才列入年度一致性；2026若資料尚未完整，視為部分年度，解讀時需保守。",
         ]
     })
 
@@ -1038,7 +1164,8 @@ def write_outputs(
         sheets = [
             ("出場策略排行榜", summary),
             ("各指標最佳", best),
-            ("年度穩定度", annual),
+            ("年度逐年驗證", annual),
+            ("年度穩定摘要", stability),
             ("過熱事件統計", heat_summary),
             ("過熱事件明細", heat_detail),
             ("交易明細_精選", trade_detail),
@@ -1072,7 +1199,7 @@ def write_outputs(
 
 def run(start: dt.date, end: dt.date, max_hold: int, fetch_missing: bool, workers: int) -> int:
     warmup_start = start - dt.timedelta(days=WARMUP_CALENDAR_DAYS)
-    print("=== 個股出場策略回測 v1.1（高速矩陣版）===", flush=True)
+    print("=== 個股出場策略回測 v1.2（觸發/未觸發分離＋年度驗證）===", flush=True)
     print(f"正式研究區間: {start} ~ {end}", flush=True)
     print(f"RS/均線暖機: {warmup_start} 起", flush=True)
     print(f"最大共同持有窗: {max_hold} 交易日", flush=True)
@@ -1080,6 +1207,10 @@ def run(start: dt.date, end: dt.date, max_hold: int, fetch_missing: bool, worker
     cache_report = ensure_history_cache(warmup_start, end, fetch_missing=fetch_missing, workers=workers)
     raw, cache_meta = load_market_cache(warmup_start, end)
     print(f"[data] {cache_meta}", flush=True)
+    cache_last = _date(cache_meta["last_date"])
+    effective_end = min(end, cache_last)
+    if effective_end < end:
+        print(f"[WARN] requested end={end}, available cache ends={cache_last}; effective end={effective_end}", flush=True)
     signals = compute_signals(raw)
     del raw
     valid_rs = signals[(signals["date"].dt.date >= start) & signals["rs"].notna()]
@@ -1090,40 +1221,45 @@ def run(start: dt.date, end: dt.date, max_hold: int, fetch_missing: bool, worker
     )
 
     print("[phase] simulate exit rules", flush=True)
-    trades, trade_meta = simulate_trades(signals, start, end, max_hold=max_hold)
+    trades, trade_meta = simulate_trades(signals, start, effective_end, max_hold=max_hold)
     print(f"[phase] compact trade rows={len(trades):,}; summarize", flush=True)
     summary = summarize_trades(trades, max_hold=max_hold)
     annual = annual_summary(trades, max_hold=max_hold)
+    stability = annual_stability_summary(annual)
+    summary = apply_validation_ranking(summary, stability)
     best = best_by_metric(summary)
     print("[phase] heat-event study", flush=True)
-    heat_detail, heat_summary = heat_event_study(signals, start, end)
+    heat_detail, heat_summary = heat_event_study(signals, start, effective_end)
 
     status = {
         "status": "success" if not summary.empty else "no_results",
         "generated_at_taipei": dt.datetime.now(dt.timezone(dt.timedelta(hours=8))).strftime("%Y-%m-%d %H:%M:%S"),
         "research_start": start.isoformat(),
-        "research_end": end.isoformat(),
+        "research_end_requested": end.isoformat(),
+        "research_end_effective": effective_end.isoformat(),
         "warmup_start": warmup_start.isoformat(),
         "max_hold_sessions": int(max_hold),
         "cache": cache_report,
         "data": cache_meta,
         "trades": trade_meta,
+        "validation": "v1.2 actual-trigger separated; annual stability",
         "trade_rows": int(len(trades)),
         "summary_rows": int(len(summary)),
         "heat_events": int(len(heat_detail)),
         "method": "T close signal -> T+1 open execution; technical/RS point-in-time reconstruction",
-        "outputs": [OUT_XLSX.name, OUT_SUMMARY.name, OUT_STATUS.name],
+        "outputs": [OUT_XLSX.name, OUT_SUMMARY.name, OUT_VALIDATION.name, OUT_STATUS.name],
     }
     if not summary.empty:
         leaders = (
             summary[(summary["類型"] != "基準") & (summary["群組排名"] == 1)]
-            [["進場群組", "策略", "綜合分數", "中位報酬%", "中位峰值捕捉率%", "平均高點回吐%", "樣本數", "有效觸發率%"]]
+            [["進場群組", "策略", "綜合分數", "觸發_中位報酬%", "觸發_勝率%", "觸發_中位持有日", "有效觸發率%", "年度正報酬率%", "可靠度"]]
             .to_dict("records")
         )
         status["current_leaders"] = leaders
-    write_outputs(summary, best, annual, heat_summary, heat_detail, trades, status)
+    write_outputs(summary, best, annual, stability, heat_summary, heat_detail, trades, status)
     print(f"[done] {OUT_XLSX}", flush=True)
     print(f"[done] {OUT_SUMMARY}", flush=True)
+    print(f"[done] {OUT_VALIDATION}", flush=True)
     print(f"[done] {OUT_STATUS}", flush=True)
     if status.get("current_leaders"):
         print("[leaders]", json.dumps(status["current_leaders"], ensure_ascii=False), flush=True)
