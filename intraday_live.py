@@ -36,7 +36,7 @@ BASELINE_STATUS = APP_DIR / "intraday_baseline_status.json"
 TRADE_STATE_FILE = APP_DIR / "intraday_trade_state_today.json"
 MIS_URL = "https://mis.twse.com.tw/stock/api/getStockInfo.jsp"
 TZ = ZoneInfo("Asia/Taipei")
-ENGINE_VERSION = "3.5.9-stable-reading-1"
+ENGINE_VERSION = "3.6.2-manager-reset-1"
 
 RS_THRESHOLD = 85.0
 AMOUNT_MIN = 30_000_000.0
@@ -1040,7 +1040,7 @@ class IntradayBackgroundManager:
                 "last_started": self._last_started.strftime("%Y-%m-%d %H:%M:%S") if self._last_started else None,
                 "last_completed": self._last_completed.strftime("%Y-%m-%d %H:%M:%S") if self._last_completed else None,
                 "last_error": self._last_error,
-                "full_fail_streak": int(self._full_fail_streak),
+                "full_fail_streak": int(getattr(self, "_full_fail_streak", 0)),
                 "fast_rows": None if self._fast_rows is None else self._fast_rows.copy(deep=False),
                 "fast_watch_codes": list(self._fast_watch_codes),
                 "fast_watch_count": len(self._fast_watch_codes),
@@ -1055,7 +1055,7 @@ class IntradayBackgroundManager:
                 "fast_last_started": self._fast_last_started.strftime("%Y-%m-%d %H:%M:%S") if self._fast_last_started else None,
                 "fast_last_completed": self._fast_last_completed.strftime("%Y-%m-%d %H:%M:%S") if self._fast_last_completed else None,
                 "fast_last_error": self._fast_last_error,
-                "fast_fail_streak": int(self._fast_fail_streak),
+                "fast_fail_streak": int(getattr(self, "_fast_fail_streak", 0)),
                 "trade_state_day": self._trade_state_day,
                 "trade_state_version": int(self._trade_state_version),
                 "trade_state_codes": [code for code, rec in self._trade_states.items() if bool(rec.get("今日曾觸發", False))],

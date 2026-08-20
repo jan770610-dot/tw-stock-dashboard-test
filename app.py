@@ -19,8 +19,8 @@ DEFAULT_DUCK = APP_DIR / "duck_latest.xlsx"
 STATUS_FILE = APP_DIR / "update_status.json"
 INTRADAY_BASELINE_FILE = APP_DIR / "intraday_baseline.pkl.gz"
 ACTIONS_URL = "https://github.com/jan770610-dot/tw-stock-dashboard-test/actions/workflows/daily-update.yml"
-LIVE_SCHEMA_VERSION = "v359-stable-reading-1"
-INTRADAY_ENGINE_GENERATION = "3.5.9-stable-reading-1"
+LIVE_SCHEMA_VERSION = "v362-manager-reset-1"
+INTRADAY_ENGINE_GENERATION = "3.6.2-manager-reset-1"
 
 st.set_page_config(page_title="台股分析中心", page_icon="📈", layout="wide", initial_sidebar_state="expanded")
 
@@ -28,7 +28,7 @@ st.set_page_config(page_title="台股分析中心", page_icon="📈", layout="wi
 # 瀏覽器 session 可能在程式更新後仍保留舊 radar/override，造成看起來「價格不動」。
 if st.session_state.get("_intraday_live_schema") != LIVE_SCHEMA_VERSION:
     for _k in list(st.session_state.keys()):
-        if str(_k).startswith(("v359_", "v358_", "v357_", "v356_", "v355_", "v354_")) or _k == "v32_single_override":
+        if str(_k).startswith(("v362_", "v360_", "v359_", "v358_", "v357_", "v356_", "v355_", "v354_")) or _k == "v32_single_override":
             st.session_state.pop(_k, None)
     st.session_state["_intraday_live_schema"] = LIVE_SCHEMA_VERSION
 
@@ -2924,6 +2924,38 @@ elif u_status == "error" and message:
 
 if dashboard_mode in {"intraday", "close_trial"}:
     from intraday_live import get_background_manager
+
+    # v3.6.2：Streamlit cache_resource 在熱更新後，可能仍保留舊版 manager 實例。
+    # 新檔案即使補上欄位，舊實例仍會執行舊 class 的 get_state。
+    # 因此版本切換時先停止舊 thread、清 cache，再建立全新的 manager。
+    _manager_key = "_intraday_manager_generation"
+    if st.session_state.get(_manager_key) != INTRADAY_ENGINE_GENERATION:
+        _old_generations = [
+            st.session_state.get(_manager_key),
+            "3.5.9-stable-reading-1",
+            "3.5.8-state-machine-1",
+        ]
+        for _gen in [g for g in _old_generations if g and g != INTRADAY_ENGINE_GENERATION]:
+            try:
+                _old_mgr = get_background_manager(_gen)
+                try:
+                    _old_mgr._enabled = False
+                    _old_mgr._fast_enabled = False
+                except Exception:
+                    pass
+                try:
+                    _old_mgr._stop.set()
+                    _old_mgr._wake.set()
+                except Exception:
+                    pass
+            except Exception:
+                pass
+        try:
+            get_background_manager.clear()
+        except Exception:
+            pass
+        st.session_state[_manager_key] = INTRADAY_ENGINE_GENERATION
+
     bg_manager = get_background_manager(INTRADAY_ENGINE_GENERATION)
     official_strong_codes = _codes_from_df(strong)
     official_duck_codes = _codes_from_df(all_ok)
@@ -3476,4 +3508,4 @@ with tabs[7]:
     with open(DEFAULT_RS,"rb") as f: d1.download_button("下載 RS 最新結果",f.read(),file_name="rs_latest.xlsx",mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",use_container_width=True)
     with open(DEFAULT_DUCK,"rb") as f: d2.download_button("下載鴨嘴最新結果",f.read(),file_name="duck_latest.xlsx",mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",use_container_width=True)
 
-st.divider(); st.caption(f"正式版 v3.6.0｜進場 v1.0 × 獲利出場 v1.2 × 失敗風控 v1.0 × 個股決策中心｜RS：{rs_date}｜鴨嘴：{duck_date}｜量化篩選與市場廣度工具，不構成投資建議。")
+st.divider(); st.caption(f"正式版 v3.6.2｜進場 v1.0 × 獲利出場 v1.2 × 失敗風控 v1.0 × 個股決策中心｜RS：{rs_date}｜鴨嘴：{duck_date}｜量化篩選與市場廣度工具，不構成投資建議。")
