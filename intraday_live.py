@@ -36,7 +36,7 @@ BASELINE_STATUS = APP_DIR / "intraday_baseline_status.json"
 TRADE_STATE_FILE = APP_DIR / "intraday_trade_state_today.json"
 MIS_URL = "https://mis.twse.com.tw/stock/api/getStockInfo.jsp"
 TZ = ZoneInfo("Asia/Taipei")
-ENGINE_VERSION = "3.6.3-mis-resilience-1"
+ENGINE_VERSION = "3.6.4-fast-bounded-scan-1"
 
 RS_THRESHOLD = 85.0
 AMOUNT_MIN = 30_000_000.0
@@ -104,7 +104,7 @@ def _fetch_batch(channels: list[str], timeout: int = 10, attempts: int = 3) -> t
     return [], last_err
 
 
-def _fetch_mis_quotes_raw(universe_json: str, batch_size: int = 80, workers: int = 4) -> tuple[pd.DataFrame, list[str]]:
+def _fetch_mis_quotes_raw(universe_json: str, batch_size: int = 80, workers: int = 4, timeout: int = 6, attempts: int = 2) -> tuple[pd.DataFrame, list[str]]:
     """Pure-Python quote fetcher. Safe to call from the background worker (no Streamlit API)."""
     universe = json.loads(universe_json)
     channels = [_channel(str(r["code"]), str(r["market"])) for r in universe]
@@ -112,7 +112,7 @@ def _fetch_mis_quotes_raw(universe_json: str, batch_size: int = 80, workers: int
     raw: list[dict] = []
     errors: list[str] = []
     with ThreadPoolExecutor(max_workers=max(1, min(workers, 8))) as ex:
-        futs = {ex.submit(_fetch_batch, b): b for b in batches}
+        futs = {ex.submit(_fetch_batch, b, timeout=timeout, attempts=attempts): b for b in batches}
         for fut in as_completed(futs):
             rows, err = fut.result()
             raw.extend(rows)
@@ -186,37 +186,66 @@ def _fetch_mis_quotes_raw(universe_json: str, batch_size: int = 80, workers: int
 
 
 def _fetch_mis_quotes_resilient(universe_json: str) -> tuple[pd.DataFrame, list[str]]:
-    """Two-stage MIS fetch for full-market scans.
+    """Fast bounded two-stage MIS fetch for full-market scans.
 
-    First pass stays moderately parallel.  If some/most batches fail, retry only
-    the missing symbols in smaller batches with one worker.  This reduces the
-    chance that a temporary MIS throttle turns into a complete 2,000-stock scan
-    failure on Streamlit Cloud.
+    Design target: do not let a bad MIS minute turn one background rescan into
+    several minutes.  The first pass is moderately parallel with only one retry.
+    The repair pass is allowed only for a manageable missing set and has no retry.
+    If coverage is still too low, build_snapshot rejects the new snapshot and the
+    dashboard keeps the previous successful RS/Wade state.
     """
     universe = json.loads(universe_json)
     total = len(universe)
-    q1, err1 = _fetch_mis_quotes_raw(universe_json, batch_size=80, workers=3)
+
+    # Pass 1: about 20 batches for ~2,000 stocks; 4 workers; at most 2 attempts/batch.
+    q1, err1 = _fetch_mis_quotes_raw(
+        universe_json,
+        batch_size=100,
+        workers=4,
+        timeout=6,
+        attempts=2,
+    )
 
     have = set()
     if q1 is not None and not q1.empty and "code" in q1.columns:
         have = set(q1["code"].astype(str).map(_norm_code))
-
-    # If first pass is already very healthy, avoid extra network calls.
     coverage1 = (len(have) / total * 100.0) if total else 100.0
-    if coverage1 >= 92.0 and not err1:
-        return q1, err1
+
+    # Healthy enough: publish immediately.  A few failed sub-batches do not justify
+    # another whole repair cycle if fresh coverage is already >= 92%.
+    if coverage1 >= 92.0:
+        return q1, list(err1 or [])
 
     missing = [
         {"code": str(r.get("code", "")), "market": str(r.get("market", ""))}
         for r in universe
         if _norm_code(r.get("code")) not in have
     ]
+
+    # If too much is missing, do not spend minutes serially repairing 1,000+ names.
+    # Fail fast; the caller will keep the previous successful full-market snapshot.
+    if len(missing) > 600:
+        errs = list(err1 or [])
+        errs.append(
+            f"第一階段僅 {coverage1:.1f}% 覆蓋，缺漏 {len(missing)} 檔；"
+            "超過600檔快速補抓上限，保留上一批成功市場快照"
+        )
+        return q1, errs
+
     q2 = pd.DataFrame()
     err2 = []
     if missing:
-        time.sleep(0.45)
+        time.sleep(0.25)
         missing_json = json.dumps(missing, ensure_ascii=False, separators=(",", ":"))
-        q2, err2 = _fetch_mis_quotes_raw(missing_json, batch_size=45, workers=1)
+        # Repair pass: smaller batches, 2 workers, no retry.  It is a bounded repair,
+        # not a second potentially long-running full scan.
+        q2, err2 = _fetch_mis_quotes_raw(
+            missing_json,
+            batch_size=60,
+            workers=2,
+            timeout=4,
+            attempts=1,
+        )
 
     parts = [q for q in [q1, q2] if q is not None and not q.empty]
     if parts:
@@ -227,13 +256,11 @@ def _fetch_mis_quotes_resilient(universe_json: str) -> tuple[pd.DataFrame, list[
     else:
         q = pd.DataFrame()
 
-    errors = list(err1 or []) + list(err2 or [])
-    return q, errors
-
+    return q, list(err1 or []) + list(err2 or [])
 
 @st.cache_data(ttl=25, show_spinner=False)
 def fetch_mis_quotes(universe_json: str, batch_size: int = 80, workers: int = 4) -> tuple[pd.DataFrame, list[str]]:
-    return _fetch_mis_quotes_raw(universe_json, batch_size=batch_size, workers=workers)
+    return _fetch_mis_quotes_raw(universe_json, batch_size=batch_size, workers=workers, timeout=6, attempts=2)
 
 
 def _load_baseline_raw(path_s: str) -> pd.DataFrame:
@@ -1306,7 +1333,7 @@ def refresh_watchlist(snapshot: dict, codes, max_codes: int = 2500) -> pd.DataFr
     market_map = dict(zip(hit["代號"].astype(str), hit.get("市場", pd.Series("TWSE", index=hit.index)).astype(str)))
     universe = [{"code": c, "market": market_map.get(c, "TWSE")} for c in ordered if c in market_map]
     universe_json = json.dumps(universe, ensure_ascii=False, separators=(",", ":"))
-    q, errors = _fetch_mis_quotes_raw(universe_json, batch_size=80, workers=3)
+    q, errors = _fetch_mis_quotes_raw(universe_json, batch_size=90, workers=3, timeout=4, attempts=1)
     if q.empty:
         raise RuntimeError(errors[0] if errors else "MIS 沒有回傳快速追蹤行情")
     q["code"] = q["code"].astype(str).map(_norm_code)

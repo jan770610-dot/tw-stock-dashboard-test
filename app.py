@@ -19,8 +19,8 @@ DEFAULT_DUCK = APP_DIR / "duck_latest.xlsx"
 STATUS_FILE = APP_DIR / "update_status.json"
 INTRADAY_BASELINE_FILE = APP_DIR / "intraday_baseline.pkl.gz"
 ACTIONS_URL = "https://github.com/jan770610-dot/tw-stock-dashboard-test/actions/workflows/daily-update.yml"
-LIVE_SCHEMA_VERSION = "v363-mis-resilience-1"
-INTRADAY_ENGINE_GENERATION = "3.6.3-mis-resilience-1"
+LIVE_SCHEMA_VERSION = "v364-fast-bounded-scan-1"
+INTRADAY_ENGINE_GENERATION = "3.6.4-fast-bounded-scan-1"
 
 st.set_page_config(page_title="台股分析中心", page_icon="📈", layout="wide", initial_sidebar_state="expanded")
 
@@ -28,7 +28,7 @@ st.set_page_config(page_title="台股分析中心", page_icon="📈", layout="wi
 # 瀏覽器 session 可能在程式更新後仍保留舊 radar/override，造成看起來「價格不動」。
 if st.session_state.get("_intraday_live_schema") != LIVE_SCHEMA_VERSION:
     for _k in list(st.session_state.keys()):
-        if str(_k).startswith(("v363_", "v362_", "v360_", "v359_", "v358_", "v357_", "v356_", "v355_", "v354_")) or _k == "v32_single_override":
+        if str(_k).startswith(("v364_", "v363_", "v362_", "v360_", "v359_", "v358_", "v357_", "v356_", "v355_", "v354_")) or _k == "v32_single_override":
             st.session_state.pop(_k, None)
     st.session_state["_intraday_live_schema"] = LIVE_SCHEMA_VERSION
 
@@ -2393,7 +2393,7 @@ def _render_trial_summary(bg_state: dict, manager=None):
     mode_title = "📡 今日盤中試算" if dashboard_mode == "intraday" else "🧾 今日收盤試算（等待正式更新）"
     status_text = "🔄 背景正在處理下一批；目前畫面維持上一批完成資料" if running else "🟢 背景待命／等待下一批"
     mode_note = (
-        "全市場約90秒刷新廣度/RS/Wade與候選發現；個股狀態引擎約10秒同步，盤中追蹤股依數量約10–30秒抓取。畫面預設30秒才重繪，避免閱讀時表格一直跳。"
+        "全市場約90秒觸發一次廣度/RS/Wade重掃；單輪採『快速有界』抓取，異常時不會無限補抓；個股狀態引擎約10秒同步，盤中追蹤股依數量約10–30秒抓取。畫面預設30秒才重繪，避免閱讀時表格一直跳。"
         if dashboard_mode == "intraday"
         else "13:30 後不再連續背景掃描；保留最後完成結果，等待 18:05 正式資料。"
     )
@@ -2942,6 +2942,7 @@ if dashboard_mode in {"intraday", "close_trial"}:
     if st.session_state.get(_manager_key) != INTRADAY_ENGINE_GENERATION:
         _old_generations = [
             st.session_state.get(_manager_key),
+            "3.6.3-mis-resilience-1",
             "3.6.2-manager-reset-1",
             "3.5.9-stable-reading-1",
             "3.5.8-state-machine-1",
@@ -3519,4 +3520,4 @@ with tabs[7]:
     with open(DEFAULT_RS,"rb") as f: d1.download_button("下載 RS 最新結果",f.read(),file_name="rs_latest.xlsx",mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",use_container_width=True)
     with open(DEFAULT_DUCK,"rb") as f: d2.download_button("下載鴨嘴最新結果",f.read(),file_name="duck_latest.xlsx",mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",use_container_width=True)
 
-st.divider(); st.caption(f"正式版 v3.6.3｜進場 v1.0 × 獲利出場 v1.2 × 失敗風控 v1.0 × 個股決策中心｜RS：{rs_date}｜鴨嘴：{duck_date}｜量化篩選與市場廣度工具，不構成投資建議。")
+st.divider(); st.caption(f"正式版 v3.6.4｜進場 v1.0 × 獲利出場 v1.2 × 失敗風控 v1.0 × 個股決策中心｜RS：{rs_date}｜鴨嘴：{duck_date}｜量化篩選與市場廣度工具，不構成投資建議。")
