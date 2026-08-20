@@ -36,7 +36,7 @@ BASELINE_STATUS = APP_DIR / "intraday_baseline_status.json"
 TRADE_STATE_FILE = APP_DIR / "intraday_trade_state_today.json"
 MIS_URL = "https://mis.twse.com.tw/stock/api/getStockInfo.jsp"
 TZ = ZoneInfo("Asia/Taipei")
-ENGINE_VERSION = "3.6.4-fast-bounded-scan-1"
+ENGINE_VERSION = "3.6.6-conservative-mis-1"
 
 RS_THRESHOLD = 85.0
 AMOUNT_MIN = 30_000_000.0
@@ -737,6 +737,29 @@ def _trade_state_path_text(path) -> str:
     return " → ".join(vals[-10:]) if vals else "—"
 
 
+
+def _probe_mis_source() -> tuple[bool, str | None]:
+    """Probe a tiny set before a full-market request burst.
+
+    When the source/network is rejecting this cloud host, the probe fails in a
+    few seconds and the manager opens a cooldown circuit instead of launching
+    20+ full-market batches that cannot succeed.
+    """
+    probe_universe = [
+        {"code": "2330", "market": "TWSE"},
+        {"code": "2317", "market": "TWSE"},
+        {"code": "6488", "market": "TPEX"},
+    ]
+    payload = json.dumps(probe_universe, ensure_ascii=False, separators=(",", ":"))
+    q, errors = _fetch_mis_quotes_raw(
+        payload, batch_size=3, workers=1, timeout=4, attempts=1
+    )
+    if q is not None and not q.empty:
+        return True, None
+    err = "；".join(dict.fromkeys([str(e) for e in (errors or []) if str(e)]))[:350]
+    return False, err or "MIS 小型連線探測沒有回傳行情"
+
+
 class IntradayBackgroundManager:
     """Process-shared scanner: full-market pulse + reactive intraday watch universe.
 
@@ -757,7 +780,7 @@ class IntradayBackgroundManager:
         self._duck_watch: set[str] = set()
         self._formal_date = "—"
         self._config_sig = None
-        self._interval = 30.0
+        self._interval = 300.0
         self._enabled = False
         self._force_once = False
         self._snapshot: dict | None = None
@@ -770,6 +793,10 @@ class IntradayBackgroundManager:
         self._last_completed: dt.datetime | None = None
         self._last_error: str | None = None
         self._full_fail_streak = 0
+        # v3.6.5: source circuit breaker.  If TWSE MIS starts rejecting the
+        # Streamlit Cloud host, do not hammer 2,000 symbols every 90 seconds.
+        self._source_circuit_until: dt.datetime | None = None
+        self._source_probe_error: str | None = None
 
         # v3.5.5: every stock shown by a盤中/即時 decision/event/manual view is
         # eligible for the reactive watch universe, not only the first 120 names.
@@ -1127,6 +1154,9 @@ class IntradayBackgroundManager:
                 "last_completed": self._last_completed.strftime("%Y-%m-%d %H:%M:%S") if self._last_completed else None,
                 "last_error": self._last_error,
                 "full_fail_streak": int(getattr(self, "_full_fail_streak", 0)),
+                "source_circuit_until": self._source_circuit_until.strftime("%Y-%m-%d %H:%M:%S") if getattr(self, "_source_circuit_until", None) else None,
+                "source_probe_error": getattr(self, "_source_probe_error", None),
+                "source_circuit_open": bool(getattr(self, "_source_circuit_until", None) and dt.datetime.now(TZ) < self._source_circuit_until),
                 "fast_rows": None if self._fast_rows is None else self._fast_rows.copy(deep=False),
                 "fast_watch_codes": list(self._fast_watch_codes),
                 "fast_watch_count": len(self._fast_watch_codes),
@@ -1217,9 +1247,32 @@ class IntradayBackgroundManager:
             anchor=max(full_anchors) if full_anchors else None
             due = anchor is None or (now - anchor).total_seconds() >= interval
 
-            # Full scan has priority when due; it refreshes the market gate and candidate discovery universe.
+            # Full scan has priority when due; but first honor the source circuit breaker.
             if ready and (force or (enabled and due)):
                 with self._lock:
+                    circuit_until = self._source_circuit_until
+                if circuit_until is not None and now < circuit_until and not force:
+                    # No network burst during cooldown.  Existing formal/last-good data remain usable.
+                    self._wake.clear()
+                    self._wake.wait(min(15.0, max(1.0, (circuit_until-now).total_seconds())))
+                    continue
+
+                # Tiny preflight. If even 3 representative symbols are rejected,
+                # a 1,991-stock scan cannot work; cool down for five minutes.
+                ok_probe, probe_err = _probe_mis_source()
+                if not ok_probe:
+                    with self._lock:
+                        self._force_once = False
+                        self._running = False
+                        self._full_fail_streak += 1
+                        self._source_probe_error = probe_err
+                        self._last_error = f"MIS來源連線探測失敗：{probe_err}"
+                        self._source_circuit_until = dt.datetime.now(TZ) + dt.timedelta(minutes=10)
+                    continue
+
+                with self._lock:
+                    self._source_probe_error = None
+                    self._source_circuit_until = None
                     self._force_once = False
                     self._running = True
                     self._last_started = dt.datetime.now(TZ)
@@ -1233,12 +1286,16 @@ class IntradayBackgroundManager:
                         self._full_fail_streak += 1
                         self._last_error = f"{type(e).__name__}: {e}"
                         self._running = False
+                        # A failed full scan after a successful probe still suggests
+                        # throttling; use a shorter two-minute cooldown.
+                        self._source_circuit_until = dt.datetime.now(TZ) + dt.timedelta(minutes=5)
                 else:
                     with self._lock:
                         self._accept_snapshot(snap)
                         self._last_completed = dt.datetime.now(TZ)
                         self._full_fail_streak = 0
                         self._last_error = None
+                        self._source_circuit_until = None
                         self._running = False
                 continue
 

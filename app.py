@@ -19,8 +19,8 @@ DEFAULT_DUCK = APP_DIR / "duck_latest.xlsx"
 STATUS_FILE = APP_DIR / "update_status.json"
 INTRADAY_BASELINE_FILE = APP_DIR / "intraday_baseline.pkl.gz"
 ACTIONS_URL = "https://github.com/jan770610-dot/tw-stock-dashboard-test/actions/workflows/daily-update.yml"
-LIVE_SCHEMA_VERSION = "v364-fast-bounded-scan-1"
-INTRADAY_ENGINE_GENERATION = "3.6.4-fast-bounded-scan-1"
+LIVE_SCHEMA_VERSION = "v366-conservative-mis-1"
+INTRADAY_ENGINE_GENERATION = "3.6.6-conservative-mis-1"
 
 st.set_page_config(page_title="台股分析中心", page_icon="📈", layout="wide", initial_sidebar_state="expanded")
 
@@ -28,7 +28,7 @@ st.set_page_config(page_title="台股分析中心", page_icon="📈", layout="wi
 # 瀏覽器 session 可能在程式更新後仍保留舊 radar/override，造成看起來「價格不動」。
 if st.session_state.get("_intraday_live_schema") != LIVE_SCHEMA_VERSION:
     for _k in list(st.session_state.keys()):
-        if str(_k).startswith(("v364_", "v363_", "v362_", "v360_", "v359_", "v358_", "v357_", "v356_", "v355_", "v354_")) or _k == "v32_single_override":
+        if str(_k).startswith(("v366_", "v365_", "v364_", "v363_", "v362_", "v360_", "v359_", "v358_", "v357_", "v356_", "v355_", "v354_")) or _k == "v32_single_override":
             st.session_state.pop(_k, None)
     st.session_state["_intraday_live_schema"] = LIVE_SCHEMA_VERSION
 
@@ -2039,13 +2039,18 @@ def _all_reactive_watch_codes(radar: pd.DataFrame, bg_state: dict, snap: dict, t
     return sorted(codes)
 
 def _reactive_interval_for_count(n: int) -> int:
-    """Keep all active names live while automatically protecting MIS/network load."""
+    """Conservative MIS cadence for active names.
+
+    Full-market discovery is intentionally low-frequency.  Only stocks already
+    relevant to the radar/state machine receive faster refreshes, and the interval
+    expands as the active universe grows to avoid recreating a full-market flood.
+    """
     n=max(0,int(n or 0))
-    if n<=250: return 10
-    if n<=500: return 12
-    if n<=800: return 15
-    if n<=1200: return 20
-    return 30
+    if n<=80: return 20
+    if n<=200: return 30
+    if n<=400: return 45
+    if n<=700: return 60
+    return 90
 
 
 
@@ -2379,21 +2384,47 @@ def _render_trial_summary(bg_state: dict, manager=None):
     last_error = bg_state.get("last_error")
     full_fail_streak = int(bg_state.get("full_fail_streak",0) or 0)
     if not snap:
+        circuit_open = bool(bg_state.get("source_circuit_open"))
+        circuit_until = bg_state.get("source_circuit_until")
         if running:
-            st.info("🔄 背景正在建立第一批全市場行情；你可以繼續使用下面功能，不需要等在這裡。")
-        elif last_error and full_fail_streak >= 2:
-            st.error(f"背景盤中行情已連續失敗 {full_fail_streak} 輪：{last_error}")
+            st.info("🔄 正在建立第一批盤中市場資料；正式收盤資料仍可正常使用。")
+        elif circuit_open:
+            st.warning(
+                "⚠️ TWSE MIS 目前拒絕／中斷這個雲端主機的連線，系統已進入安全冷卻，"
+                "不再每90秒用1,991檔重複撞來源。"
+            )
+            st.caption(
+                f"預計下次小型連線探測：{circuit_until or '約5分鐘後'}。"
+                "在來源恢復以前，下方正式基準與盤後分析仍可正常使用；盤中雷達暫停，不會用假即時資料替代。"
+            )
+            if last_error:
+                with st.expander("查看即時來源錯誤", expanded=False):
+                    st.code(str(last_error))
         elif last_error:
-            st.info("第一批背景行情剛出現暫時性失敗，系統會自動重試。")
+            st.warning("⚠️ 第一批盤中來源暫時不可用；正式資料仍可正常使用，系統稍後會自動小型探測。")
+            with st.expander("查看即時來源錯誤", expanded=False):
+                st.code(str(last_error))
         else:
-            st.info("背景掃描已啟動，第一批完成後會顯示盤中試算。")
+            st.info("盤中來源探測準備中；正式資料仍可正常使用。")
+
+        st.write("### 🧾 目前可用：最新正式市場基準")
+        cards([
+            ("RS 強勢股", safe_num(strong_count,0," 檔"), f"正式資料日 {latest_date}"),
+            ("Wade", safe_num(wade_score,1," 分"), wade_state),
+            ("上漲比例", safe_num(advance_ratio,1,"%"), "正式收盤"),
+            ("市場階段", stage, water),
+        ])
+        st.info(
+            "目前先以正式收盤資料工作。這是刻意的安全降級："
+            "沒有取得可靠盤中行情時，不建立盤中進場／獲利保護名單，也不畫假的即時線圖。"
+        )
         return
 
     trial_exposure, trial_exposure_label = _trial_exposure_reference(snap)
     mode_title = "📡 今日盤中試算" if dashboard_mode == "intraday" else "🧾 今日收盤試算（等待正式更新）"
     status_text = "🔄 背景正在處理下一批；目前畫面維持上一批完成資料" if running else "🟢 背景待命／等待下一批"
     mode_note = (
-        "全市場約90秒觸發一次廣度/RS/Wade重掃；單輪採『快速有界』抓取，異常時不會無限補抓；個股狀態引擎約10秒同步，盤中追蹤股依數量約10–30秒抓取。畫面預設30秒才重繪，避免閱讀時表格一直跳。"
+        "全市場改為低頻約5分鐘重掃一次，用來更新RS/Wade/市場廣度與發現新候選；只有已進入交易雷達、今日狀態機或手動查詢的股票才做較快追蹤，依數量約20–90秒。來源異常會先小型探測並進入冷卻，不再持續打1,991檔。"
         if dashboard_mode == "intraday"
         else "13:30 後不再連續背景掃描；保留最後完成結果，等待 18:05 正式資料。"
     )
@@ -2906,8 +2937,8 @@ message = update_status.get("message", "")
 if dashboard_mode == "intraday":
     st.markdown(
         f'<div class="status-strip status-ok"><b>目前模式：</b>📡 今日盤中試算　｜　'
-        f'<b>正式比較基準：</b>{latest_date}　｜　<b>全市場同步：</b>約90秒　｜　'
-        f'<b>盤中個股同步：</b>動態10–30秒　｜　<b>最近正式排程：</b>{html.escape(str(last_run))}</div>',
+        f'<b>正式比較基準：</b>{latest_date}　｜　<b>全市場同步：</b>低頻約5分鐘　｜　'
+        f'<b>盤中個股同步：</b>動態20–90秒　｜　<b>最近正式排程：</b>{html.escape(str(last_run))}</div>',
         unsafe_allow_html=True
     )
 elif dashboard_mode == "close_trial":
@@ -2942,6 +2973,8 @@ if dashboard_mode in {"intraday", "close_trial"}:
     if st.session_state.get(_manager_key) != INTRADAY_ENGINE_GENERATION:
         _old_generations = [
             st.session_state.get(_manager_key),
+            "3.6.5-fail-safe-1",
+            "3.6.4-fast-bounded-scan-1",
             "3.6.3-mis-resilience-1",
             "3.6.2-manager-reset-1",
             "3.5.9-stable-reading-1",
@@ -2976,10 +3009,10 @@ if dashboard_mode in {"intraday", "close_trial"}:
     if dashboard_mode == "intraday":
         ctrl1, ctrl2 = st.columns([3, 1])
         auto_scan = ctrl1.toggle(
-            "背景全市場同步（約 90 秒）",
+            "低頻全市場同步（約 5 分鐘）",
             value=True,
             key="v32_background_scan",
-            help="背景執行行情抓取與約2,000檔運算；不會讓前台等待。關閉後仍可用手動單檔查詢。"
+            help="只用低頻全市場掃描更新RS/Wade與發現新候選；已進雷達股票另外用較低負載頻率追蹤。關閉後仍可使用正式資料與手動單檔查詢。"
         )
         bg_manager.configure(
             daily, strong,
@@ -2987,13 +3020,13 @@ if dashboard_mode in {"intraday", "close_trial"}:
             official_duck_codes=official_duck_codes,
             duck_watch_codes=duck_watch_codes,
             formal_date=latest_date,
-            interval_seconds=90,
+            interval_seconds=300,
             enabled=auto_scan,
             ensure_once=True,
         )
-        if ctrl2.button("🔄 背景立即重掃", key="v32_bg_force", use_container_width=True):
+        if ctrl2.button("🔌 測試來源／重掃一次", key="v32_bg_force", use_container_width=True):
             bg_manager.request_refresh()
-            st.toast("已要求背景重掃；畫面不會卡住。")
+            st.toast("已要求先測試即時來源；來源可用時才執行一次全市場重掃。")
 
         # v3.5.9：資料引擎與畫面刷新分離。背景狀態仍持續追蹤，
         # 但可閱讀的大表不再每 5 秒整塊重繪。
@@ -3520,4 +3553,4 @@ with tabs[7]:
     with open(DEFAULT_RS,"rb") as f: d1.download_button("下載 RS 最新結果",f.read(),file_name="rs_latest.xlsx",mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",use_container_width=True)
     with open(DEFAULT_DUCK,"rb") as f: d2.download_button("下載鴨嘴最新結果",f.read(),file_name="duck_latest.xlsx",mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",use_container_width=True)
 
-st.divider(); st.caption(f"正式版 v3.6.4｜進場 v1.0 × 獲利出場 v1.2 × 失敗風控 v1.0 × 個股決策中心｜RS：{rs_date}｜鴨嘴：{duck_date}｜量化篩選與市場廣度工具，不構成投資建議。")
+st.divider(); st.caption(f"正式版 v3.6.6｜進場 v1.0 × 獲利出場 v1.2 × 失敗風控 v1.0 × 個股決策中心｜RS：{rs_date}｜鴨嘴：{duck_date}｜量化篩選與市場廣度工具，不構成投資建議。")
