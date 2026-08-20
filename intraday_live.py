@@ -36,7 +36,7 @@ BASELINE_STATUS = APP_DIR / "intraday_baseline_status.json"
 TRADE_STATE_FILE = APP_DIR / "intraday_trade_state_today.json"
 MIS_URL = "https://mis.twse.com.tw/stock/api/getStockInfo.jsp"
 TZ = ZoneInfo("Asia/Taipei")
-ENGINE_VERSION = "3.5.8-state-machine-1"
+ENGINE_VERSION = "3.5.9-stable-reading-1"
 
 RS_THRESHOLD = 85.0
 AMOUNT_MIN = 30_000_000.0
@@ -75,27 +75,36 @@ def _channel(code: str, market: str) -> str:
     return f"{prefix}_{code}.tw"
 
 
-def _fetch_batch(channels: list[str], timeout: int = 8) -> tuple[list[dict], str | None]:
+def _fetch_batch(channels: list[str], timeout: int = 10, attempts: int = 3) -> tuple[list[dict], str | None]:
+    """Fetch one MIS batch with short retry/backoff for transient network failures."""
     if not channels:
         return [], None
-    query = urlencode({"ex_ch": "|".join(channels), "json": "1", "delay": "0", "_": str(int(time.time() * 1000))})
-    req = Request(
-        f"{MIS_URL}?{query}",
-        headers={
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/138 Safari/537.36",
-            "Referer": "https://mis.twse.com.tw/stock/index.jsp",
-            "Accept": "application/json,text/plain,*/*",
-        },
-    )
-    try:
-        with urlopen(req, timeout=timeout) as resp:
-            payload = json.loads(resp.read().decode("utf-8", errors="replace"))
-        return payload.get("msgArray", []) or [], None
-    except Exception as e:
-        return [], f"{type(e).__name__}: {e}"
+    last_err=None
+    for attempt in range(max(1,int(attempts))):
+        query = urlencode({"ex_ch": "|".join(channels), "json": "1", "delay": "0", "_": str(int(time.time() * 1000))})
+        req = Request(
+            f"{MIS_URL}?{query}",
+            headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/138 Safari/537.36",
+                "Referer": "https://mis.twse.com.tw/stock/index.jsp",
+                "Accept": "application/json,text/plain,*/*",
+            },
+        )
+        try:
+            with urlopen(req, timeout=timeout) as resp:
+                payload = json.loads(resp.read().decode("utf-8", errors="replace"))
+            rows=payload.get("msgArray", []) or []
+            if rows:
+                return rows, None
+            last_err="MIS 回傳空批次"
+        except Exception as e:
+            last_err=f"{type(e).__name__}: {e}"
+        if attempt < max(1,int(attempts))-1:
+            time.sleep(0.35 * (2 ** attempt))
+    return [], last_err
 
 
-def _fetch_mis_quotes_raw(universe_json: str, batch_size: int = 80, workers: int = 6) -> tuple[pd.DataFrame, list[str]]:
+def _fetch_mis_quotes_raw(universe_json: str, batch_size: int = 80, workers: int = 4) -> tuple[pd.DataFrame, list[str]]:
     """Pure-Python quote fetcher. Safe to call from the background worker (no Streamlit API)."""
     universe = json.loads(universe_json)
     channels = [_channel(str(r["code"]), str(r["market"])) for r in universe]
@@ -177,7 +186,7 @@ def _fetch_mis_quotes_raw(universe_json: str, batch_size: int = 80, workers: int
 
 
 @st.cache_data(ttl=25, show_spinner=False)
-def fetch_mis_quotes(universe_json: str, batch_size: int = 80, workers: int = 6) -> tuple[pd.DataFrame, list[str]]:
+def fetch_mis_quotes(universe_json: str, batch_size: int = 80, workers: int = 4) -> tuple[pd.DataFrame, list[str]]:
     return _fetch_mis_quotes_raw(universe_json, batch_size=batch_size, workers=workers)
 
 
@@ -674,6 +683,7 @@ class IntradayBackgroundManager:
         self._last_started: dt.datetime | None = None
         self._last_completed: dt.datetime | None = None
         self._last_error: str | None = None
+        self._full_fail_streak = 0
 
         # v3.5.5: every stock shown by a盤中/即時 decision/event/manual view is
         # eligible for the reactive watch universe, not only the first 120 names.
@@ -711,7 +721,7 @@ class IntradayBackgroundManager:
         official_duck_codes: set[str] | None = None,
         duck_watch_codes: set[str] | None = None,
         formal_date: str = "—",
-        interval_seconds: int = 30,
+        interval_seconds: int = 60,
         enabled: bool = True,
         ensure_once: bool = False,
     ) -> None:
@@ -748,7 +758,7 @@ class IntradayBackgroundManager:
                     self._fast_last_returned_count = 0
                     self._fast_cycle = 0
                 should_wake = True
-            new_interval = float(max(30, int(interval_seconds)))
+            new_interval = float(max(60, int(interval_seconds)))
             if new_interval != self._interval or bool(enabled) != self._enabled:
                 self._interval = new_interval
                 self._enabled = bool(enabled)
@@ -1029,6 +1039,7 @@ class IntradayBackgroundManager:
                 "last_started": self._last_started.strftime("%Y-%m-%d %H:%M:%S") if self._last_started else None,
                 "last_completed": self._last_completed.strftime("%Y-%m-%d %H:%M:%S") if self._last_completed else None,
                 "last_error": self._last_error,
+                "full_fail_streak": int(self._full_fail_streak),
                 "fast_rows": None if self._fast_rows is None else self._fast_rows.copy(deep=False),
                 "fast_watch_codes": list(self._fast_watch_codes),
                 "fast_watch_count": len(self._fast_watch_codes),
@@ -1043,6 +1054,7 @@ class IntradayBackgroundManager:
                 "fast_last_started": self._fast_last_started.strftime("%Y-%m-%d %H:%M:%S") if self._fast_last_started else None,
                 "fast_last_completed": self._fast_last_completed.strftime("%Y-%m-%d %H:%M:%S") if self._fast_last_completed else None,
                 "fast_last_error": self._fast_last_error,
+                "fast_fail_streak": int(self._fast_fail_streak),
                 "trade_state_day": self._trade_state_day,
                 "trade_state_version": int(self._trade_state_version),
                 "trade_state_codes": [code for code, rec in self._trade_states.items() if bool(rec.get("今日曾觸發", False))],
@@ -1131,12 +1143,15 @@ class IntradayBackgroundManager:
                     snap = build_snapshot(daily_local, strong_local, use_streamlit_cache=False)
                 except Exception as e:
                     with self._lock:
+                        self._full_fail_streak += 1
                         self._last_error = f"{type(e).__name__}: {e}"
                         self._running = False
                 else:
                     with self._lock:
                         self._accept_snapshot(snap)
                         self._last_completed = dt.datetime.now(TZ)
+                        self._full_fail_streak = 0
+                        self._last_error = None
                         self._running = False
                 continue
 
@@ -1154,11 +1169,14 @@ class IntradayBackgroundManager:
                     rows = refresh_watchlist(fast_snapshot_local, fast_codes_local, max_codes=2500)
                 except Exception as e:
                     with self._lock:
+                        self._fast_fail_streak += 1
                         self._fast_last_error = f"{type(e).__name__}: {e}"
                         self._fast_running = False
                 else:
                     with self._lock:
                         now_done = dt.datetime.now(TZ)
+                        self._fast_fail_streak = 0
+                        self._fast_last_error = None
                         # MIS 批次可能偶爾少回個別股票；不能因此讓該股退回30秒甚至更舊的全市場列。
                         # 將本輪成功回傳逐碼合併到上一輪快速行情，未回傳者保留上一筆並由 UI 顯示資料年齡。
                         if rows is not None and not rows.empty:

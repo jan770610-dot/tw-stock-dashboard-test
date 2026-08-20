@@ -19,8 +19,8 @@ DEFAULT_DUCK = APP_DIR / "duck_latest.xlsx"
 STATUS_FILE = APP_DIR / "update_status.json"
 INTRADAY_BASELINE_FILE = APP_DIR / "intraday_baseline.pkl.gz"
 ACTIONS_URL = "https://github.com/jan770610-dot/tw-stock-dashboard-test/actions/workflows/daily-update.yml"
-LIVE_SCHEMA_VERSION = "v358-stock-state-machine-1"
-INTRADAY_ENGINE_GENERATION = "3.5.8-state-machine-1"
+LIVE_SCHEMA_VERSION = "v359-stable-reading-1"
+INTRADAY_ENGINE_GENERATION = "3.5.9-stable-reading-1"
 
 st.set_page_config(page_title="台股分析中心", page_icon="📈", layout="wide", initial_sidebar_state="expanded")
 
@@ -28,7 +28,7 @@ st.set_page_config(page_title="台股分析中心", page_icon="📈", layout="wi
 # 瀏覽器 session 可能在程式更新後仍保留舊 radar/override，造成看起來「價格不動」。
 if st.session_state.get("_intraday_live_schema") != LIVE_SCHEMA_VERSION:
     for _k in list(st.session_state.keys()):
-        if str(_k).startswith(("v358_", "v357_", "v356_", "v355_", "v354_")) or _k == "v32_single_override":
+        if str(_k).startswith(("v359_", "v358_", "v357_", "v356_", "v355_", "v354_")) or _k == "v32_single_override":
             st.session_state.pop(_k, None)
     st.session_state["_intraday_live_schema"] = LIVE_SCHEMA_VERSION
 
@@ -1701,11 +1701,11 @@ def _snapshot_with_fast_rows(snap: dict, bg_state: dict) -> dict:
 def _get_intraday_trade_radar(snap: dict, bg_state: dict) -> pd.DataFrame:
     """Full-market discovery on pulse scan; reactive versions recalc every watched row."""
     full_key=(str(latest_date),int(bg_state.get("version",0) or 0))
-    cache=st.session_state.get("v358_trade_radar_full_cache")
+    cache=st.session_state.get("v359_trade_radar_full_cache")
     if not (isinstance(cache,dict) and cache.get("key")==full_key and isinstance(cache.get("data"),pd.DataFrame)):
         base_data=_intraday_trade_radar_table(snap)
         cache={"key":full_key,"data":base_data}
-        st.session_state["v358_trade_radar_full_cache"]=cache
+        st.session_state["v359_trade_radar_full_cache"]=cache
     base_data=cache["data"]
 
     fast=bg_state.get("fast_rows")
@@ -1713,7 +1713,7 @@ def _get_intraday_trade_radar(snap: dict, bg_state: dict) -> pd.DataFrame:
     if fast is None or not isinstance(fast,pd.DataFrame) or fast.empty:
         return base_data
     compose_key=(full_key,fast_ver)
-    cc=st.session_state.get("v358_trade_radar_fast_cache")
+    cc=st.session_state.get("v359_trade_radar_fast_cache")
     if isinstance(cc,dict) and cc.get("key")==compose_key and isinstance(cc.get("data"),pd.DataFrame):
         return cc["data"]
 
@@ -1731,7 +1731,7 @@ def _get_intraday_trade_radar(snap: dict, bg_state: dict) -> pd.DataFrame:
         if missing:
             m=data["代號"].astype(str).isin(missing)
             data.loc[m,"資料層級"]="⏳ 快速行情待回傳"
-    st.session_state["v358_trade_radar_fast_cache"]={"key":compose_key,"data":data}
+    st.session_state["v359_trade_radar_fast_cache"]={"key":compose_key,"data":data}
     return data
 
 
@@ -2041,11 +2041,11 @@ def _all_reactive_watch_codes(radar: pd.DataFrame, bg_state: dict, snap: dict, t
 def _reactive_interval_for_count(n: int) -> int:
     """Keep all active names live while automatically protecting MIS/network load."""
     n=max(0,int(n or 0))
-    if n<=250: return 5
-    if n<=500: return 8
-    if n<=800: return 12
-    if n<=1200: return 15
-    return 20
+    if n<=250: return 10
+    if n<=500: return 12
+    if n<=800: return 15
+    if n<=1200: return 20
+    return 30
 
 
 
@@ -2162,6 +2162,46 @@ def _trade_radar_view(df: pd.DataFrame, limit=80, sort_kind="entry") -> pd.DataF
     return z[show].head(limit)
 
 
+def _sync_intraday_state_engine(bg_state: dict, manager) -> tuple[pd.DataFrame,pd.DataFrame]:
+    """Update the per-stock state machine and fast-watch universe without redrawing the UI.
+
+    v3.5.9 decouples data/state refresh from visible table refresh.  This lets the
+    engine keep tracking short-lived state changes while the user reads a stable
+    table snapshot instead of having the whole radar redraw every few seconds.
+    """
+    if manager is None:
+        return pd.DataFrame(),pd.DataFrame()
+    snap0=bg_state.get("snapshot") if isinstance(bg_state,dict) else None
+    if not snap0 or snap0.get("stocks") is None:
+        return pd.DataFrame(),pd.DataFrame()
+    snap=_snapshot_with_fast_rows(snap0,bg_state)
+    radar=_get_intraday_trade_radar(snap,bg_state)
+    if radar is None or radar.empty:
+        return pd.DataFrame(),pd.DataFrame()
+    radar=_decorate_live_freshness(radar,bg_state,snap)
+    radar["追蹤分類"]=radar.apply(_signal_bucket,axis=1)
+    radar["目前判讀狀態"]=radar.apply(_continuous_state_label,axis=1)
+    manager.sync_trade_states(_state_sync_payload(radar))
+    state_df=manager.get_trade_state_table()
+
+    touched_codes=set(state_df["代號"].astype(str).map(_norm_stock_code)) if not state_df.empty and "代號" in state_df.columns else set()
+    full_cache=st.session_state.get("v359_trade_radar_full_cache",{})
+    watch_source=full_cache.get("data") if isinstance(full_cache,dict) else None
+    if not isinstance(watch_source,pd.DataFrame) or watch_source.empty:
+        watch_source=radar.copy()
+    else:
+        watch_source=watch_source.copy()
+    watch_source["追蹤分類"]=watch_source.apply(_signal_bucket,axis=1)
+    fast_codes=_all_reactive_watch_codes(watch_source,bg_state,snap,touched_codes=touched_codes)
+    manager.set_fast_watch_codes(
+        fast_codes,
+        interval_seconds=_reactive_interval_for_count(len(fast_codes)),
+        enabled=True,
+        max_codes=2500,
+    )
+    return radar,state_df
+
+
 def _render_change_radar(snap: dict, bg_state: dict, manager=None):
     # Every table marked盤中/即時 reads the same reactive overlay.
     snap = _snapshot_with_fast_rows(snap,bg_state)
@@ -2177,14 +2217,13 @@ def _render_change_radar(snap: dict, bg_state: dict, manager=None):
     )
 
     try:
-        radar=_get_intraday_trade_radar(snap,bg_state)
-        radar=_decorate_live_freshness(radar,bg_state,snap)
-        radar["追蹤分類"]=radar.apply(_signal_bucket,axis=1)
-        radar["目前判讀狀態"]=radar.apply(_continuous_state_label,axis=1)
         if manager is not None:
-            manager.sync_trade_states(_state_sync_payload(radar))
-            state_df=manager.get_trade_state_table()
+            radar,state_df=_sync_intraday_state_engine(bg_state,manager)
         else:
+            radar=_get_intraday_trade_radar(snap,bg_state)
+            radar=_decorate_live_freshness(radar,bg_state,snap)
+            radar["追蹤分類"]=radar.apply(_signal_bucket,axis=1)
+            radar["目前判讀狀態"]=radar.apply(_continuous_state_label,axis=1)
             state_df=pd.DataFrame()
     except Exception as e:
         radar=pd.DataFrame(); state_df=pd.DataFrame()
@@ -2206,21 +2245,7 @@ def _render_change_radar(snap: dict, bg_state: dict, manager=None):
         lock=real[profit_s.str.startswith("🟠")]
         retreat=real[profit_s.str.startswith("🔴")]
 
-        touched_codes=set(state_df["代號"].astype(str).map(_norm_stock_code)) if not state_df.empty and "代號" in state_df.columns else set()
-        full_cache=st.session_state.get("v358_trade_radar_full_cache",{})
-        watch_source=full_cache.get("data") if isinstance(full_cache,dict) else None
-        if not isinstance(watch_source,pd.DataFrame) or watch_source.empty:
-            watch_source=radar.copy()
-        else:
-            watch_source=watch_source.copy()
-        watch_source["追蹤分類"]=watch_source.apply(_signal_bucket,axis=1)
-        fast_codes=_all_reactive_watch_codes(watch_source,bg_state,snap,touched_codes=touched_codes)
-        reactive_interval=_reactive_interval_for_count(len(fast_codes))
-        if manager is not None and dashboard_mode=="intraday":
-            try:
-                manager.set_fast_watch_codes(fast_codes,interval_seconds=reactive_interval,enabled=True,max_codes=2500)
-            except Exception as e:
-                st.caption(f"盤中動態追蹤設定暫時失敗：{e}")
+        reactive_interval=int(bg_state.get("fast_interval_seconds",10) or 10)
 
         # Attach each stock's continuous path to current-effective bucket tables.
         trial=_attach_state_context(trial,state_df)
@@ -2244,6 +2269,7 @@ def _render_change_radar(snap: dict, bg_state: dict, manager=None):
         fast_last=bg_state.get("fast_last_completed") or "等待第一輪"
         fast_running=bool(bg_state.get("fast_running"))
         fast_error=bg_state.get("fast_last_error")
+        fast_fail_streak=int(bg_state.get("fast_fail_streak",0) or 0)
         fast_interval=int(bg_state.get("fast_interval_seconds",reactive_interval) or reactive_interval)
         engine=_clean_cell(bg_state.get("engine_version")) or "—"
         st.caption(
@@ -2251,8 +2277,10 @@ def _render_change_radar(snap: dict, bg_state: dict, manager=None):
             f"最近完成：{fast_last}｜{'更新中' if fast_running else '待命'}｜引擎 {engine}。"
             f"今日狀態機已接管 {len(state_df)} 檔曾觸發股票；離開目前條件後仍持續追蹤。"
         )
-        if fast_error:
-            st.warning(f"快速追蹤上一輪失敗：{fast_error}；目前保留上一筆可用資料並顯示資料年齡。")
+        if fast_error and fast_fail_streak >= 2:
+            st.warning(f"快速追蹤已連續失敗 {fast_fail_streak} 輪：{fast_error}；目前保留上一筆可用資料並顯示資料年齡。")
+        elif fast_error:
+            st.caption("快速行情剛出現一次暫時性失敗，系統會保留上一筆並自動重試；連續失敗才會升級警告。")
         persist_error=bg_state.get("trade_state_persist_error")
         if persist_error:
             st.caption(f"狀態檔持久化提示：{persist_error}")
@@ -2276,7 +2304,7 @@ def _render_change_radar(snap: dict, bg_state: dict, manager=None):
                 "例如早上曾是『📈主要進場』，現在條件失效，就會變成『⏳等待』並保留今日路徑；"
                 "如果轉成獲利保護，則會顯示『📈主要進場 → 🟡獲利保護』。搜尋股票時看到的是它現在走到哪裡，而不是另一張獨立歷史表。"
             )
-            state_q=st.text_input("搜尋今日曾進入雷達的股票（代號／名稱）",key="v358_state_flow_search",placeholder="例如 2603、長榮、3029、零壹")
+            state_q=st.text_input("搜尋今日曾進入雷達的股票（代號／名稱）",key="v359_state_flow_search",placeholder="例如 2603、長榮、3029、零壹")
             sv=_state_machine_view(state_df,state_q)
             if sv.empty:
                 st.caption("沒有符合搜尋條件的今日狀態股票。若該股是在 v3.5.8 上線前短暫出現，舊版沒有留下可重建的狀態資料。")
@@ -2349,11 +2377,14 @@ def _render_trial_summary(bg_state: dict, manager=None):
         snap = _snapshot_with_fast_rows(snap,bg_state)
     running = bool(bg_state.get("running"))
     last_error = bg_state.get("last_error")
+    full_fail_streak = int(bg_state.get("full_fail_streak",0) or 0)
     if not snap:
         if running:
             st.info("🔄 背景正在建立第一批全市場行情；你可以繼續使用下面功能，不需要等在這裡。")
+        elif last_error and full_fail_streak >= 2:
+            st.error(f"背景盤中行情已連續失敗 {full_fail_streak} 輪：{last_error}")
         elif last_error:
-            st.error(f"背景盤中行情暫時無法建立：{last_error}")
+            st.info("第一批背景行情剛出現暫時性失敗，系統會自動重試。")
         else:
             st.info("背景掃描已啟動，第一批完成後會顯示盤中試算。")
         return
@@ -2362,7 +2393,7 @@ def _render_trial_summary(bg_state: dict, manager=None):
     mode_title = "📡 今日盤中試算" if dashboard_mode == "intraday" else "🧾 今日收盤試算（等待正式更新）"
     status_text = "🔄 背景正在處理下一批；目前畫面維持上一批完成資料" if running else "🟢 背景待命／等待下一批"
     mode_note = (
-        "全市場約30秒刷新廣度/RS/Wade與候選發現；所有盤中交易分類、事件與手動查詢個股再以動態5–20秒批次追蹤。前台每5秒只讀完成結果。"
+        "全市場約60秒刷新廣度/RS/Wade與候選發現；個股狀態引擎約10秒同步，盤中追蹤股依數量約10–30秒抓取。畫面預設30秒才重繪，避免閱讀時表格一直跳。"
         if dashboard_mode == "intraday"
         else "13:30 後不再連續背景掃描；保留最後完成結果，等待 18:05 正式資料。"
     )
@@ -2373,8 +2404,10 @@ def _render_trial_summary(bg_state: dict, manager=None):
         f"背景完成：{bg_state.get('last_completed') or snap.get('snapshot_time','—')}｜"
         f"可用報價覆蓋：{_fmt_trial(snap.get('coverage'),1,'%')}｜MIS z真實成交覆蓋：{_fmt_trial(snap.get('real_trade_coverage'),1,'%')}"
     )
-    if last_error:
-        st.warning(f"上一輪背景更新失敗：{last_error}；目前仍顯示上一批成功資料。")
+    if last_error and full_fail_streak >= 2:
+        st.warning(f"背景更新已連續失敗 {full_fail_streak} 輪：{last_error}；目前仍顯示上一批成功資料。")
+    elif last_error:
+        st.caption("背景剛出現一次暫時性失敗，系統會自動重試；目前畫面維持上一批成功資料。")
 
     c1, c2, c3, c4, c5, c6 = st.columns(6)
     c1.metric("RS 強勢股", f"{int(snap.get('strong_count',0)):,} 檔", _metric_delta(snap.get("strong_count"), strong_count, 0, " 檔"))
@@ -2715,7 +2748,7 @@ def _manual_stock_lookup(manager):
 
 st.title("📈 台股分析中心")
 st.markdown(
-    '<div class="hero-sub">RS 市場廣度 × 鴨嘴型態 × 培育中心｜正式網頁版 v3.5.8｜進場回測 × 獲利管理 × -8%失敗風控 × 個股決策中心</div>',
+    '<div class="hero-sub">RS 市場廣度 × 鴨嘴型態 × 培育中心｜正式網頁版 v3.5.9｜進場回測 × 獲利管理 × -8%失敗風控 × 個股決策中心</div>',
     unsafe_allow_html=True
 )
 
@@ -2726,8 +2759,8 @@ message = update_status.get("message", "")
 if dashboard_mode == "intraday":
     st.markdown(
         f'<div class="status-strip status-ok"><b>目前模式：</b>📡 今日盤中試算　｜　'
-        f'<b>正式比較基準：</b>{latest_date}　｜　<b>全市場同步：</b>約30秒　｜　'
-        f'<b>盤中個股同步：</b>動態5–20秒　｜　<b>最近正式排程：</b>{html.escape(str(last_run))}</div>',
+        f'<b>正式比較基準：</b>{latest_date}　｜　<b>全市場同步：</b>約60秒　｜　'
+        f'<b>盤中個股同步：</b>動態10–30秒　｜　<b>最近正式排程：</b>{html.escape(str(last_run))}</div>',
         unsafe_allow_html=True
     )
 elif dashboard_mode == "close_trial":
@@ -2762,7 +2795,7 @@ if dashboard_mode in {"intraday", "close_trial"}:
     if dashboard_mode == "intraday":
         ctrl1, ctrl2 = st.columns([3, 1])
         auto_scan = ctrl1.toggle(
-            "背景全市場同步（約 30 秒）",
+            "背景全市場同步（約 60 秒）",
             value=True,
             key="v32_background_scan",
             help="背景執行行情抓取與約2,000檔運算；不會讓前台等待。關閉後仍可用手動單檔查詢。"
@@ -2773,7 +2806,7 @@ if dashboard_mode in {"intraday", "close_trial"}:
             official_duck_codes=official_duck_codes,
             duck_watch_codes=duck_watch_codes,
             formal_date=latest_date,
-            interval_seconds=30,
+            interval_seconds=60,
             enabled=auto_scan,
             ensure_once=True,
         )
@@ -2781,12 +2814,42 @@ if dashboard_mode in {"intraday", "close_trial"}:
             bg_manager.request_refresh()
             st.toast("已要求背景重掃；畫面不會卡住。")
 
+        # v3.5.9：資料引擎與畫面刷新分離。背景狀態仍持續追蹤，
+        # 但可閱讀的大表不再每 5 秒整塊重繪。
+        view_mode=st.radio(
+            "畫面刷新模式",
+            ["📖 閱讀模式（30秒）","⚡ 快速檢視（15秒）","✋ 手動更新"],
+            index=0,
+            horizontal=True,
+            key="v359_view_refresh_mode",
+            help="只影響畫面重繪頻率，不會停止背景行情與個股狀態追蹤。閱讀模式最適合展開表格閱讀。"
+        )
+        view_cols=st.columns([1,3])
+        if view_cols[0].button("📥 立即更新畫面",key="v359_refresh_view",use_container_width=True):
+            st.rerun()
+        view_cols[1].caption("背景資料持續更新；畫面降低刷新頻率只是避免表格跳動，不會讓行情引擎停止。")
+
         if hasattr(st, "fragment"):
-            @st.fragment(run_every="5s")
-            def _memory_view_fragment():
+            @st.fragment(run_every="10s")
+            def _state_engine_fragment():
+                # 不產生可見元件，只維持狀態機與快速追蹤名單。
+                try:
+                    _sync_intraday_state_engine(bg_manager.get_state(),bg_manager)
+                except Exception:
+                    pass
+            _state_engine_fragment()
+
+            if view_mode=="✋ 手動更新":
                 _render_trial_summary(bg_manager.get_state(), bg_manager)
-                _manual_stock_lookup(bg_manager)
-            _memory_view_fragment()
+            else:
+                _view_every="15s" if view_mode.startswith("⚡") else "30s"
+                @st.fragment(run_every=_view_every)
+                def _memory_view_fragment():
+                    _render_trial_summary(bg_manager.get_state(), bg_manager)
+                _memory_view_fragment()
+
+            # 手動查詢不放進自動刷新 fragment，避免使用者輸入或閱讀時被重繪打斷。
+            _manual_stock_lookup(bg_manager)
         else:
             st.info("目前 Streamlit 版本不支援局部刷新；背景仍會掃描，但畫面需手動重新整理才會讀到新快照。")
             _render_trial_summary(bg_manager.get_state(), bg_manager)
@@ -3276,4 +3339,4 @@ with tabs[7]:
     with open(DEFAULT_RS,"rb") as f: d1.download_button("下載 RS 最新結果",f.read(),file_name="rs_latest.xlsx",mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",use_container_width=True)
     with open(DEFAULT_DUCK,"rb") as f: d2.download_button("下載鴨嘴最新結果",f.read(),file_name="duck_latest.xlsx",mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",use_container_width=True)
 
-st.divider(); st.caption(f"正式版 v3.5.8｜進場 v1.0 × 獲利出場 v1.2 × 失敗風控 v1.0 × 個股決策中心｜RS：{rs_date}｜鴨嘴：{duck_date}｜量化篩選與市場廣度工具，不構成投資建議。")
+st.divider(); st.caption(f"正式版 v3.5.9｜進場 v1.0 × 獲利出場 v1.2 × 失敗風控 v1.0 × 個股決策中心｜RS：{rs_date}｜鴨嘴：{duck_date}｜量化篩選與市場廣度工具，不構成投資建議。")
