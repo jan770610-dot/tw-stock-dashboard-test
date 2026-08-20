@@ -1,0 +1,174 @@
+name: 失敗交易／停損條件回測 v1.0
+
+on:
+  workflow_dispatch:
+    inputs:
+      start_date:
+        description: "回測開始日 YYYY-MM-DD"
+        required: true
+        default: "2023-01-03"
+        type: string
+      end_date:
+        description: "回測結束日 YYYY-MM-DD；留白 = 最新正式資料日"
+        required: false
+        default: ""
+        type: string
+      max_hold:
+        description: "單筆最大持有交易日"
+        required: true
+        default: "60"
+        type: choice
+        options: ["40", "60", "80"]
+      cooldown:
+        description: "同股票同進場情境最少間隔交易日"
+        required: true
+        default: "10"
+        type: choice
+        options: ["5", "10", "20"]
+      commission_rate:
+        description: "每次買/賣手續費率"
+        required: true
+        default: "0.001425"
+        type: string
+      sell_tax_rate:
+        description: "股票賣出證交稅率"
+        required: true
+        default: "0.003"
+        type: string
+      fetch_missing:
+        description: "補抓缺少官方歷史行情；已有seed/cache建議false"
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+concurrency:
+  group: tw-stock-daily-update
+  cancel-in-progress: false
+
+jobs:
+  backtest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+    env:
+      TZ: Asia/Taipei
+      PYTHONUNBUFFERED: "1"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: automation/requirements.txt
+
+      - name: Install automation packages
+        run: python -m pip install -r automation/requirements.txt
+
+      - name: Resolve formal end date
+        id: dates
+        shell: bash
+        env:
+          MANUAL_END: ${{ inputs.end_date }}
+        run: |
+          if [ -n "$MANUAL_END" ]; then
+            END_DATE="$MANUAL_END"
+          else
+            END_DATE=$(python - <<'PYDATE'
+          import json
+          from pathlib import Path
+          p=Path('update_status.json')
+          if p.exists():
+              try:
+                  x=json.loads(p.read_text(encoding='utf-8'))
+                  print(x.get('target_date') or x.get('rs_date') or '')
+              except Exception:
+                  print('')
+          else:
+              print('')
+          PYDATE
+            )
+          fi
+          if [ -z "$END_DATE" ]; then
+            echo "找不到最新正式資料日" >&2
+            exit 2
+          fi
+          echo "end=$END_DATE" >> "$GITHUB_OUTPUT"
+          echo "END_DATE=$END_DATE"
+
+      - name: Restore research history cache
+        uses: actions/cache@v5
+        with:
+          path: automation/rs/cache
+          key: failure-exit-v1-${{ runner.os }}-${{ inputs.start_date }}-${{ steps.dates.outputs.end }}-${{ github.run_id }}
+          restore-keys: |
+            entry-backtest-history-v1-${{ runner.os }}-${{ inputs.start_date }}-
+            exit-backtest-history-v1-${{ runner.os }}-${{ inputs.start_date }}-
+            exit-backtest-history-v1-${{ runner.os }}-
+            tw-stock-runtime-v25-${{ runner.os }}-
+            tw-stock-runtime-${{ runner.os }}-
+
+      - name: Bootstrap RS history on cache miss
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ ! -d automation/rs/cache ] || ! find automation/rs/cache -maxdepth 1 -name '20??????.csv' -print -quit | grep -q .; then
+            echo "RS history cache miss; downloading bootstrap seed..."
+            mkdir -p /tmp/tw-stock-seed
+            gh release download seed-v2 --pattern "bootstrap_seed_v2.zip" --dir /tmp/tw-stock-seed
+            unzip -q /tmp/tw-stock-seed/bootstrap_seed_v2.zip -d .
+            test -d automation/rs/cache
+          else
+            echo "RS daily history cache restored."
+          fi
+
+      - name: Run failure-exit backtest
+        shell: bash
+        env:
+          FETCH_MISSING: ${{ inputs.fetch_missing }}
+        run: |
+          EXTRA=""
+          if [ "$FETCH_MISSING" = "true" ]; then EXTRA="--fetch-missing"; fi
+          python -u automation/backtest_failure_exits.py \
+            --start "${{ inputs.start_date }}" \
+            --end "${{ steps.dates.outputs.end }}" \
+            --max-hold "${{ inputs.max_hold }}" \
+            --cooldown "${{ inputs.cooldown }}" \
+            --commission-rate "${{ inputs.commission_rate }}" \
+            --sell-tax-rate "${{ inputs.sell_tax_rate }}" \
+            --workers 2 \
+            $EXTRA
+
+      - name: Show failure-exit leaders
+        run: |
+          cat failure_exit_status.json
+          echo "--- failure rule leaders ---"
+          python - <<'PY'
+          import pandas as pd
+          x=pd.read_csv('failure_exit_rule_rollup.csv')
+          y=x[x['失敗代碼']!='none']
+          cols=['總排名','失敗規則','平均情境排名','排名前3比例%','中位報酬改善pp_中位','10分位改善pp_中位','最大回撤改善pp_中位','停損後達原進場+5率%_中位','平均情境綜合分數']
+          print(y[cols].head(12).to_string(index=False))
+          PY
+
+      - name: Commit failure-exit results
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add failure_exit_latest.xlsx failure_exit_summary.csv failure_exit_rule_rollup.csv failure_exit_annual.csv failure_exit_status.json
+          if git diff --cached --quiet; then
+            echo "No failure-exit result changes."
+          else
+            git commit -m "research: update failure-exit backtest v1.0 ${{ steps.dates.outputs.end }}"
+            git pull --rebase origin main
+            git push origin HEAD:main
+          fi
