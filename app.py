@@ -19,8 +19,8 @@ DEFAULT_DUCK = APP_DIR / "duck_latest.xlsx"
 STATUS_FILE = APP_DIR / "update_status.json"
 INTRADAY_BASELINE_FILE = APP_DIR / "intraday_baseline.pkl.gz"
 ACTIONS_URL = "https://github.com/jan770610-dot/tw-stock-dashboard-test/actions/workflows/daily-update.yml"
-LIVE_SCHEMA_VERSION = "v357-live-history-1"
-INTRADAY_ENGINE_GENERATION = "3.5.6-auditfix-1"
+LIVE_SCHEMA_VERSION = "v358-stock-state-machine-1"
+INTRADAY_ENGINE_GENERATION = "3.5.8-state-machine-1"
 
 st.set_page_config(page_title="台股分析中心", page_icon="📈", layout="wide", initial_sidebar_state="expanded")
 
@@ -28,7 +28,7 @@ st.set_page_config(page_title="台股分析中心", page_icon="📈", layout="wi
 # 瀏覽器 session 可能在程式更新後仍保留舊 radar/override，造成看起來「價格不動」。
 if st.session_state.get("_intraday_live_schema") != LIVE_SCHEMA_VERSION:
     for _k in list(st.session_state.keys()):
-        if str(_k).startswith(("v357_", "v356_", "v355_", "v354_")) or _k == "v32_single_override":
+        if str(_k).startswith(("v358_", "v357_", "v356_", "v355_", "v354_")) or _k == "v32_single_override":
             st.session_state.pop(_k, None)
     st.session_state["_intraday_live_schema"] = LIVE_SCHEMA_VERSION
 
@@ -1701,11 +1701,11 @@ def _snapshot_with_fast_rows(snap: dict, bg_state: dict) -> dict:
 def _get_intraday_trade_radar(snap: dict, bg_state: dict) -> pd.DataFrame:
     """Full-market discovery on pulse scan; reactive versions recalc every watched row."""
     full_key=(str(latest_date),int(bg_state.get("version",0) or 0))
-    cache=st.session_state.get("v356_trade_radar_full_cache")
+    cache=st.session_state.get("v358_trade_radar_full_cache")
     if not (isinstance(cache,dict) and cache.get("key")==full_key and isinstance(cache.get("data"),pd.DataFrame)):
         base_data=_intraday_trade_radar_table(snap)
         cache={"key":full_key,"data":base_data}
-        st.session_state["v356_trade_radar_full_cache"]=cache
+        st.session_state["v358_trade_radar_full_cache"]=cache
     base_data=cache["data"]
 
     fast=bg_state.get("fast_rows")
@@ -1713,7 +1713,7 @@ def _get_intraday_trade_radar(snap: dict, bg_state: dict) -> pd.DataFrame:
     if fast is None or not isinstance(fast,pd.DataFrame) or fast.empty:
         return base_data
     compose_key=(full_key,fast_ver)
-    cc=st.session_state.get("v356_trade_radar_fast_cache")
+    cc=st.session_state.get("v358_trade_radar_fast_cache")
     if isinstance(cc,dict) and cc.get("key")==compose_key and isinstance(cc.get("data"),pd.DataFrame):
         return cc["data"]
 
@@ -1731,7 +1731,7 @@ def _get_intraday_trade_radar(snap: dict, bg_state: dict) -> pd.DataFrame:
         if missing:
             m=data["代號"].astype(str).isin(missing)
             data.loc[m,"資料層級"]="⏳ 快速行情待回傳"
-    st.session_state["v356_trade_radar_fast_cache"]={"key":compose_key,"data":data}
+    st.session_state["v358_trade_radar_fast_cache"]={"key":compose_key,"data":data}
     return data
 
 
@@ -2022,12 +2022,8 @@ def _manual_query_watch_codes(snap: dict) -> set[str]:
     return {str(hit.iloc[0]["代號"])} if not hit.empty else set()
 
 
-def _all_reactive_watch_codes(radar: pd.DataFrame, bg_state: dict, snap: dict) -> list[str]:
-    """Track ALL stocks currently participating in any盤中/即時 view.
-
-    This intentionally has no 120-name ranking cut.  It combines the six trading
-    buckets, market-event radar names and the current manual lookup.
-    """
+def _all_reactive_watch_codes(radar: pd.DataFrame, bg_state: dict, snap: dict, touched_codes=None) -> list[str]:
+    """Track current signals + every stock that has already touched the radar today."""
     codes=set()
     if radar is not None and not radar.empty:
         z=radar.copy()
@@ -2039,12 +2035,8 @@ def _all_reactive_watch_codes(radar: pd.DataFrame, bg_state: dict, snap: dict) -
     for key in ["new_strong","out_strong","new_duck","near"]:
         codes |= {_norm_stock_code(c) for c in (events.get(key) or set()) if _norm_stock_code(c)}
     codes |= _manual_query_watch_codes(snap)
-    for rec in (st.session_state.get("v357_signal_history",[]) or []):
-        c=_norm_stock_code(rec.get("代號"))
-        if c:
-            codes.add(c)
+    codes |= {_norm_stock_code(c) for c in (touched_codes or []) if _norm_stock_code(c)}
     return sorted(codes)
-
 
 def _reactive_interval_for_count(n: int) -> int:
     """Keep all active names live while automatically protecting MIS/network load."""
@@ -2054,6 +2046,101 @@ def _reactive_interval_for_count(n: int) -> int:
     if n<=800: return 12
     if n<=1200: return 15
     return 20
+
+
+
+def _continuous_state_label(row) -> str:
+    return _signal_bucket(row) or "⏳ 等待"
+
+
+def _next_state_condition(row, state: str | None = None) -> str:
+    state=state or _continuous_state_label(row)
+    right=_num(row.get("右側分數"))
+    rs=_num(row.get("盤中RS"))
+    heat=_num(row.get("過熱程度"))
+    complete=_num(row.get("鴨嘴完成度%"))
+    gate=_clean_cell(row.get("市場閘門"))
+    if state.startswith("🌱"):
+        return "右側≥65＋市場廣度改善 → 升級主要進場"
+    if state.startswith("📈"):
+        return "維持右側≥65；正式鴨嘴確認可續抱，過熱≥70轉獲利保護"
+    if state.startswith("🚀"):
+        return "趨勢續強則持有；一般過熱≥70／RS85領頭股接近90開始鎖利"
+    if state.startswith("🟡"):
+        return "停止追價；過熱升高轉積極鎖利，結構退潮則提高防守"
+    if state.startswith("🟠"):
+        return "以鎖利為主；高檔退潮時轉贏家退潮管理"
+    if state.startswith("🔴"):
+        return "等待收盤確認減碼／出場；持股另檢查成本-8%最後防線"
+    # Waiting: tell the user what would re-activate the stock.
+    if right is not None and right >= 55 and (rs is None or rs >= 70):
+        return f"右側目前 {right:.0f}；重新≥65＋市場廣度改善 → 主要進場"
+    if complete is not None and complete >= 65 and (rs is None or rs >= 65):
+        rs_txt="—" if rs is None else f"{rs:.0f}"
+        return f"完成度 {complete:.0f}%／RS {rs_txt}；完成度≥80＋RS≥70＋市場改善 → 試單"
+    if "未確認" in gate:
+        return "先等市場廣度改善，再檢查預備80／右側65進場門檻"
+    if heat is not None and heat >= 70:
+        return "目前偏熱；不追價，等待獲利管理或結構重新整理"
+    return "等待預備80＋RS≥70，或右側≥65＋市場廣度改善"
+
+
+def _state_sync_payload(radar: pd.DataFrame) -> pd.DataFrame:
+    if radar is None or radar.empty:
+        return pd.DataFrame()
+    z=radar.copy()
+    z["狀態"]=z.apply(_continuous_state_label,axis=1)
+    z["資料問題"]=z.apply(_signal_data_issue,axis=1)
+    z["下一步條件"]=[_next_state_condition(r,s) for (_,r),s in zip(z.iterrows(),z["狀態"].tolist())]
+    keep=[c for c in [
+        "代號","名稱","市場","狀態","資料問題","盤中價","價格為估計","資料狀態","資料層級",
+        "資料更新時間","MIS報價時間","盤中RS","右側分數","過熱程度","鴨嘴完成度%",
+        "市場閘門","盤中操作","盤中正式鴨嘴","下一步條件"
+    ] if c in z.columns]
+    return z[keep].copy()
+
+
+def _attach_state_context(df: pd.DataFrame, state_df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty or state_df is None or state_df.empty or "代號" not in df.columns:
+        return df
+    cols=[c for c in [
+        "代號","目前狀態","前一狀態","今日路徑","狀態起始時間","最近變更時間","最近變更原因",
+        "首次觸發時間","首次觸發價","本狀態觸發時間","本狀態觸發價","首次觸發後漲跌%",
+        "本狀態漲跌%","下一步條件"
+    ] if c in state_df.columns]
+    if not cols:
+        return df
+    s=state_df[cols].copy()
+    s["代號"]=s["代號"].astype(str).map(_norm_stock_code)
+    z=df.copy()
+    z["代號"]=z["代號"].astype(str).map(_norm_stock_code)
+    return z.merge(s,on="代號",how="left",suffixes=("","_狀態機"))
+
+
+def _state_machine_view(state_df: pd.DataFrame, query: str="") -> pd.DataFrame:
+    if state_df is None or state_df.empty:
+        return pd.DataFrame()
+    z=state_df.copy()
+    if query.strip():
+        q=query.strip()
+        z=z[
+            z["代號"].astype(str).str.contains(q,case=False,na=False,regex=False)
+            | z.get("名稱",pd.Series("",index=z.index)).astype(str).str.contains(q,case=False,na=False,regex=False)
+        ].copy()
+    order={"📈 主要進場":1,"🌱 回測試單":2,"🚀 趨勢確認持有":3,"🟡 獲利保護":4,"🟠 積極鎖利":5,"🔴 贏家退潮":6,"⏳ 等待":7}
+    z["_o"]=z.get("目前狀態",pd.Series("⏳ 等待",index=z.index)).map(order).fillna(8)
+    if "最近變更時間" in z.columns:
+        z["_t"]=pd.to_datetime(z["最近變更時間"],format="%H:%M:%S",errors="coerce")
+        z=z.sort_values(["_o","_t"],ascending=[True,False],na_position="last")
+    else:
+        z=z.sort_values("_o")
+    show=[c for c in [
+        "代號","名稱","目前狀態","前一狀態","今日路徑","最近變更時間","最近變更原因",
+        "首次觸發時間","首次觸發價","本狀態觸發時間","本狀態觸發價","最新價",
+        "首次觸發後漲跌%","本狀態漲跌%","盤中RS","右側分數","過熱程度","鴨嘴完成度%",
+        "下一步條件","資料狀態","資料更新時間","MIS報價時間"
+    ] if c in z.columns]
+    return z[show]
 
 
 def _trade_radar_view(df: pd.DataFrame, limit=80, sort_kind="entry") -> pd.DataFrame:
@@ -2067,9 +2154,10 @@ def _trade_radar_view(df: pd.DataFrame, limit=80, sort_kind="entry") -> pd.DataF
     if sort_cols:
         z=z.sort_values(sort_cols,ascending=[False]*len(sort_cols),na_position="last")
     show=[c for c in [
-        "代號","名稱","市場","盤中價","漲跌幅%","觸發價","觸發後漲跌%","訊號持續",
+        "代號","名稱","目前狀態","前一狀態","今日路徑","盤中價","漲跌幅%",
+        "本狀態觸發價","本狀態漲跌%","首次觸發價","首次觸發後漲跌%","最近變更原因",
         "盤中RS","鴨嘴完成度%","右側分數","過熱程度","盤中操作","進場階段","獲利階段",
-        "市場閘門","成交狀態","資料狀態","資料層級","資料更新時間","資料年齡秒","MIS報價時間","價格來源"
+        "下一步條件","市場閘門","成交狀態","資料狀態","資料層級","資料更新時間","MIS報價時間","價格來源"
     ] if c in z.columns]
     return z[show].head(limit)
 
@@ -2081,21 +2169,25 @@ def _render_change_radar(snap: dict, bg_state: dict, manager=None):
     if stocks is None or stocks.empty:
         return
 
-    # ===== 第一層：最新回測後真正可操作的進出場雷達 =====
     st.write("#### 🎯 盤中回測交易雷達")
     st.caption(
-        "這一層與下方『盤中單檔查詢』使用同一套規則："
-        "預備80＋RS70＋市場改善＝試單；右側≥65＋市場改善＝主要進場；"
-        "一般/可交易股過熱70～80、RS85領頭股90＝獲利管理。"
-        "全市場約30秒刷新廣度與候選發現；六大交易分類、事件雷達、手動查詢，以及今日曾觸發後已離開的股票全部進入動態5–20秒批次追蹤。主清單只採 MIS z 真實成交價。真正離開條件的股票不會留在『目前有效』清單，但會保留在『今日曾觸發』紀錄並標示離開原因。"
+        "v3.5.8 改成『個股狀態機』：股票一旦曾進入交易雷達，今天就不再因條件失效而消失，"
+        "而是持續更新為 🌱試單 → 📈主要進場 → 🚀持有 → 🟡獲利保護 → 🟠鎖利 → 🔴退潮 或 ⏳等待。"
+        "六大數字仍代表此刻有效；下方狀態流則是一檔股票一列，持續顯示目前位置、今日路徑與下一步條件。"
     )
 
     try:
         radar=_get_intraday_trade_radar(snap,bg_state)
         radar=_decorate_live_freshness(radar,bg_state,snap)
-        radar=_decorate_signal_tracking(radar)
+        radar["追蹤分類"]=radar.apply(_signal_bucket,axis=1)
+        radar["目前判讀狀態"]=radar.apply(_continuous_state_label,axis=1)
+        if manager is not None:
+            manager.sync_trade_states(_state_sync_payload(radar))
+            state_df=manager.get_trade_state_table()
+        else:
+            state_df=pd.DataFrame()
     except Exception as e:
-        radar=pd.DataFrame()
+        radar=pd.DataFrame(); state_df=pd.DataFrame()
         st.warning(f"盤中交易雷達暫時無法重算：{e}；下方市場事件雷達仍可使用。")
 
     if not radar.empty:
@@ -2114,25 +2206,29 @@ def _render_change_radar(snap: dict, bg_state: dict, manager=None):
         lock=real[profit_s.str.startswith("🟠")]
         retreat=real[profit_s.str.startswith("🔴")]
 
-        # Keep the discovery universe stable until the next full-market pulse, but do not
-        # drop names because of an arbitrary 120-stock cap.  All six trade buckets +
-        # event radar + current manual lookup are reactive.
-        full_cache=st.session_state.get("v356_trade_radar_full_cache",{})
+        touched_codes=set(state_df["代號"].astype(str).map(_norm_stock_code)) if not state_df.empty and "代號" in state_df.columns else set()
+        full_cache=st.session_state.get("v358_trade_radar_full_cache",{})
         watch_source=full_cache.get("data") if isinstance(full_cache,dict) else None
         if not isinstance(watch_source,pd.DataFrame) or watch_source.empty:
             watch_source=radar.copy()
         else:
             watch_source=watch_source.copy()
         watch_source["追蹤分類"]=watch_source.apply(_signal_bucket,axis=1)
-        fast_codes=_all_reactive_watch_codes(watch_source,bg_state,snap)
+        fast_codes=_all_reactive_watch_codes(watch_source,bg_state,snap,touched_codes=touched_codes)
         reactive_interval=_reactive_interval_for_count(len(fast_codes))
         if manager is not None and dashboard_mode=="intraday":
             try:
-                manager.set_fast_watch_codes(
-                    fast_codes,interval_seconds=reactive_interval,enabled=True,max_codes=2500
-                )
+                manager.set_fast_watch_codes(fast_codes,interval_seconds=reactive_interval,enabled=True,max_codes=2500)
             except Exception as e:
                 st.caption(f"盤中動態追蹤設定暫時失敗：{e}")
+
+        # Attach each stock's continuous path to current-effective bucket tables.
+        trial=_attach_state_context(trial,state_df)
+        major=_attach_state_context(major,state_df)
+        hold=_attach_state_context(hold,state_df)
+        protect=_attach_state_context(protect,state_df)
+        lock=_attach_state_context(lock,state_df)
+        retreat=_attach_state_context(retreat,state_df)
 
         c1,c2,c3,c4,c5,c6=st.columns(6)
         c1.metric("🌱 回測試單候選",f"{len(trial)} 檔")
@@ -2150,13 +2246,20 @@ def _render_change_radar(snap: dict, bg_state: dict, manager=None):
         fast_error=bg_state.get("fast_last_error")
         fast_interval=int(bg_state.get("fast_interval_seconds",reactive_interval) or reactive_interval)
         engine=_clean_cell(bg_state.get("engine_version")) or "—"
-        st.caption(f"⚡ 盤中動態追蹤：{fast_count} 檔｜本輪回傳 {fast_returned} 檔（{fast_cov:.1f}%）｜約{fast_interval}秒/批｜最近完成：{fast_last}｜{'更新中' if fast_running else '待命'}｜引擎 {engine}。全市場廣度/RS/Wade約30秒更新。")
+        st.caption(
+            f"⚡ 盤中動態追蹤：{fast_count} 檔｜本輪回傳 {fast_returned} 檔（{fast_cov:.1f}%）｜約{fast_interval}秒/批｜"
+            f"最近完成：{fast_last}｜{'更新中' if fast_running else '待命'}｜引擎 {engine}。"
+            f"今日狀態機已接管 {len(state_df)} 檔曾觸發股票；離開目前條件後仍持續追蹤。"
+        )
         if fast_error:
             st.warning(f"快速追蹤上一輪失敗：{fast_error}；目前保留上一筆可用資料並顯示資料年齡。")
+        persist_error=bg_state.get("trade_state_persist_error")
+        if persist_error:
+            st.caption(f"狀態檔持久化提示：{persist_error}")
         if not stale.empty:
-            st.warning(f"有 {len(stale)} 檔真實成交列已超過允許的新鮮度，暫時不計入『即時可操作』數量；展開下方逾時清單可檢查。")
+            st.warning(f"有 {len(stale)} 檔真實成交列已超過允許的新鮮度；不會把它誤判成『離開策略』，狀態機會保留上一個有效狀態並標示行情待刷新。")
             with st.expander(f"⚠️ 行情逾時／待刷新：{len(stale)} 檔", expanded=False):
-                st.dataframe(_trade_radar_view(stale,120,"entry"),hide_index=True,use_container_width=True,height=320)
+                st.dataframe(_trade_radar_view(_attach_state_context(stale,state_df),max(120,len(stale)),"entry"),hide_index=True,use_container_width=True,height=320)
 
         gate=_intraday_entry_gate(snap)
         if gate["允許"]:
@@ -2164,80 +2267,48 @@ def _render_change_radar(snap: dict, bg_state: dict, manager=None):
         else:
             st.warning(f"目前盤中進場閘門：{gate['標籤']}｜{gate['說明']}。即使個股結構到位，也先列觀察，不直接升級新買點。")
         if est_count:
-            st.caption(f"另有 {est_count} 檔目前只有委託簿/前收參考價，已排除在上述可操作數量之外。")
+            st.caption(f"另有 {est_count} 檔目前只有委託簿/前收參考價；這種資料不會觸發狀態切換。")
 
-        with st.expander(f"🌱 回測試單候選：{len(trial)} 檔｜預備80＋RS70＋市場改善", expanded=False):
-            if trial.empty:
-                st.caption("目前沒有以真實成交價觸發的試單候選。")
+        # Unified per-stock continuity view: this replaces a disconnected history page.
+        if not state_df.empty:
+            st.write("##### 🧭 今日個股狀態流｜一檔股票一列，不消失、只換狀態")
+            st.caption(
+                "例如早上曾是『📈主要進場』，現在條件失效，就會變成『⏳等待』並保留今日路徑；"
+                "如果轉成獲利保護，則會顯示『📈主要進場 → 🟡獲利保護』。搜尋股票時看到的是它現在走到哪裡，而不是另一張獨立歷史表。"
+            )
+            state_q=st.text_input("搜尋今日曾進入雷達的股票（代號／名稱）",key="v358_state_flow_search",placeholder="例如 2603、長榮、3029、零壹")
+            sv=_state_machine_view(state_df,state_q)
+            if sv.empty:
+                st.caption("沒有符合搜尋條件的今日狀態股票。若該股是在 v3.5.8 上線前短暫出現，舊版沒有留下可重建的狀態資料。")
             else:
-                st.dataframe(_trade_radar_view(trial,max(80,len(trial)),"entry"),hide_index=True,use_container_width=True,height=420)
+                st.dataframe(sv,hide_index=True,use_container_width=True,height=min(620,105+35*min(len(sv),14)))
 
-        with st.expander(f"📈 主要進場候選：{len(major)} 檔｜右側≥65＋市場改善", expanded=False):
-            if major.empty:
-                st.caption("目前沒有以真實成交價觸發的主要進場候選。")
-            else:
-                st.dataframe(_trade_radar_view(major,max(100,len(major)),"entry"),hide_index=True,use_container_width=True,height=460)
+        with st.expander(f"🌱 回測試單候選：{len(trial)} 檔｜目前此刻有效", expanded=False):
+            st.dataframe(_trade_radar_view(trial,max(80,len(trial)),"entry"),hide_index=True,use_container_width=True,height=420) if not trial.empty else st.caption("目前沒有以真實成交價觸發的試單候選。")
+        with st.expander(f"📈 主要進場候選：{len(major)} 檔｜目前此刻有效", expanded=False):
+            st.dataframe(_trade_radar_view(major,max(100,len(major)),"entry"),hide_index=True,use_container_width=True,height=460) if not major.empty else st.caption("目前沒有以真實成交價觸發的主要進場候選。")
+        with st.expander(f"🚀 趨勢確認持有：{len(hold)} 檔｜目前此刻有效", expanded=False):
+            st.dataframe(_trade_radar_view(hold,max(100,len(hold)),"entry"),hide_index=True,use_container_width=True,height=440) if not hold.empty else st.caption("目前沒有盤中右側確認持有名單。")
+        with st.expander(f"🟡 獲利保護：{len(protect)} 檔｜目前此刻有效", expanded=False):
+            st.dataframe(_trade_radar_view(protect,max(100,len(protect)),"exit"),hide_index=True,use_container_width=True,height=440) if not protect.empty else st.caption("目前沒有進入第一層獲利保護區的股票。")
+        with st.expander(f"🟠 積極鎖利：{len(lock)} 檔｜目前此刻有效", expanded=False):
+            st.dataframe(_trade_radar_view(lock,max(100,len(lock)),"exit"),hide_index=True,use_container_width=True,height=440) if not lock.empty else st.caption("目前沒有進入積極鎖利區的股票。")
+        with st.expander(f"🔴 贏家退潮：{len(retreat)} 檔｜目前此刻有效", expanded=False):
+            st.dataframe(_trade_radar_view(retreat,max(100,len(retreat)),"exit"),hide_index=True,use_container_width=True,height=440) if not retreat.empty else st.caption("目前沒有觸發贏家退潮管理的股票。")
 
-        with st.expander(f"🚀 趨勢確認持有：{len(hold)} 檔", expanded=False):
-            if hold.empty:
-                st.caption("目前沒有盤中右側確認持有名單。")
-            else:
-                st.dataframe(_trade_radar_view(hold,max(100,len(hold)),"entry"),hide_index=True,use_container_width=True,height=440)
-
-        with st.expander(f"🟡 獲利保護：{len(protect)} 檔｜停止追價／準備鎖利", expanded=False):
-            if protect.empty:
-                st.caption("目前沒有進入第一層獲利保護區的股票。")
-            else:
-                st.dataframe(_trade_radar_view(protect,max(100,len(protect)),"exit"),hide_index=True,use_container_width=True,height=440)
-
-        with st.expander(f"🟠 積極鎖利：{len(lock)} 檔｜一般股80／RS85領頭股90附近", expanded=False):
-            if lock.empty:
-                st.caption("目前沒有進入積極鎖利區的股票。")
-            else:
-                st.dataframe(_trade_radar_view(lock,max(100,len(lock)),"exit"),hide_index=True,use_container_width=True,height=440)
-
-        with st.expander(f"🔴 贏家退潮：{len(retreat)} 檔｜曾過熱後結構退潮", expanded=False):
-            if retreat.empty:
-                st.caption("目前沒有觸發贏家退潮管理的股票。")
-            else:
-                st.dataframe(_trade_radar_view(retreat,max(100,len(retreat)),"exit"),hide_index=True,use_container_width=True,height=440)
-
-        hist_summary,hist_df=_today_signal_history_frames()
-        if not hist_df.empty:
-            closed=hist_df[hist_df["離開時間"].fillna("").astype(str)!=""].copy()
-            closed_unique=int(closed["代號"].astype(str).nunique()) if not closed.empty else 0
-            with st.expander(
-                f"🕘 今日曾觸發／已離開原分類：{closed_unique} 檔｜今日共 {len(hist_df)} 段訊號",
-                expanded=False
-            ):
-                st.caption(
-                    "『目前有效』六區只放此刻仍符合條件的股票；這裡保留今天曾經觸發過的完整軌跡。"
-                    "離開原因會區分條件失效、分類轉換、MIS 無真實成交價或行情逾時；離開原分類本身不等於正式賣出指令。"
-                )
-                if not hist_summary.empty:
-                    st.dataframe(hist_summary,hide_index=True,use_container_width=True,height=min(280,80+35*len(hist_summary)))
-                show_hist=[c for c in [
-                    "代號","名稱","觸發分類","進入時間","觸發價","離開時間","離開價",
-                    "離開原因","目前分類","目前狀態","最新價","觸發後漲跌%"
-                ] if c in hist_df.columns]
-                hz=hist_df.copy()
-                hz["_sort"]=pd.to_datetime(hz["進入時間"],format="%H:%M:%S",errors="coerce")
-                hz=hz.sort_values("_sort",ascending=False).drop(columns="_sort")
-                st.dataframe(hz[show_hist],hide_index=True,use_container_width=True,height=460)
-
-        fast_log=st.session_state.get("v357_signal_change_log",[])
-        if fast_log:
-            with st.expander(f"⚡ 盤中動態訊號變化（最近 {min(len(fast_log),300)} 筆）",expanded=False):
-                st.dataframe(pd.DataFrame(fast_log[::-1]),hide_index=True,use_container_width=True,height=340)
+        events_sm=manager.get_state().get("trade_state_events",[]) if manager is not None else []
+        if events_sm:
+            with st.expander(f"🔁 最近狀態轉換：{min(len(events_sm),500)} 筆",expanded=False):
+                st.dataframe(pd.DataFrame(events_sm[::-1]),hide_index=True,use_container_width=True,height=340)
 
         st.caption(
-            "注意：全市場雷達不知道你的個別持股成本，因此不會把『收盤≤成本-8%』列成全市場硬停損。"
-            "-8% 最後防線仍在單檔查詢／個股決策卡填入成本後判斷。"
+            "注意：『離開某個分類』不等於正式賣出，而是更新為下一個狀態。"
+            "全市場雷達不知道你的個別持股成本，因此 -8% 最後防線仍在單檔查詢／個股決策卡填入成本後判斷。"
         )
     else:
         st.info("盤中交易雷達尚無可用結果；等待背景第一批完成後會自動出現。")
 
-    # ===== 第二層：保留原本的市場事件掃描，但不再把掉出強勢條件叫做「退出」 =====
+    # ===== 第二層：市場事件觀察 =====
     st.divider()
     events = bg_state.get("events") or {}
     new_strong = set(events.get("new_strong") or set())
@@ -2247,46 +2318,30 @@ def _render_change_radar(snap: dict, bg_state: dict, manager=None):
     compare_label = str(events.get("compare_label") or f"相對 {latest_date} 正式")
 
     st.write("##### 📡 市場事件觀察（原強勢／鴨嘴雷達）")
-    st.caption(
-        f"{compare_label}｜這一層是市場結構事件，不等同回測後的買賣指令。"
-        "原本『暫時退出』改名為『結構轉弱』，避免與真正出場條件混淆。"
-    )
+    st.caption(f"{compare_label}｜這一層是市場結構事件，不等同回測後的買賣指令。")
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("🔥 本輪新進強勢", f"{len(new_strong)} 檔")
     c2.metric("🌱 即將符合強勢", f"{len(near_codes)} 檔")
     c3.metric("⚠️ 本輪結構轉弱", f"{len(out_strong)} 檔")
     c4.metric("🦆 鴨嘴結構新進", f"{len(new_duck)} 檔")
 
-    if new_strong:
-        st.success(f"🔥 最新背景掃描發現 {len(new_strong)} 檔新進強勢；這是事件觀察，不代表一定是最佳買點。")
     with st.expander(f"🔥 本輪新進強勢：{len(new_strong)} 檔", expanded=False):
-        if new_strong:
-            st.dataframe(_event_table(stocks, new_strong, 40), hide_index=True, use_container_width=True, height=360)
-        else:
-            st.caption("本輪沒有新進強勢。")
+        st.dataframe(_event_table(stocks,new_strong,40),hide_index=True,use_container_width=True,height=360) if new_strong else st.caption("本輪沒有新進強勢。")
     with st.expander(f"🌱 即將符合強勢：{len(near_codes)} 檔", expanded=False):
-        if near_codes:
-            st.dataframe(_event_table(stocks, near_codes, 80), hide_index=True, use_container_width=True, height=420)
-        else:
-            st.caption("目前沒有只差一項且已接近門檻的股票。")
+        st.dataframe(_event_table(stocks,near_codes,80),hide_index=True,use_container_width=True,height=420) if near_codes else st.caption("目前沒有只差一項且已接近門檻的股票。")
     with st.expander(f"⚠️ 本輪結構轉弱：{len(out_strong)} 檔", expanded=False):
-        if out_strong:
-            st.dataframe(_event_table(stocks, out_strong, 50), hide_index=True, use_container_width=True, height=360)
-        else:
-            st.caption("本輪沒有強勢結構轉弱。")
+        st.dataframe(_event_table(stocks,out_strong,50),hide_index=True,use_container_width=True,height=360) if out_strong else st.caption("本輪沒有強勢結構轉弱。")
     with st.expander(f"🦆 本輪新進鴨嘴價格結構：{len(new_duck)} 檔", expanded=False):
-        if new_duck:
-            st.dataframe(_event_table(stocks, new_duck, 50), hide_index=True, use_container_width=True, height=360)
-        else:
-            st.caption("本輪沒有新進鴨嘴價格結構。")
+        st.dataframe(_event_table(stocks,new_duck,50),hide_index=True,use_container_width=True,height=360) if new_duck else st.caption("本輪沒有新進鴨嘴價格結構。")
 
     log = bg_state.get("event_log") or []
     if log:
-        with st.expander(f"🕘 今日盤中事件紀錄（最近 {min(len(log), 300)} 筆）", expanded=False):
+        with st.expander(f"🕘 今日盤中市場事件（最近 {min(len(log),300)} 筆）", expanded=False):
             log_df=pd.DataFrame(log[::-1])
             if "類型" in log_df.columns:
                 log_df["類型"]=log_df["類型"].replace({"⚠️ 暫時退出":"⚠️ 結構轉弱"})
-            st.dataframe(log_df, hide_index=True, use_container_width=True, height=360)
+            st.dataframe(log_df,hide_index=True,use_container_width=True,height=360)
+
 
 def _render_trial_summary(bg_state: dict, manager=None):
     snap = bg_state.get("snapshot")
@@ -2620,6 +2675,19 @@ def _manual_stock_lookup(manager):
         f"盤中試算：右側 {plan['右側分數']:.0f}／過熱 {plan['過熱程度']:.0f}／"
         f"鴨嘴完成 {plan['鴨嘴完成度%']:.0f}%｜{plan['市場閘門']}｜{plan['市場閘門說明']}"
     )
+
+    # v3.5.8: the manual lookup reads the same process-shared per-stock state machine.
+    life=manager.get_trade_state(code_s) if hasattr(manager,"get_trade_state") else None
+    if life:
+        st.write("#### 🧭 今日狀態生命線")
+        decision_cards([
+            ("目前狀態",life.get("顯示狀態") or life.get("目前狀態","—"),f"前一狀態：{life.get('前一狀態','—')}"),
+            ("今日路徑",life.get("今日路徑","—"),f"最近變更 {life.get('最近變更時間','—')}"),
+            ("首次觸發",f"{life.get('首次觸發分類','—')} @ {_fmt_trial(life.get('首次觸發價'),2)}",f"{life.get('首次觸發時間','—')}｜至今 {_fmt_trial(life.get('首次觸發後漲跌%'),2,'%')}"),
+            ("下一步",life.get("下一步條件","—"),_short_text(life.get("最近變更原因","—"),95)),
+        ])
+    else:
+        st.caption("🧭 今日狀態生命線：這檔股票今天尚未以真實、足夠新鮮的行情進入六大交易雷達；目前仍以本次即時判讀為準。")
     if cost_v>0 and plan.get("硬停損價") is not None:
         ret_txt="—" if plan.get("成本報酬%") is None else f"{plan['成本報酬%']:+.2f}%"
         st.caption(f"平均成本 {cost_v:.2f}｜-8% 收盤硬停損參考價 {plan['硬停損價']:.2f}｜目前相對成本 {ret_txt}。盤中跌破只預警，收盤仍符合才正式觸發。")
@@ -2647,7 +2715,7 @@ def _manual_stock_lookup(manager):
 
 st.title("📈 台股分析中心")
 st.markdown(
-    '<div class="hero-sub">RS 市場廣度 × 鴨嘴型態 × 培育中心｜正式網頁版 v3.5.6｜進場回測 × 獲利管理 × -8%失敗風控 × 個股決策中心</div>',
+    '<div class="hero-sub">RS 市場廣度 × 鴨嘴型態 × 培育中心｜正式網頁版 v3.5.8｜進場回測 × 獲利管理 × -8%失敗風控 × 個股決策中心</div>',
     unsafe_allow_html=True
 )
 
@@ -3208,4 +3276,4 @@ with tabs[7]:
     with open(DEFAULT_RS,"rb") as f: d1.download_button("下載 RS 最新結果",f.read(),file_name="rs_latest.xlsx",mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",use_container_width=True)
     with open(DEFAULT_DUCK,"rb") as f: d2.download_button("下載鴨嘴最新結果",f.read(),file_name="duck_latest.xlsx",mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",use_container_width=True)
 
-st.divider(); st.caption(f"正式版 v3.5.7｜進場 v1.0 × 獲利出場 v1.2 × 失敗風控 v1.0 × 個股決策中心｜RS：{rs_date}｜鴨嘴：{duck_date}｜量化篩選與市場廣度工具，不構成投資建議。")
+st.divider(); st.caption(f"正式版 v3.5.8｜進場 v1.0 × 獲利出場 v1.2 × 失敗風控 v1.0 × 個股決策中心｜RS：{rs_date}｜鴨嘴：{duck_date}｜量化篩選與市場廣度工具，不構成投資建議。")

@@ -23,6 +23,7 @@ from zoneinfo import ZoneInfo
 import datetime as dt
 import json
 import math
+import os
 import time
 import threading
 
@@ -32,9 +33,10 @@ import streamlit as st
 APP_DIR = Path(__file__).resolve().parent
 BASELINE = APP_DIR / "intraday_baseline.pkl.gz"
 BASELINE_STATUS = APP_DIR / "intraday_baseline_status.json"
+TRADE_STATE_FILE = APP_DIR / "intraday_trade_state_today.json"
 MIS_URL = "https://mis.twse.com.tw/stock/api/getStockInfo.jsp"
 TZ = ZoneInfo("Asia/Taipei")
-ENGINE_VERSION = "3.5.6-auditfix-1"
+ENGINE_VERSION = "3.5.8-state-machine-1"
 
 RS_THRESHOLD = 85.0
 AMOUNT_MIN = 30_000_000.0
@@ -564,6 +566,82 @@ def _codes_from_live(snapshot: dict, col: str, watch_codes: set[str] | None = No
     return set(stocks.loc[mask, "代號"].astype(str))
 
 
+
+
+def _plain_json_value(v):
+    """Convert pandas/numpy-ish scalars into small JSON-safe values."""
+    try:
+        if pd.isna(v):
+            return None
+    except Exception:
+        pass
+    if isinstance(v, (str, int, float, bool)) or v is None:
+        return v
+    try:
+        x = v.item()
+        if isinstance(x, (str, int, float, bool)) or x is None:
+            return x
+    except Exception:
+        pass
+    return str(v)
+
+
+def _trade_state_transition_reason(old_state: str, new_state: str, row: dict) -> str:
+    """Describe why a touched stock changed state, using the same live diagnostics shown in the UI."""
+    old_state = str(old_state or "⏳ 等待")
+    new_state = str(new_state or "⏳ 等待")
+    if old_state == new_state:
+        return "狀態延續"
+    if old_state == "⏳ 等待" and new_state != "⏳ 等待":
+        return f"即時條件成立：{new_state}"
+    if old_state != "⏳ 等待" and new_state != "⏳ 等待":
+        return f"分類轉換：{old_state} → {new_state}"
+
+    right = _f(row.get("右側分數"))
+    rs = _f(row.get("盤中RS"))
+    heat = _f(row.get("過熱程度"))
+    complete = _f(row.get("鴨嘴完成度%"))
+    gate = str(row.get("市場閘門") or "")
+    live_duck = bool(row.get("盤中正式鴨嘴", False))
+    reasons = []
+    if old_state.startswith("📈"):
+        if right is not None and right < 65:
+            reasons.append(f"右側 {right:.1f}<65")
+        if "未確認" in gate:
+            reasons.append("市場廣度閘門未確認")
+        if heat is not None and heat >= 70:
+            reasons.append(f"過熱 {heat:.1f}，離開進場區")
+    elif old_state.startswith("🌱"):
+        if complete is not None and complete < 80:
+            reasons.append(f"鴨嘴完成度 {complete:.0f}%<80%")
+        if rs is not None and rs < 70:
+            reasons.append(f"RS {rs:.1f}<70")
+        if "未確認" in gate:
+            reasons.append("市場廣度閘門未確認")
+        if heat is not None and heat >= 70:
+            reasons.append(f"過熱 {heat:.1f}，離開試單區")
+    elif old_state.startswith("🚀"):
+        if not live_duck:
+            reasons.append("正式鴨嘴結構暫時不成立")
+        if right is not None and right < 65:
+            reasons.append(f"右側 {right:.1f}<65")
+    elif old_state.startswith("🟡"):
+        if heat is not None and heat < 70:
+            reasons.append(f"過熱降至 {heat:.1f}<70")
+    elif old_state.startswith("🟠"):
+        threshold = 90 if rs is not None and rs >= 85 else 80
+        if heat is not None and heat < threshold:
+            reasons.append(f"過熱降至 {heat:.1f}<{threshold}")
+    elif old_state.startswith("🔴"):
+        reasons.append("贏家退潮條件目前解除")
+    return "；".join(reasons[:3]) if reasons else f"{old_state} → {new_state}"
+
+
+def _trade_state_path_text(path) -> str:
+    vals = [str(x) for x in (path or []) if str(x).strip()]
+    return " → ".join(vals[-10:]) if vals else "—"
+
+
 class IntradayBackgroundManager:
     """Process-shared scanner: full-market pulse + reactive intraday watch universe.
 
@@ -610,6 +688,17 @@ class IntradayBackgroundManager:
         self._fast_last_error: str | None = None
         self._fast_last_returned_count = 0
         self._fast_cycle = 0
+
+        # v3.5.8: process-shared per-stock state machine.  Once a stock has entered
+        # any actionable radar state, it remains traceable for the rest of the day
+        # even after it returns to "等待" or moves to another bucket.
+        self._trade_state_day = dt.datetime.now(TZ).strftime("%Y-%m-%d")
+        self._trade_states: dict[str, dict] = {}
+        self._trade_state_events: list[dict] = []
+        self._trade_state_version = 0
+        self._trade_state_last_save = 0.0
+        self._trade_state_persist_error: str | None = None
+        self._load_trade_state_file_locked()
 
         self._thread = threading.Thread(target=self._loop, name="tw-intraday-background", daemon=True)
         self._thread.start()
@@ -671,6 +760,216 @@ class IntradayBackgroundManager:
                 should_wake = True
         if should_wake:
             self._wake.set()
+
+    def _reset_trade_state_day_locked(self, day: str | None = None) -> None:
+        day = day or dt.datetime.now(TZ).strftime("%Y-%m-%d")
+        if day == self._trade_state_day:
+            return
+        self._trade_state_day = day
+        self._trade_states = {}
+        self._trade_state_events = []
+        self._trade_state_version += 1
+        self._trade_state_persist_error = None
+        try:
+            if TRADE_STATE_FILE.exists():
+                TRADE_STATE_FILE.unlink()
+        except Exception:
+            pass
+
+    def _load_trade_state_file_locked(self) -> None:
+        """Best-effort restore for browser/session refreshes and same-container restarts."""
+        try:
+            if not TRADE_STATE_FILE.exists():
+                return
+            payload = json.loads(TRADE_STATE_FILE.read_text(encoding="utf-8"))
+            today = dt.datetime.now(TZ).strftime("%Y-%m-%d")
+            if str(payload.get("day") or "") != today:
+                try:
+                    TRADE_STATE_FILE.unlink()
+                except Exception:
+                    pass
+                return
+            states = payload.get("states") or {}
+            events = payload.get("events") or []
+            if isinstance(states, dict):
+                self._trade_states = {str(k): dict(v) for k, v in states.items() if isinstance(v, dict)}
+            if isinstance(events, list):
+                self._trade_state_events = [dict(x) for x in events[-2000:] if isinstance(x, dict)]
+            self._trade_state_day = today
+        except Exception as e:
+            self._trade_state_persist_error = f"讀取狀態檔失敗：{type(e).__name__}: {e}"
+
+    def _save_trade_state_file_locked(self, force: bool = False) -> None:
+        now_ts = time.time()
+        if not force and now_ts - self._trade_state_last_save < 20.0:
+            return
+        try:
+            # Only touched stocks need durable continuity; untouched waiting stocks can
+            # always be reconstructed from the next full-market snapshot.
+            touched = {
+                code: rec for code, rec in self._trade_states.items()
+                if bool(rec.get("今日曾觸發", False))
+            }
+            payload = {
+                "day": self._trade_state_day,
+                "engine_version": ENGINE_VERSION,
+                "saved_at": dt.datetime.now(TZ).strftime("%Y-%m-%d %H:%M:%S"),
+                "states": touched,
+                "events": self._trade_state_events[-2000:],
+            }
+            tmp = TRADE_STATE_FILE.with_name(TRADE_STATE_FILE.name + ".tmp")
+            tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+            os.replace(tmp, TRADE_STATE_FILE)
+            self._trade_state_last_save = now_ts
+            self._trade_state_persist_error = None
+        except Exception as e:
+            self._trade_state_persist_error = f"寫入狀態檔失敗：{type(e).__name__}: {e}"
+
+    def sync_trade_states(self, rows) -> None:
+        """Synchronize app-classified live rows into one continuous state per stock.
+
+        `rows` can be a DataFrame or a list of dicts.  Data-quality problems do not
+        force a trading-state transition: the last valid state is kept and the row is
+        marked non-actionable until a fresh MIS z quote returns.
+        """
+        if rows is None:
+            return
+        if isinstance(rows, pd.DataFrame):
+            records = rows.to_dict("records")
+        else:
+            records = list(rows or [])
+        if not records:
+            return
+
+        now = dt.datetime.now(TZ)
+        day = now.strftime("%Y-%m-%d")
+        now_text = now.strftime("%Y-%m-%d %H:%M:%S")
+        clock = now.strftime("%H:%M:%S")
+        changed = False
+        with self._lock:
+            self._reset_trade_state_day_locked(day)
+            for raw in records:
+                if not isinstance(raw, dict):
+                    continue
+                row = {str(k): _plain_json_value(v) for k, v in raw.items()}
+                code = _norm_code(row.get("代號"))
+                if not code:
+                    continue
+                candidate = str(row.get("狀態") or "⏳ 等待")
+                data_issue = str(row.get("資料問題") or "").strip()
+                price = _f(row.get("盤中價"))
+                rec = self._trade_states.get(code)
+
+                # Do not create 2,000 permanent waiting rows.  A stock enters the state
+                # machine only after its first real actionable signal; from then on it
+                # never disappears for the rest of that trading day.
+                if rec is None:
+                    if data_issue or candidate == "⏳ 等待":
+                        continue
+                    path = [candidate]
+                    rec = {
+                        "日期": day,
+                        "代號": code,
+                        "名稱": str(row.get("名稱") or ""),
+                        "市場": str(row.get("市場") or ""),
+                        "目前狀態": candidate,
+                        "前一狀態": "—",
+                        "今日路徑清單": path,
+                        "今日路徑": _trade_state_path_text(path),
+                        "今日曾觸發": True,
+                        "首次觸發分類": candidate,
+                        "首次觸發時間": clock,
+                        "首次觸發價": price,
+                        "本狀態觸發時間": clock,
+                        "本狀態觸發價": price,
+                        "狀態起始時間": clock,
+                        "最近變更時間": clock,
+                        "最近變更原因": f"首次進入：{candidate}",
+                        "狀態變更次數": 0,
+                    }
+                    self._trade_states[code] = rec
+                    self._trade_state_events.append({
+                        "時間": clock, "代號": code, "名稱": rec["名稱"],
+                        "前一狀態": "—", "目前狀態": candidate,
+                        "價格": price, "原因": rec["最近變更原因"],
+                    })
+                    changed = True
+                else:
+                    rec["名稱"] = str(row.get("名稱") or rec.get("名稱") or "")
+                    rec["市場"] = str(row.get("市場") or rec.get("市場") or "")
+
+                # Always refresh diagnostics/data-health, even while a quote is stale.
+                rec["最後同步時間"] = now_text
+                rec["資料狀態"] = str(row.get("資料狀態") or "—")
+                rec["資料層級"] = str(row.get("資料層級") or "—")
+                rec["資料更新時間"] = str(row.get("資料更新時間") or "—")
+                rec["MIS報價時間"] = str(row.get("MIS報價時間") or "—")
+                rec["資料問題"] = data_issue
+                rec["可即時操作"] = bool(not data_issue and candidate != "⏳ 等待")
+                rec["下一步條件"] = str(row.get("下一步條件") or rec.get("下一步條件") or "—")
+                for k in ["盤中RS", "右側分數", "過熱程度", "鴨嘴完成度%", "市場閘門", "盤中操作", "盤中正式鴨嘴"]:
+                    if k in row:
+                        rec[k] = row.get(k)
+
+                # Keep last real price separate from an estimated book/previous-close reference.
+                if not bool(row.get("價格為估計", False)) and price is not None:
+                    rec["最新價"] = price
+                    rec["最新真實價時間"] = now_text
+                elif "最新價" not in rec and price is not None:
+                    rec["最新價"] = price
+
+                # A temporary stale/estimated quote must not make a stock look as if it
+                # left the strategy.  Wait for the next fresh real quote before changing state.
+                if data_issue:
+                    rec["顯示狀態"] = f"{rec.get('目前狀態','⏳ 等待')}｜⚠️ 行情待刷新"
+                    continue
+
+                old_state = str(rec.get("目前狀態") or "⏳ 等待")
+                if candidate != old_state:
+                    reason = _trade_state_transition_reason(old_state, candidate, row)
+                    rec["前一狀態"] = old_state
+                    rec["目前狀態"] = candidate
+                    path = list(rec.get("今日路徑清單") or [])
+                    if not path or path[-1] != candidate:
+                        path.append(candidate)
+                    rec["今日路徑清單"] = path[-12:]
+                    rec["今日路徑"] = _trade_state_path_text(rec["今日路徑清單"])
+                    rec["狀態起始時間"] = clock
+                    rec["本狀態觸發時間"] = clock
+                    rec["本狀態觸發價"] = price
+                    rec["最近變更時間"] = clock
+                    rec["最近變更原因"] = reason
+                    rec["狀態變更次數"] = int(rec.get("狀態變更次數", 0) or 0) + 1
+                    if candidate != "⏳ 等待":
+                        rec["今日曾觸發"] = True
+                    self._trade_state_events.append({
+                        "時間": clock, "代號": code, "名稱": rec.get("名稱", ""),
+                        "前一狀態": old_state, "目前狀態": candidate,
+                        "價格": price, "原因": reason,
+                    })
+                    changed = True
+
+                rec["顯示狀態"] = str(rec.get("目前狀態") or "⏳ 等待")
+                p0 = _f(rec.get("首次觸發價"))
+                ps = _f(rec.get("本狀態觸發價"))
+                pnow = _f(rec.get("最新價"))
+                rec["首次觸發後漲跌%"] = ((pnow / p0 - 1.0) * 100.0) if p0 not in (None, 0) and pnow is not None else None
+                rec["本狀態漲跌%"] = ((pnow / ps - 1.0) * 100.0) if ps not in (None, 0) and pnow is not None else None
+
+            self._trade_state_events = self._trade_state_events[-3000:]
+            self._trade_state_version += 1
+            self._save_trade_state_file_locked(force=changed)
+
+    def get_trade_state_table(self) -> pd.DataFrame:
+        with self._lock:
+            rows = [dict(v) for v in self._trade_states.values() if bool(v.get("今日曾觸發", False))]
+        return pd.DataFrame(rows)
+
+    def get_trade_state(self, code: str) -> dict | None:
+        code = _norm_code(code)
+        with self._lock:
+            rec = self._trade_states.get(code)
+            return dict(rec) if rec and bool(rec.get("今日曾觸發", False)) else None
 
     def set_fast_watch_codes(self, codes, interval_seconds: int = 5, enabled: bool = True, max_codes: int = 2500) -> None:
         ordered = []
@@ -744,6 +1043,12 @@ class IntradayBackgroundManager:
                 "fast_last_started": self._fast_last_started.strftime("%Y-%m-%d %H:%M:%S") if self._fast_last_started else None,
                 "fast_last_completed": self._fast_last_completed.strftime("%Y-%m-%d %H:%M:%S") if self._fast_last_completed else None,
                 "fast_last_error": self._fast_last_error,
+                "trade_state_day": self._trade_state_day,
+                "trade_state_version": int(self._trade_state_version),
+                "trade_state_codes": [code for code, rec in self._trade_states.items() if bool(rec.get("今日曾觸發", False))],
+                "trade_state_count": sum(1 for rec in self._trade_states.values() if bool(rec.get("今日曾觸發", False))),
+                "trade_state_events": list(self._trade_state_events[-500:]),
+                "trade_state_persist_error": self._trade_state_persist_error,
             }
 
     def _accept_snapshot(self, snap: dict) -> None:
