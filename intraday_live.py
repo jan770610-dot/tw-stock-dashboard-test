@@ -556,13 +556,7 @@ def _codes_from_live(snapshot: dict, col: str, watch_codes: set[str] | None = No
 
 
 class IntradayBackgroundManager:
-    """Process-shared background scanner.
-
-    The worker never calls Streamlit APIs. It fetches and calculates a full-market
-    snapshot in a daemon thread, then atomically swaps the completed snapshot.
-    Front-end fragments only read the last completed result, so the user never
-    waits for MIS/network + 2,000-stock calculations during an automatic refresh.
-    """
+    """Process-shared scanner: full market ~90s + actionable watchlist ~10s."""
 
     def __init__(self):
         self._lock = threading.RLock()
@@ -587,6 +581,18 @@ class IntradayBackgroundManager:
         self._last_started: dt.datetime | None = None
         self._last_completed: dt.datetime | None = None
         self._last_error: str | None = None
+
+        # v3.5.4: once a stock becomes actionable, follow it separately in small MIS batches.
+        self._fast_watch_codes: list[str] = []
+        self._fast_interval = 10.0
+        self._fast_enabled = False
+        self._fast_rows: pd.DataFrame | None = None
+        self._fast_version = 0
+        self._fast_running = False
+        self._fast_last_started: dt.datetime | None = None
+        self._fast_last_completed: dt.datetime | None = None
+        self._fast_last_error: str | None = None
+
         self._thread = threading.Thread(target=self._loop, name="tw-intraday-background", daemon=True)
         self._thread.start()
 
@@ -621,21 +627,53 @@ class IntradayBackgroundManager:
                 self._duck_watch = duck_watch_codes
                 self._formal_date = str(formal_date)
                 self._config_sig = sig
-                # A new formal date/baseline invalidates yesterday's intraday history.
                 if old_date != "—" and old_date != self._formal_date:
                     self._snapshot = None
                     self._previous_snapshot = None
                     self._events = {"new_strong": set(), "out_strong": set(), "new_duck": set(), "near": set(), "compare_label": ""}
                     self._event_log = []
                     self._version = 0
+                    self._fast_watch_codes = []
+                    self._fast_rows = None
+                    self._fast_version = 0
+                    self._fast_last_completed = None
+                    self._fast_last_started = None
                 should_wake = True
             new_interval = float(max(30, int(interval_seconds)))
             if new_interval != self._interval or bool(enabled) != self._enabled:
                 self._interval = new_interval
                 self._enabled = bool(enabled)
                 should_wake = True
+            if not self._enabled:
+                self._fast_enabled = False
             if (ensure_once or self._enabled) and self._snapshot is None:
                 self._force_once = True
+                should_wake = True
+        if should_wake:
+            self._wake.set()
+
+    def set_fast_watch_codes(self, codes, interval_seconds: int = 10, enabled: bool = True, max_codes: int = 120) -> None:
+        ordered = []
+        seen = set()
+        for code in list(codes or []):
+            code = _norm_code(code)
+            if code and code not in seen:
+                ordered.append(code); seen.add(code)
+            if len(ordered) >= max(1, int(max_codes)):
+                break
+        interval = float(max(5, int(interval_seconds)))
+        should_wake = False
+        with self._lock:
+            active = bool(enabled and self._enabled and ordered)
+            if ordered != self._fast_watch_codes:
+                self._fast_watch_codes = ordered
+                self._fast_rows = None
+                self._fast_last_completed = None
+                self._fast_last_started = None
+                should_wake = True
+            if interval != self._fast_interval or active != self._fast_enabled:
+                self._fast_interval = interval
+                self._fast_enabled = active
                 should_wake = True
         if should_wake:
             self._wake.set()
@@ -665,6 +703,16 @@ class IntradayBackgroundManager:
                 "last_started": self._last_started.strftime("%Y-%m-%d %H:%M:%S") if self._last_started else None,
                 "last_completed": self._last_completed.strftime("%Y-%m-%d %H:%M:%S") if self._last_completed else None,
                 "last_error": self._last_error,
+                "fast_rows": None if self._fast_rows is None else self._fast_rows.copy(deep=False),
+                "fast_watch_codes": list(self._fast_watch_codes),
+                "fast_watch_count": len(self._fast_watch_codes),
+                "fast_version": self._fast_version,
+                "fast_running": self._fast_running,
+                "fast_enabled": self._fast_enabled,
+                "fast_interval_seconds": self._fast_interval,
+                "fast_last_started": self._fast_last_started.strftime("%Y-%m-%d %H:%M:%S") if self._fast_last_started else None,
+                "fast_last_completed": self._fast_last_completed.strftime("%Y-%m-%d %H:%M:%S") if self._fast_last_completed else None,
+                "fast_last_error": self._fast_last_error,
             }
 
     def _accept_snapshot(self, snap: dict) -> None:
@@ -707,6 +755,10 @@ class IntradayBackgroundManager:
             "compare_label": compare_label,
         }
         self._version += 1
+        # Re-anchor fast calculations to the just-completed full market snapshot.
+        self._fast_rows = None
+        self._fast_last_completed = None
+        self._fast_last_started = None
 
     def _loop(self) -> None:
         while not self._stop.is_set():
@@ -719,10 +771,18 @@ class IntradayBackgroundManager:
                 last_started = self._last_started
                 daily = self._daily
                 strong = self._strong
+                fast_enabled = self._fast_enabled
+                fast_interval = self._fast_interval
+                fast_last_completed = self._fast_last_completed
+                fast_last_started = self._fast_last_started
+                fast_codes = list(self._fast_watch_codes)
+                snap_for_fast = self._snapshot
             now = dt.datetime.now(TZ)
-            # After a failed attempt, wait until the next interval instead of hammering MIS in a tight retry loop.
-            anchor = last_completed or last_started
+            full_anchors=[x for x in [last_completed,last_started] if x is not None]
+            anchor=max(full_anchors) if full_anchors else None
             due = anchor is None or (now - anchor).total_seconds() >= interval
+
+            # Full scan has priority when due; it refreshes the market gate and candidate discovery universe.
             if ready and (force or (enabled and due)):
                 with self._lock:
                     self._force_once = False
@@ -744,12 +804,165 @@ class IntradayBackgroundManager:
                         self._running = False
                 continue
 
-            if enabled and last_completed is not None:
-                wait_s = max(1.0, min(15.0, interval - (now - last_completed).total_seconds()))
-            else:
-                wait_s = 15.0
+            fast_anchors=[x for x in [fast_last_completed,fast_last_started] if x is not None]
+            fast_anchor=max(fast_anchors) if fast_anchors else None
+            fast_due = fast_anchor is None or (now - fast_anchor).total_seconds() >= fast_interval
+            if ready and enabled and fast_enabled and fast_codes and snap_for_fast is not None and fast_due:
+                with self._lock:
+                    self._fast_running = True
+                    self._fast_last_started = dt.datetime.now(TZ)
+                    self._fast_last_error = None
+                    fast_snapshot_local = snap_for_fast
+                    fast_codes_local = list(fast_codes)
+                try:
+                    rows = refresh_watchlist(fast_snapshot_local, fast_codes_local, max_codes=120)
+                except Exception as e:
+                    with self._lock:
+                        self._fast_last_error = f"{type(e).__name__}: {e}"
+                        self._fast_running = False
+                else:
+                    with self._lock:
+                        self._fast_rows = rows
+                        self._fast_version += 1
+                        self._fast_last_completed = dt.datetime.now(TZ)
+                        self._fast_running = False
+                continue
+
+            waits = [15.0]
+            if enabled and anchor is not None:
+                waits.append(max(1.0, interval - (now - anchor).total_seconds()))
+            if enabled and fast_enabled and fast_codes and snap_for_fast is not None and fast_anchor is not None:
+                waits.append(max(0.5, fast_interval - (now - fast_anchor).total_seconds()))
+            wait_s = max(0.5, min(15.0, min(waits)))
             self._wake.clear()
             self._wake.wait(wait_s)
+
+
+def refresh_watchlist(snapshot: dict, codes, max_codes: int = 120) -> pd.DataFrame:
+    """Batch-refresh a small actionable watchlist without rescanning the whole market.
+
+    The full-market snapshot remains the ranking anchor. Updated watched stocks are
+    reranked together against the unchanged 250-day returns of the rest of the market.
+    One MIS batch request can therefore refresh dozens of candidates every ~10 seconds
+    without making 2,000 quote requests or one request per stock.
+    """
+    if not snapshot or snapshot.get("stocks") is None:
+        raise RuntimeError("尚未有背景市場快照")
+    stocks = snapshot["stocks"].copy()
+    if stocks.empty or "代號" not in stocks.columns:
+        return pd.DataFrame()
+    stocks["代號"] = stocks["代號"].astype(str).map(_norm_code)
+
+    ordered = []
+    seen = set()
+    for c in list(codes or []):
+        c = _norm_code(c)
+        if c and c not in seen:
+            ordered.append(c); seen.add(c)
+        if len(ordered) >= max(1, int(max_codes)):
+            break
+    if not ordered:
+        return pd.DataFrame()
+
+    hit = stocks[stocks["代號"].isin(ordered)].copy()
+    if hit.empty:
+        return pd.DataFrame()
+    market_map = dict(zip(hit["代號"].astype(str), hit.get("市場", pd.Series("TWSE", index=hit.index)).astype(str)))
+    universe = [{"code": c, "market": market_map.get(c, "TWSE")} for c in ordered if c in market_map]
+    universe_json = json.dumps(universe, ensure_ascii=False, separators=(",", ":"))
+    q, errors = _fetch_mis_quotes_raw(universe_json, batch_size=80, workers=3)
+    if q.empty:
+        raise RuntimeError(errors[0] if errors else "MIS 沒有回傳快速追蹤行情")
+    q["code"] = q["code"].astype(str).map(_norm_code)
+    q = q.drop_duplicates("code", keep="last").set_index("code")
+
+    base = _load_baseline_raw(str(BASELINE)).copy()
+    base["code"] = base["code"].astype(str).map(_norm_code)
+    base = base.drop_duplicates("code", keep="last").set_index("code")
+
+    # Rebuild watched ret250 first, then rank them against the last full-market snapshot.
+    ret_all = pd.to_numeric(stocks.get("250日報酬試算"), errors="coerce")
+    ret_all.index = stocks["代號"].astype(str)
+    updated_ret = {}
+    for code in ordered:
+        if code not in q.index or code not in base.index:
+            continue
+        last = _f(q.loc[code].get("last"))
+        rs_base = _f(base.loc[code].get("rs_base_close"))
+        if last is not None and rs_base not in (None, 0):
+            updated_ret[code] = last / rs_base - 1.0
+    for code, ret in updated_ret.items():
+        ret_all.loc[code] = ret
+    rs_rank = ret_all.rank(method="average", pct=True) * 100.0
+
+    old_map = {str(r.get("代號")): r for r in stocks.to_dict("records")}
+    rows = []
+    for code in ordered:
+        if code not in q.index or code not in base.index or code not in old_map:
+            continue
+        qr = q.loc[code]
+        b = base.loc[code]
+        old = old_map[code]
+        last = _f(qr.get("last"))
+        prev_close = _f(b.get("prev_close"))
+        if last is None or prev_close in (None, 0):
+            continue
+        ma20 = (_f(b.get("sum_close_19"), 0) + last) / 20.0
+        ma50 = (_f(b.get("sum_close_49"), 0) + last) / 50.0
+        ma60 = (_f(b.get("sum_close_59"), 0) + last) / 60.0
+        ma200 = (_f(b.get("sum_close_199"), 0) + last) / 200.0
+        ret250 = updated_ret.get(code)
+        rs_live = _f(rs_rank.get(code)) if code in rs_rank.index else _f(old.get("盤中RS"))
+
+        high_live = _f(qr.get("high_live"), last)
+        low_live = _f(qr.get("low_live"), last)
+        high250 = max(_f(b.get("max_high_249"), last), high_live)
+        low250 = min(_f(b.get("min_low_249"), last), low_live)
+        amount_est = last * (_f(qr.get("volume_lots"), 0.0) or 0.0) * 1000.0
+        conds = {
+            "RS>85": rs_live is not None and rs_live > RS_THRESHOLD,
+            "股價>MA200": last > ma200,
+            "MA50>MA200": ma50 > ma200,
+            "成交額>3000萬": amount_est > AMOUNT_MIN,
+            "距52週高點≤25%": last >= high250 * (1.0 - MAX_BELOW_52W_HIGH),
+            "高於52週低點≥30%": last >= low250 * (1.0 + MIN_ABOVE_52W_LOW),
+        }
+        count = sum(bool(v) for v in conds.values())
+        missing = [k for k, v in conds.items() if not v]
+        strong_live = count == 6
+        near = (
+            (not strong_live) and count >= 5 and (rs_live or 0) >= 80.0
+            and amount_est >= 20_000_000.0 and last > ma200 and ma50 > ma200
+            and last >= high250 * 0.70 and last >= low250 * 1.25
+        )
+        rows.append({
+            "代號": code,
+            "名稱": str(old.get("名稱") or qr.get("name_live") or ""),
+            "市場": str(old.get("市場") or market_map.get(code) or "TWSE"),
+            "盤中價": last,
+            "漲跌幅%": (last / prev_close - 1.0) * 100.0,
+            "最佳買價": _f(qr.get("best_bid")),
+            "最佳賣價": _f(qr.get("best_ask")),
+            "價格來源": str(qr.get("price_source") or "—"),
+            "價格為估計": bool(qr.get("price_estimated", False)),
+            "MIS報價時間": str(qr.get("quote_time") or "—"),
+            "MIS報價日期": str(qr.get("quote_date") or "—"),
+            "盤中RS": rs_live,
+            "250日報酬試算": ret250,
+            "盤中MA20": ma20,
+            "盤中MA50": ma50,
+            "盤中MA60": ma60,
+            "盤中MA200": ma200,
+            "盤中成交金額估算": amount_est,
+            "盤中強勢": strong_live,
+            "強勢條件通過數": count,
+            "強勢尚缺條件": "、".join(missing) if missing else "已全部符合",
+            "即將強勢": near,
+            "盤中鴨嘴價格結構": bool(last > ma20 > ma60),
+            "月線乖離率%": (last / ma20 - 1.0) * 100.0 if ma20 else None,
+            "快速追蹤時間": dt.datetime.now(TZ).strftime("%Y-%m-%d %H:%M:%S"),
+        })
+    return pd.DataFrame(rows)
 
 
 @st.cache_resource(show_spinner=False)
@@ -758,96 +971,14 @@ def get_background_manager() -> IntradayBackgroundManager:
 
 
 def refresh_single_stock(snapshot: dict, code: str) -> dict:
-    """Fetch only one stock and recompute its intraday diagnostics.
-
-    RS is reranked against the last completed full-market snapshot, so this action
-    is fast and does not trigger another 2,000-stock scan.
-    """
-    if not snapshot or snapshot.get("stocks") is None:
-        raise RuntimeError("尚未有背景市場快照")
+    """Fetch one stock using the same batch-refresh core used by the fast radar."""
     code = _norm_code(code)
-    stocks = snapshot["stocks"]
-    hit = stocks[stocks["代號"].astype(str) == code]
-    if hit.empty:
-        raise RuntimeError(f"背景快照找不到股票 {code}")
-    old = hit.iloc[0]
-    market = str(old.get("市場") or "TWSE")
-    universe_json = json.dumps([{"code": code, "market": market}], ensure_ascii=False, separators=(",", ":"))
-    q, errors = _fetch_mis_quotes_raw(universe_json, batch_size=1, workers=1)
-    if q.empty:
-        raise RuntimeError(errors[0] if errors else "MIS 沒有回傳此股票行情")
-    qr = q.iloc[0]
-    base = _load_baseline_raw(str(BASELINE))
-    base["code"] = base["code"].astype(str)
-    bh = base[base["code"] == code]
-    if bh.empty:
-        raise RuntimeError(f"盤中基準檔找不到股票 {code}")
-    b = bh.iloc[0]
-
-    last = _f(qr.get("last"))
-    prev_close = _f(b.get("prev_close"))
-    if last is None or prev_close in (None, 0):
-        raise RuntimeError("最新價或前收資料不足")
-    ma20 = (_f(b.get("sum_close_19"), 0) + last) / 20.0
-    ma50 = (_f(b.get("sum_close_49"), 0) + last) / 50.0
-    ma60 = (_f(b.get("sum_close_59"), 0) + last) / 60.0
-    ma200 = (_f(b.get("sum_close_199"), 0) + last) / 200.0
-    rs_base = _f(b.get("rs_base_close"))
-    ret250 = last / rs_base - 1.0 if rs_base not in (None, 0) else None
-
-    rs_live = _f(old.get("盤中RS"))
-    if ret250 is not None and "250日報酬試算" in stocks.columns:
-        others = pd.to_numeric(stocks.loc[stocks["代號"].astype(str) != code, "250日報酬試算"], errors="coerce").dropna()
-        vals = pd.concat([others.reset_index(drop=True), pd.Series([ret250])], ignore_index=True)
-        rs_live = float(vals.rank(method="average", pct=True).iloc[-1] * 100.0)
-
-    high_live = _f(qr.get("high_live"), last)
-    low_live = _f(qr.get("low_live"), last)
-    high250 = max(_f(b.get("max_high_249"), last), high_live)
-    low250 = min(_f(b.get("min_low_249"), last), low_live)
-    amount_est = last * (_f(qr.get("volume_lots"), 0.0) or 0.0) * 1000.0
-    conds = {
-        "RS>85": rs_live is not None and rs_live > RS_THRESHOLD,
-        "股價>MA200": last > ma200,
-        "MA50>MA200": ma50 > ma200,
-        "成交額>3000萬": amount_est > AMOUNT_MIN,
-        "距52週高點≤25%": last >= high250 * (1.0 - MAX_BELOW_52W_HIGH),
-        "高於52週低點≥30%": last >= low250 * (1.0 + MIN_ABOVE_52W_LOW),
-    }
-    count = sum(bool(v) for v in conds.values())
-    missing = [k for k, v in conds.items() if not v]
-    strong_live = count == 6
-    near = (
-        (not strong_live) and count >= 5 and (rs_live or 0) >= 80.0 and amount_est >= 20_000_000.0
-        and last > ma200 and ma50 > ma200 and last >= high250 * 0.70 and last >= low250 * 1.25
-    )
-    return {
-        "代號": code,
-        "名稱": str(old.get("名稱") or qr.get("name_live") or ""),
-        "市場": market,
-        "盤中價": last,
-        "漲跌幅%": (last / prev_close - 1.0) * 100.0,
-        "最佳買價": _f(qr.get("best_bid")),
-        "最佳賣價": _f(qr.get("best_ask")),
-        "價格來源": str(qr.get("price_source") or "—"),
-        "價格為估計": bool(qr.get("price_estimated", False)),
-        "MIS報價時間": str(qr.get("quote_time") or "—"),
-        "MIS報價日期": str(qr.get("quote_date") or "—"),
-        "盤中RS": rs_live,
-        "250日報酬試算": ret250,
-        "盤中MA20": ma20,
-        "盤中MA50": ma50,
-        "盤中MA60": ma60,
-        "盤中MA200": ma200,
-        "盤中成交金額估算": amount_est,
-        "盤中強勢": strong_live,
-        "強勢條件通過數": count,
-        "強勢尚缺條件": "、".join(missing) if missing else "已全部符合",
-        "即將強勢": near,
-        "盤中鴨嘴價格結構": bool(last > ma20 > ma60),
-        "月線乖離率%": (last / ma20 - 1.0) * 100.0 if ma20 else None,
-        "單檔抓取時間": dt.datetime.now(TZ).strftime("%Y-%m-%d %H:%M:%S"),
-    }
+    rows = refresh_watchlist(snapshot, [code], max_codes=1)
+    if rows.empty:
+        raise RuntimeError(f"MIS 沒有回傳股票 {code} 的可用行情")
+    r = rows.iloc[0].to_dict()
+    r["單檔抓取時間"] = r.get("快速追蹤時間") or dt.datetime.now(TZ).strftime("%Y-%m-%d %H:%M:%S")
+    return r
 
 
 def _fmt(v, digits=1, suffix=""):
