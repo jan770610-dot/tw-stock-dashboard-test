@@ -2435,8 +2435,145 @@ def _render_trial_summary(bg_state: dict, manager=None):
         ("風險／減碼", risk_now, f"昨日正式：{left_signal_phase}"),
         ("盤中強弱", f"Wade {_fmt_trial(snap.get('wade'),1)}", f"上漲 {_fmt_trial(snap.get('advance_ratio'),1,'%')}｜新高/新低 {snap.get('new_high',0)}/{snap.get('new_low',0)}"),
     ])
+    with st.expander("📈 盤中即時變化線圖", expanded=True):
+        st.caption("把盤中 Wade、RS 強勢股、上漲比例、MA20 上方比例等關鍵變化畫成連續線圖，方便看清盤中節奏，而不是只看單一瞬間數值。")
+        _render_intraday_trace_chart(bg_state, snap)
     _render_change_radar(snap, bg_state, manager)
 
+
+
+
+
+def _intraday_trace_append(bg_state: dict, snap: dict) -> pd.DataFrame:
+    """Collect a lightweight intraday timeline for the current browser session.
+
+    The line chart is intentionally kept in the UI layer: it is cheap, easy to reset
+    per trading day, and avoids making the background engine heavier.  The underlying
+    market snapshot is still provided by the shared background manager.
+    """
+    today = dt.datetime.now(TAIPEI_TZ).strftime("%Y-%m-%d")
+    day_key = "v360_intraday_trace_day"
+    data_key = "v360_intraday_trace_rows"
+    anchor_key = "v360_intraday_trace_last_anchor"
+    if st.session_state.get(day_key) != today:
+        st.session_state[day_key] = today
+        st.session_state[data_key] = []
+        st.session_state[anchor_key] = None
+
+    rows = list(st.session_state.get(data_key, []))
+    anchor = str(bg_state.get("last_completed") or snap.get("snapshot_time") or dt.datetime.now(TAIPEI_TZ).strftime("%Y-%m-%d %H:%M:%S"))
+    tstamp = pd.to_datetime(anchor, errors="coerce")
+    if pd.isna(tstamp):
+        tstamp = pd.Timestamp(dt.datetime.now(TAIPEI_TZ))
+    row = {
+        "時間": tstamp,
+        "時間文字": tstamp.strftime("%H:%M:%S"),
+        "Wade分數": _num(snap.get("wade")),
+        "RS強勢股檔數": _num(snap.get("strong_count")),
+        "RS強勢股占比%": _num(snap.get("strong_pct")),
+        "上漲比例%": _num(snap.get("advance_ratio")),
+        "MA20上方比例%": _num(snap.get("above_ma20_ratio")),
+        "52週新高家數": _num(snap.get("new_high")),
+        "52週新低家數": _num(snap.get("new_low")),
+        "新高減新低": (_num(snap.get("new_high"), 0) or 0) - (_num(snap.get("new_low"), 0) or 0),
+        "有效報價覆蓋%": _num(snap.get("coverage")),
+        "MIS真實成交覆蓋%": _num(snap.get("real_trade_coverage")),
+    }
+    if st.session_state.get(anchor_key) == anchor and rows:
+        rows[-1] = row
+    else:
+        rows.append(row)
+        st.session_state[anchor_key] = anchor
+    rows = rows[-600:]
+    st.session_state[data_key] = rows
+    return pd.DataFrame(rows)
+
+
+
+def _render_intraday_trace_chart(bg_state: dict, snap: dict):
+    hist = _intraday_trace_append(bg_state, snap)
+    if hist.empty or len(hist) < 2:
+        return
+
+    rng = st.radio(
+        "線圖範圍",
+        ["最近30分鐘", "最近1小時", "今日全部"],
+        index=1,
+        horizontal=True,
+        key="v360_intraday_trace_range",
+    )
+    latest_ts = hist["時間"].max()
+    if rng == "最近30分鐘":
+        hist = hist[hist["時間"] >= latest_ts - pd.Timedelta(minutes=30)].copy()
+    elif rng == "最近1小時":
+        hist = hist[hist["時間"] >= latest_ts - pd.Timedelta(hours=1)].copy()
+
+    if hist.empty:
+        st.info("目前這個範圍內還沒有足夠的盤中軌跡資料。")
+        return
+
+    metric_cols = [
+        "Wade分數",
+        "RS強勢股占比%",
+        "上漲比例%",
+        "MA20上方比例%",
+    ]
+    selected = st.multiselect(
+        "比較指標（0–100 共同比例尺）",
+        options=metric_cols,
+        default=metric_cols,
+        key="v360_intraday_trace_metrics",
+    )
+    if selected:
+        m = hist[["時間", "時間文字"] + selected].melt(
+            id_vars=["時間", "時間文字"], var_name="指標", value_name="數值"
+        ).dropna(subset=["數值"])
+        if not m.empty:
+            hover = alt.selection_point(fields=["時間"], nearest=True, on="mouseover", empty="none")
+            line = alt.Chart(m).mark_line(point=True).encode(
+                x=alt.X("時間:T", title="時間"),
+                y=alt.Y("數值:Q", title="分數 / 比例", scale=alt.Scale(domain=[0, 100])),
+                color=alt.Color("指標:N", title="即時指標"),
+                tooltip=[
+                    alt.Tooltip("時間文字:N", title="時間"),
+                    alt.Tooltip("指標:N"),
+                    alt.Tooltip("數值:Q", format=".1f"),
+                ],
+            )
+            points = line.transform_filter(hover).mark_circle(size=70)
+            rules = alt.Chart(m).mark_rule(color="#999").encode(x="時間:T").transform_filter(hover)
+            st.altair_chart((line + points + rules).interactive(), use_container_width=True)
+
+    c = hist[[
+        "時間", "時間文字", "RS強勢股檔數", "52週新高家數", "52週新低家數", "新高減新低"
+    ]].melt(id_vars=["時間", "時間文字"], var_name="指標", value_name="數值").dropna(subset=["數值"])
+    if not c.empty:
+        with st.expander("檔數型即時軌跡（RS強勢股、新高／新低）", expanded=False):
+            st.caption("這張圖比較適合看盤中『強勢股母群是否在擴散』，以及新高/新低家數的擴張或收斂。")
+            st.altair_chart(
+                alt.Chart(c).mark_line(point=True).encode(
+                    x=alt.X("時間:T", title="時間"),
+                    y=alt.Y("數值:Q", title="檔數"),
+                    color=alt.Color("指標:N", title="檔數型指標"),
+                    tooltip=[
+                        alt.Tooltip("時間文字:N", title="時間"),
+                        alt.Tooltip("指標:N"),
+                        alt.Tooltip("數值:Q", format=".0f"),
+                    ],
+                ).interactive(),
+                use_container_width=True,
+            )
+
+    if len(hist) >= 2:
+        first = hist.iloc[0]
+        last = hist.iloc[-1]
+        delta_txt = (
+            f"Wade {signed_num((_num(last.get('Wade分數')) or 0) - (_num(first.get('Wade分數')) or 0),1)}｜"
+            f"RS強勢股 {signed_num((_num(last.get('RS強勢股檔數')) or 0) - (_num(first.get('RS強勢股檔數')) or 0),0,' 檔')}｜"
+            f"上漲比例 {signed_num((_num(last.get('上漲比例%')) or 0) - (_num(first.get('上漲比例%')) or 0),1,' pct')}｜"
+            f"MA20上方 {signed_num((_num(last.get('MA20上方比例%')) or 0) - (_num(first.get('MA20上方比例%')) or 0),1,' pct')}"
+        )
+        st.caption(f"區間變化：{delta_txt}")
 
 
 def _intraday_entry_gate(snap: dict) -> dict:
@@ -3339,4 +3476,4 @@ with tabs[7]:
     with open(DEFAULT_RS,"rb") as f: d1.download_button("下載 RS 最新結果",f.read(),file_name="rs_latest.xlsx",mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",use_container_width=True)
     with open(DEFAULT_DUCK,"rb") as f: d2.download_button("下載鴨嘴最新結果",f.read(),file_name="duck_latest.xlsx",mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",use_container_width=True)
 
-st.divider(); st.caption(f"正式版 v3.5.9｜進場 v1.0 × 獲利出場 v1.2 × 失敗風控 v1.0 × 個股決策中心｜RS：{rs_date}｜鴨嘴：{duck_date}｜量化篩選與市場廣度工具，不構成投資建議。")
+st.divider(); st.caption(f"正式版 v3.6.0｜進場 v1.0 × 獲利出場 v1.2 × 失敗風控 v1.0 × 個股決策中心｜RS：{rs_date}｜鴨嘴：{duck_date}｜量化篩選與市場廣度工具，不構成投資建議。")

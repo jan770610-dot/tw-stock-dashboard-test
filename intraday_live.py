@@ -698,6 +698,7 @@ class IntradayBackgroundManager:
         self._fast_last_error: str | None = None
         self._fast_last_returned_count = 0
         self._fast_cycle = 0
+        self._fast_fail_streak = 0
 
         # v3.5.8: process-shared per-stock state machine.  Once a stock has entered
         # any actionable radar state, it remains traceable for the rest of the day
