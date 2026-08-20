@@ -55,6 +55,17 @@ def _norm_code(v) -> str:
     return str(v).replace(".0", "").strip()
 
 
+def _first_book_price(v):
+    """Return the first usable price from MIS five-level book fields."""
+    if v in (None, "", "-", "--"):
+        return None
+    for part in str(v).split("_"):
+        x = _f(part)
+        if x is not None and x > 0:
+            return x
+    return None
+
+
 def _channel(code: str, market: str) -> str:
     m = str(market).strip().upper()
     prefix = "otc" if m in {"TPEX", "OTC", "上櫃"} else "tse"
@@ -105,12 +116,42 @@ def _fetch_mis_quotes_raw(universe_json: str, batch_size: int = 80, workers: int
         if not code:
             continue
         prev = _f(m.get("y"))
-        last = _f(m.get("z"))
-        traded = last is not None
-        if last is None:
+        z_last = _f(m.get("z"))
+        pz_last = _f(m.get("pz"))
+        best_bid = _first_book_price(m.get("b"))
+        best_ask = _first_book_price(m.get("a"))
+
+        # MIS 的 z 在逐筆交易期間可能暫時回傳 '-'。舊版直接退回昨收 y，
+        # 會把活躍個股顯示成「昨收、0.00%」。新邏輯先使用 pz（MIS 回傳的
+        # 最近成交備援），再以五檔中間價作估計；只有完全沒有盤中資訊時才退回昨收。
+        if z_last is not None:
+            last = z_last
+            price_source = "MIS z 最新成交"
+            estimated = False
+        elif pz_last is not None:
+            last = pz_last
+            price_source = "MIS pz 最近成交"
+            estimated = False
+        elif best_bid is not None and best_ask is not None:
+            last = (best_bid + best_ask) / 2.0
+            price_source = "五檔買賣中間估計"
+            estimated = True
+        elif best_bid is not None:
+            last = best_bid
+            price_source = "最佳買價估計"
+            estimated = True
+        elif best_ask is not None:
+            last = best_ask
+            price_source = "最佳賣價估計"
+            estimated = True
+        else:
             last = prev
+            price_source = "前收備援（尚無盤中價）"
+            estimated = True
+
         if last is None:
             continue
+        traded = (z_last is not None) or (pz_last is not None)
         high = _f(m.get("h"), last)
         low = _f(m.get("l"), last)
         open_ = _f(m.get("o"), last)
@@ -123,6 +164,10 @@ def _fetch_mis_quotes_raw(universe_json: str, batch_size: int = 80, workers: int
             "open_live": open_,
             "high_live": high,
             "low_live": low,
+            "best_bid": best_bid,
+            "best_ask": best_ask,
+            "price_source": price_source,
+            "price_estimated": estimated,
             "volume_lots": volume_lots,
             "traded": traded,
             "quote_time": str(m.get("t") or ""),
@@ -443,7 +488,8 @@ def build_snapshot(daily: pd.DataFrame, strong: pd.DataFrame, use_streamlit_cach
         "code", "name", "market", "last", "ret_pct", "rs_live", "ret250",
         "ma20_live", "ma50_live", "ma60_live", "ma200_live", "amount_est",
         "strong_live", "strong_cond_count", "strong_missing", "near_strong",
-        "duck_price_live", "ma20_gap_pct",
+        "duck_price_live", "ma20_gap_pct", "best_bid", "best_ask",
+        "price_source", "price_estimated", "quote_time", "quote_date",
     ]
     live_stocks = x[live_cols].copy()
     live_stocks = live_stocks.rename(columns={
@@ -451,6 +497,9 @@ def build_snapshot(daily: pd.DataFrame, strong: pd.DataFrame, use_streamlit_cach
         "ma20_live": "盤中MA20", "ma50_live": "盤中MA50", "ma60_live": "盤中MA60", "ma200_live": "盤中MA200", "amount_est": "盤中成交金額估算",
         "strong_live": "盤中強勢", "strong_cond_count": "強勢條件通過數", "strong_missing": "強勢尚缺條件", "near_strong": "即將強勢",
         "duck_price_live": "盤中鴨嘴價格結構", "ma20_gap_pct": "月線乖離率%",
+        "best_bid": "最佳買價", "best_ask": "最佳賣價",
+        "price_source": "價格來源", "price_estimated": "價格為估計",
+        "quote_time": "MIS報價時間", "quote_date": "MIS報價日期",
     })
 
     return {
@@ -779,6 +828,12 @@ def refresh_single_stock(snapshot: dict, code: str) -> dict:
         "市場": market,
         "盤中價": last,
         "漲跌幅%": (last / prev_close - 1.0) * 100.0,
+        "最佳買價": _f(qr.get("best_bid")),
+        "最佳賣價": _f(qr.get("best_ask")),
+        "價格來源": str(qr.get("price_source") or "—"),
+        "價格為估計": bool(qr.get("price_estimated", False)),
+        "MIS報價時間": str(qr.get("quote_time") or "—"),
+        "MIS報價日期": str(qr.get("quote_date") or "—"),
         "盤中RS": rs_live,
         "250日報酬試算": ret250,
         "盤中MA20": ma20,

@@ -1667,12 +1667,12 @@ def _render_trial_summary(bg_state: dict):
 def _manual_stock_lookup(manager):
     st.write("### 🔎 個股最新狀況（手動查詢）")
     st.caption(
-        "搜尋時直接讀『最近完成的背景快照』，不會再重抓 2,000 檔，所以幾乎立即顯示。"
-        "若你要更接近當下的價格，可再按『⚡ 只更新這一檔』，只向 MIS 抓單一股票。"
+        "查詢會先用背景快照定位股票，再自動只向 MIS 更新這一檔；不會重抓 2,000 檔。"
+        "因此個股價格會優先顯示單檔最新成交；若 MIS 當下沒有成交欄位，會明確標示備援來源與最佳買賣價。"
     )
     with st.form("v32_manual_lookup_form", clear_on_submit=False):
         q = st.text_input("輸入股票代號或名稱", key="v32_manual_lookup_input", placeholder="例如 2330、台積電")
-        submitted = st.form_submit_button("🔎 查詢最近背景資料", type="primary", use_container_width=True)
+        submitted = st.form_submit_button("🔎 查詢＋更新這一檔", type="primary", use_container_width=True)
     if submitted and q.strip():
         st.session_state["v32_manual_last_query"] = q.strip()
         st.session_state.pop("v32_single_override", None)
@@ -1701,6 +1701,16 @@ def _manual_stock_lookup(manager):
         hit = hit.sort_values(sort_cols, ascending=[False] * len(sort_cols), na_position="last")
     r = hit.iloc[0].copy()
 
+    # v3.5.1：手動查詢本身就只刷新命中的單一股票，避免把背景快照價誤認為即時價。
+    if submitted and q.strip():
+        try:
+            from intraday_live import refresh_single_stock
+            with st.spinner(f"更新 {r.get('代號')} 最新行情…"):
+                fresh = refresh_single_stock(snap, str(r.get("代號")))
+            st.session_state["v32_single_override"] = fresh
+        except Exception as e:
+            st.warning(f"單檔即時更新失敗，暫時顯示背景快照：{e}")
+
     override = st.session_state.get("v32_single_override")
     if override and str(override.get("代號")) == str(r.get("代號")):
         for k, v in override.items():
@@ -1711,10 +1721,18 @@ def _manual_stock_lookup(manager):
         source_time = bg_state.get("last_completed") or snap.get("snapshot_time", "—")
         source_label = "背景快照"
 
-    st.caption(f"查詢：{qq}｜資料來源：{source_label}｜時間：{source_time}｜背景全市場版本：#{bg_state.get('version',0)}")
+    mis_time = _clean_cell(r.get("MIS報價時間")) or "—"
+    price_source = _clean_cell(r.get("價格來源")) or source_label
+    bid_s = _fmt_trial(r.get("最佳買價"), 2)
+    ask_s = _fmt_trial(r.get("最佳賣價"), 2)
+    estimated = _boolish(r.get("價格為估計"))
+    st.caption(
+        f"查詢：{qq}｜資料來源：{source_label}｜程式時間：{source_time}｜MIS報價：{mis_time}｜"
+        f"價格來源：{price_source}｜最佳買/賣：{bid_s} / {ask_s}｜背景全市場版本：#{bg_state.get('version',0)}"
+    )
     c1, c2, c3, c4, c5 = st.columns(5)
     c1.metric("股票", f"{r.get('代號','—')} {r.get('名稱','')}")
-    c2.metric("最新盤中價", _fmt_trial(r.get("盤中價"), 2), _fmt_trial(r.get("漲跌幅%"), 2, "%"))
+    c2.metric("盤中參考價" if estimated else "最新成交價", _fmt_trial(r.get("盤中價"), 2), _fmt_trial(r.get("漲跌幅%"), 2, "%"))
     c3.metric("盤中 RS", _fmt_trial(r.get("盤中RS"), 1), "強勢" if bool(r.get("盤中強勢", False)) else "未達強勢")
     c4.metric("強勢條件", f"{int(_num(r.get('強勢條件通過數'),0) or 0)}/6", str(r.get("強勢尚缺條件") or "—"))
     c5.metric("鴨嘴價格結構", "✅ 符合" if bool(r.get("盤中鴨嘴價格結構", False)) else "—", f"MA20乖離 {_fmt_trial(r.get('月線乖離率%'),1,'%')}")
@@ -1736,13 +1754,13 @@ def _manual_stock_lookup(manager):
         except Exception as e:
             st.error(f"單檔即時更新失敗：{e}")
 
-    show = [c for c in ["代號", "名稱", "市場", "盤中價", "漲跌幅%", "盤中RS", "盤中MA20", "盤中MA50", "盤中MA60", "盤中MA200", "月線乖離率%", "盤中強勢", "即將強勢", "強勢條件通過數", "強勢尚缺條件", "盤中鴨嘴價格結構"] if c in hit.columns]
+    show = [c for c in ["代號", "名稱", "市場", "盤中價", "漲跌幅%", "最佳買價", "最佳賣價", "價格來源", "MIS報價時間", "盤中RS", "盤中MA20", "盤中MA50", "盤中MA60", "盤中MA200", "月線乖離率%", "盤中強勢", "即將強勢", "強勢條件通過數", "強勢尚缺條件", "盤中鴨嘴價格結構"] if c in hit.columns]
     st.dataframe(hit[show].head(20), hide_index=True, use_container_width=True, height=min(500, 70 + 35 * min(len(hit), 12)))
 
 
 st.title("📈 台股分析中心")
 st.markdown(
-    '<div class="hero-sub">RS 市場廣度 × 鴨嘴型態 × 培育中心｜正式網頁版 v3.5｜進場回測 × 獲利管理 × -8%失敗風控 × 個股決策中心</div>',
+    '<div class="hero-sub">RS 市場廣度 × 鴨嘴型態 × 培育中心｜正式網頁版 v3.5.1｜進場回測 × 獲利管理 × -8%失敗風控 × 個股決策中心</div>',
     unsafe_allow_html=True
 )
 
