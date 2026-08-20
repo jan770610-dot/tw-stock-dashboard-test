@@ -556,7 +556,13 @@ def _codes_from_live(snapshot: dict, col: str, watch_codes: set[str] | None = No
 
 
 class IntradayBackgroundManager:
-    """Process-shared scanner: full market ~90s + actionable watchlist ~10s."""
+    """Process-shared scanner: full-market pulse + reactive intraday watch universe.
+
+    v3.5.5 keeps every stock currently used by a盤中/即時 panel in the fast
+    watch universe.  The full market is rescanned on a slower cadence to keep
+    breadth/RS/Wade and discovery honest; active/event/manual stocks are then
+    refreshed much more frequently in MIS batches.
+    """
 
     def __init__(self):
         self._lock = threading.RLock()
@@ -569,7 +575,7 @@ class IntradayBackgroundManager:
         self._duck_watch: set[str] = set()
         self._formal_date = "—"
         self._config_sig = None
-        self._interval = 90.0
+        self._interval = 30.0
         self._enabled = False
         self._force_once = False
         self._snapshot: dict | None = None
@@ -582,9 +588,10 @@ class IntradayBackgroundManager:
         self._last_completed: dt.datetime | None = None
         self._last_error: str | None = None
 
-        # v3.5.4: once a stock becomes actionable, follow it separately in small MIS batches.
+        # v3.5.5: every stock shown by a盤中/即時 decision/event/manual view is
+        # eligible for the reactive watch universe, not only the first 120 names.
         self._fast_watch_codes: list[str] = []
-        self._fast_interval = 10.0
+        self._fast_interval = 5.0
         self._fast_enabled = False
         self._fast_rows: pd.DataFrame | None = None
         self._fast_version = 0
@@ -604,7 +611,7 @@ class IntradayBackgroundManager:
         official_duck_codes: set[str] | None = None,
         duck_watch_codes: set[str] | None = None,
         formal_date: str = "—",
-        interval_seconds: int = 90,
+        interval_seconds: int = 30,
         enabled: bool = True,
         ensure_once: bool = False,
     ) -> None:
@@ -652,7 +659,7 @@ class IntradayBackgroundManager:
         if should_wake:
             self._wake.set()
 
-    def set_fast_watch_codes(self, codes, interval_seconds: int = 10, enabled: bool = True, max_codes: int = 120) -> None:
+    def set_fast_watch_codes(self, codes, interval_seconds: int = 5, enabled: bool = True, max_codes: int = 2500) -> None:
         ordered = []
         seen = set()
         for code in list(codes or []):
@@ -815,7 +822,7 @@ class IntradayBackgroundManager:
                     fast_snapshot_local = snap_for_fast
                     fast_codes_local = list(fast_codes)
                 try:
-                    rows = refresh_watchlist(fast_snapshot_local, fast_codes_local, max_codes=120)
+                    rows = refresh_watchlist(fast_snapshot_local, fast_codes_local, max_codes=2500)
                 except Exception as e:
                     with self._lock:
                         self._fast_last_error = f"{type(e).__name__}: {e}"
@@ -838,13 +845,14 @@ class IntradayBackgroundManager:
             self._wake.wait(wait_s)
 
 
-def refresh_watchlist(snapshot: dict, codes, max_codes: int = 120) -> pd.DataFrame:
+def refresh_watchlist(snapshot: dict, codes, max_codes: int = 2500) -> pd.DataFrame:
     """Batch-refresh a small actionable watchlist without rescanning the whole market.
 
     The full-market snapshot remains the ranking anchor. Updated watched stocks are
     reranked together against the unchanged 250-day returns of the rest of the market.
-    One MIS batch request can therefore refresh dozens of candidates every ~10 seconds
-    without making 2,000 quote requests or one request per stock.
+    The caller can pass the complete intraday-active universe; requests are still batched
+    (80 symbols per MIS request) rather than one request per stock.  The app dynamically
+    slows the fast interval when the active universe becomes very large.
     """
     if not snapshot or snapshot.get("stocks") is None:
         raise RuntimeError("尚未有背景市場快照")
@@ -1081,13 +1089,13 @@ def _render_once(daily: pd.DataFrame, strong: pd.DataFrame, all_ok: pd.DataFrame
 
 def render_intraday_panel(daily: pd.DataFrame, strong: pd.DataFrame, all_ok: pd.DataFrame, pre: pd.DataFrame, rs_latest: pd.Series):
     st.subheader("📡 盤中即時市場雷達")
-    st.caption("v3.2：全市場行情與計算在背景執行；頁面只讀最後完成快照，不會在自動刷新時等待網路。")
+    st.caption("v3.5.5：全市場約30秒更新廣度/RS/Wade；盤中活躍個股另以動態5–20秒批次追蹤。")
     if not BASELINE.exists():
         st.warning("尚未找到 intraday_baseline.pkl.gz。部署這個版本後，請手動跑一次『每日台股自動更新』。")
         return
 
     auto = st.toggle("背景自動掃描", value=True, key="intraday_auto_refresh")
-    seconds = st.select_slider("背景掃描頻率", options=[60, 90, 120], value=90, format_func=lambda x: f"{x} 秒")
+    seconds = st.select_slider("背景掃描頻率", options=[30, 45, 60, 90], value=30, format_func=lambda x: f"{x} 秒")
     manager = get_background_manager()
     official_strong = _code_set(strong)
     official_duck = _code_set(all_ok)
