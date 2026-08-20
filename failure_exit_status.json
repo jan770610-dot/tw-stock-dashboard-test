@@ -1,0 +1,130 @@
+{
+  "status": "success",
+  "generated_at_taipei": "2026-08-20 08:25:17",
+  "research_start": "2023-01-03",
+  "research_end_requested": "2026-08-19",
+  "research_end_effective": "2026-08-14",
+  "warmup_start": "2021-10-30",
+  "max_hold_sessions": 60,
+  "cooldown_sessions": 10,
+  "commission_rate_per_side": 0.001425,
+  "sell_tax_rate": 0.003,
+  "cache": {
+    "requested_weekdays": 1253,
+    "known_nontrading_before": 0,
+    "missing_before": 91,
+    "fetched_ok": 0,
+    "new_nontrading": 0,
+    "failed": []
+  },
+  "data": {
+    "cache_files": 1162,
+    "rows": 2115308,
+    "stocks": 2029,
+    "first_date": "2021-11-01",
+    "last_date": "2026-08-14",
+    "read_errors": []
+  },
+  "simulation": {
+    "entry_contexts": 3,
+    "profit_modes": 2,
+    "stop_rules": 18,
+    "context_combinations": 108,
+    "entry_events_after_cooldown": 19235,
+    "skipped_recent_no_full_horizon": 1607,
+    "trade_rows": 634608
+  },
+  "summary_rows": 108,
+  "rollup_rows": 18,
+  "annual_rows": 432,
+  "method": "T close signal -> T+1 open execution; failure-rule deltas versus same-context no-stop baseline",
+  "current_leaders": [
+    {
+      "排名": 1,
+      "失敗規則": "收盤跌幅達-8%",
+      "平均情境綜合分數": 59.21,
+      "平均情境排名": 1.67,
+      "中位報酬改善pp": -3.289,
+      "10分位改善pp": 4.596,
+      "最大回撤改善pp": 0.639,
+      "停損後達原進場+5率%": 15.18
+    },
+    {
+      "排名": 2,
+      "失敗規則": "第15日仍未曾+5%",
+      "平均情境綜合分數": 57.97,
+      "平均情境排名": 2.5,
+      "中位報酬改善pp": -3.604,
+      "10分位改善pp": 4.614,
+      "最大回撤改善pp": 2.922,
+      "停損後達原進場+5率%": 31.17
+    },
+    {
+      "排名": 3,
+      "失敗規則": "收盤跌幅達-7%",
+      "平均情境綜合分數": 57.08,
+      "平均情境排名": 3.67,
+      "中位報酬改善pp": -4.259,
+      "10分位改善pp": 5.373,
+      "最大回撤改善pp": 1.079,
+      "停損後達原進場+5率%": 17.05
+    },
+    {
+      "排名": 4,
+      "失敗規則": "寬限10日→MA20或右側確認",
+      "平均情境綜合分數": 54.5,
+      "平均情境排名": 5.17,
+      "中位報酬改善pp": -4.039,
+      "10分位改善pp": 7.316,
+      "最大回撤改善pp": 4.104,
+      "停損後達原進場+5率%": 40.34
+    },
+    {
+      "排名": 5,
+      "失敗規則": "寬限10日→右側回落15分",
+      "平均情境綜合分數": 54.42,
+      "平均情境排名": 5.67,
+      "中位報酬改善pp": -4.039,
+      "10分位改善pp": 7.311,
+      "最大回撤改善pp": 4.085,
+      "停損後達原進場+5率%": 40.39
+    },
+    {
+      "排名": 6,
+      "失敗規則": "第10日仍未曾+3%",
+      "平均情境綜合分數": 52.67,
+      "平均情境排名": 7.0,
+      "中位報酬改善pp": -3.982,
+      "10分位改善pp": 4.266,
+      "最大回撤改善pp": 3.329,
+      "停損後達原進場+5率%": 31.8
+    },
+    {
+      "排名": 7,
+      "失敗規則": "右側自高點回落15分",
+      "平均情境綜合分數": 50.36,
+      "平均情境排名": 8.67,
+      "中位報酬改善pp": -4.418,
+      "10分位改善pp": 9.619,
+      "最大回撤改善pp": 5.81,
+      "停損後達原進場+5率%": 44.73
+    },
+    {
+      "排名": 8,
+      "失敗規則": "緊急-8%＋第10日後MA20/右側",
+      "平均情境綜合分數": 49.81,
+      "平均情境排名": 9.67,
+      "中位報酬改善pp": -4.039,
+      "10分位改善pp": 6.527,
+      "最大回撤改善pp": 4.122,
+      "停損後達原進場+5率%": 40.1
+    }
+  ],
+  "outputs": [
+    "failure_exit_latest.xlsx",
+    "failure_exit_summary.csv",
+    "failure_exit_rule_rollup.csv",
+    "failure_exit_annual.csv",
+    "failure_exit_status.json"
+  ]
+}
