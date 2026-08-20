@@ -19,7 +19,7 @@ DEFAULT_DUCK = APP_DIR / "duck_latest.xlsx"
 STATUS_FILE = APP_DIR / "update_status.json"
 INTRADAY_BASELINE_FILE = APP_DIR / "intraday_baseline.pkl.gz"
 ACTIONS_URL = "https://github.com/jan770610-dot/tw-stock-dashboard-test/actions/workflows/daily-update.yml"
-LIVE_SCHEMA_VERSION = "v356-live-auditfix-1"
+LIVE_SCHEMA_VERSION = "v357-live-history-1"
 INTRADAY_ENGINE_GENERATION = "3.5.6-auditfix-1"
 
 st.set_page_config(page_title="台股分析中心", page_icon="📈", layout="wide", initial_sidebar_state="expanded")
@@ -28,7 +28,7 @@ st.set_page_config(page_title="台股分析中心", page_icon="📈", layout="wi
 # 瀏覽器 session 可能在程式更新後仍保留舊 radar/override，造成看起來「價格不動」。
 if st.session_state.get("_intraday_live_schema") != LIVE_SCHEMA_VERSION:
     for _k in list(st.session_state.keys()):
-        if str(_k).startswith(("v356_", "v355_", "v356_")) or _k == "v32_single_override":
+        if str(_k).startswith(("v357_", "v356_", "v355_", "v354_")) or _k == "v32_single_override":
             st.session_state.pop(_k, None)
     st.session_state["_intraday_live_schema"] = LIVE_SCHEMA_VERSION
 
@@ -1748,33 +1748,214 @@ def _signal_bucket(row) -> str:
     return ""
 
 
+def _signal_data_issue(row) -> str:
+    """Return a data-quality reason that makes a row unsuitable as a live actionable signal."""
+    if _boolish(row.get("價格為估計")):
+        return "MIS 暫無 z 真實成交價（目前僅參考價）"
+    state=_clean_cell(row.get("資料狀態"))
+    if state.startswith("⚠️"):
+        return state
+    return ""
+
+
+def _signal_leave_reason(old_bucket: str, row) -> str:
+    """Explain why a previously active bucket is no longer active."""
+    issue=_signal_data_issue(row)
+    if issue:
+        return issue
+
+    new_bucket=_signal_bucket(row)
+    if new_bucket and new_bucket!=old_bucket:
+        return f"分類轉換：{old_bucket} → {new_bucket}"
+
+    right=_num(row.get("右側分數"))
+    rs=_num(row.get("盤中RS"))
+    heat=_num(row.get("過熱程度"))
+    complete=_num(row.get("鴨嘴完成度%"))
+    gate=_clean_cell(row.get("市場閘門"))
+    live_duck=_boolish(row.get("盤中正式鴨嘴"))
+    operation=_clean_cell(row.get("盤中操作"))
+    reasons=[]
+
+    if old_bucket.startswith("📈"):
+        if right is not None and right < 65:
+            reasons.append(f"右側 {right:.1f}<65")
+        if "未確認" in gate:
+            reasons.append("市場廣度閘門未確認")
+        if heat is not None and heat >= 70:
+            reasons.append(f"過熱 {heat:.1f}，不再屬進場區")
+    elif old_bucket.startswith("🌱"):
+        if complete is not None and complete < 80:
+            reasons.append(f"鴨嘴完成度 {complete:.0f}%<80%")
+        if rs is not None and rs < 70:
+            reasons.append(f"RS {rs:.1f}<70")
+        if "未確認" in gate:
+            reasons.append("市場廣度閘門未確認")
+        if heat is not None and heat >= 70:
+            reasons.append(f"過熱 {heat:.1f}，不再屬試單區")
+    elif old_bucket.startswith("🚀"):
+        if not live_duck:
+            reasons.append("正式鴨嘴結構暫時不成立")
+        if right is not None and right < 65:
+            reasons.append(f"右側 {right:.1f}<65")
+    elif old_bucket.startswith("🟡"):
+        if heat is not None and heat < 70:
+            reasons.append(f"過熱降至 {heat:.1f}<70")
+    elif old_bucket.startswith("🟠"):
+        threshold=90 if rs is not None and rs >= 85 else 80
+        if heat is not None and heat < threshold:
+            reasons.append(f"過熱降至 {heat:.1f}<{threshold}")
+    elif old_bucket.startswith("🔴"):
+        reasons.append("贏家退潮條件目前解除")
+
+    if reasons:
+        return "；".join(reasons[:3])
+    if operation and operation not in {"—",""}:
+        return f"目前改判：{operation}"
+    return "目前不再符合原分類"
+
+
+def _start_signal_episode(history: list[dict], now, row, bucket: str, price):
+    code=str(row.get("代號"))
+    name=_clean_cell(row.get("名稱"))
+    rec={
+        "日期":now.strftime("%Y-%m-%d"),
+        "代號":code,
+        "名稱":name,
+        "觸發分類":bucket,
+        "進入時間":now.strftime("%H:%M:%S"),
+        "觸發價":price,
+        "離開時間":"",
+        "離開價":None,
+        "離開原因":"",
+        "目前分類":bucket,
+        "目前狀態":"✅ 目前有效",
+        "最新價":price,
+        "觸發後漲跌%":0.0,
+    }
+    history.append(rec)
+    return len(history)-1
+
+
+def _close_signal_episode(history: list[dict], idx, now, row, reason: str, current_bucket: str=""):
+    if idx is None or not (0 <= int(idx) < len(history)):
+        return
+    rec=history[int(idx)]
+    price=_num(row.get("盤中價")) if row is not None else None
+    rec["離開時間"]=now.strftime("%H:%M:%S")
+    rec["離開價"]=price
+    rec["離開原因"]=reason
+    rec["目前分類"]=current_bucket or "⏳ 等待"
+    rec["目前狀態"]="➡️ 已轉分類" if current_bucket else "⏹️ 已離開原分類"
+    rec["最新價"]=price
+    p0=_num(rec.get("觸發價"))
+    rec["觸發後漲跌%"]=(price/p0-1)*100 if p0 not in (None,0) and price is not None else None
+
+
 def _decorate_signal_tracking(radar: pd.DataFrame) -> pd.DataFrame:
-    """Keep trigger price/time and show whether a fast-tracked signal is still valid now."""
+    """Track current-valid signals and retain today's triggered/left history with reasons."""
     if radar is None or radar.empty:
         return radar
+
     now=dt.datetime.now(TAIPEI_TZ)
-    tracker=st.session_state.setdefault("v356_signal_tracker",{})
-    log=st.session_state.setdefault("v356_signal_change_log",[])
+    day=now.strftime("%Y-%m-%d")
+    if st.session_state.get("v357_signal_day") != day:
+        st.session_state["v357_signal_day"]=day
+        st.session_state["v357_signal_tracker"]={}
+        st.session_state["v357_signal_change_log"]=[]
+        st.session_state["v357_signal_history"]=[]
+
+    tracker=st.session_state.setdefault("v357_signal_tracker",{})
+    log=st.session_state.setdefault("v357_signal_change_log",[])
+    history=st.session_state.setdefault("v357_signal_history",[])
+
     out=radar.copy()
     out["追蹤分類"]=out.apply(_signal_bucket,axis=1)
-    active=out[(out["追蹤分類"]!="") & (~out["價格為估計"].fillna(True).astype(bool))].copy()
-    active_codes=set(active["代號"].astype(str))
+    row_map={str(r.get("代號")):r for _,r in out.iterrows()}
 
-    for _,r in active.iterrows():
-        code=str(r.get("代號")); bucket=str(r.get("追蹤分類")); price=_num(r.get("盤中價"))
-        old=tracker.get(code)
-        if old is None or old.get("分類")!=bucket:
-            if old is not None:
-                log.append({"時間":now.strftime("%H:%M:%S"),"代號":code,"名稱":r.get("名稱",""),"變化":f"{old.get('分類')} → {bucket}","價格":price})
-            else:
-                log.append({"時間":now.strftime("%H:%M:%S"),"代號":code,"名稱":r.get("名稱",""),"變化":f"進入 {bucket}","價格":price})
-            tracker[code]={"分類":bucket,"觸發價":price,"觸發時間":now.isoformat()}
+    actionable={}
+    for code,r in row_map.items():
+        bucket=str(r.get("追蹤分類") or "")
+        if bucket and not _signal_data_issue(r):
+            actionable[code]=(bucket,r)
 
     for code in list(tracker):
-        if code not in active_codes:
-            old=tracker.pop(code)
-            log.append({"時間":now.strftime("%H:%M:%S"),"代號":code,"名稱":"","變化":f"離開 {old.get('分類')}","價格":None})
-    del log[:-120]
+        old=tracker.get(code) or {}
+        old_bucket=str(old.get("分類") or "")
+        old_idx=old.get("history_index")
+        cur=actionable.get(code)
+        row=row_map.get(code)
+
+        if cur is None:
+            reason=_signal_leave_reason(old_bucket,row) if row is not None else "目前行情列暫時不存在"
+            _close_signal_episode(history,old_idx,now,row,reason,"")
+            log.append({
+                "時間":now.strftime("%H:%M:%S"),"代號":code,
+                "名稱":_clean_cell(row.get("名稱")) if row is not None else (history[int(old_idx)].get("名稱","") if old_idx is not None and int(old_idx)<len(history) else ""),
+                "變化":f"離開 {old_bucket}","原因":reason,
+                "價格":_num(row.get("盤中價")) if row is not None else None,
+            })
+            tracker.pop(code,None)
+            continue
+
+        new_bucket,row=cur
+        if new_bucket != old_bucket:
+            reason=f"分類轉換：{old_bucket} → {new_bucket}"
+            _close_signal_episode(history,old_idx,now,row,reason,new_bucket)
+            log.append({
+                "時間":now.strftime("%H:%M:%S"),"代號":code,"名稱":row.get("名稱",""),
+                "變化":f"{old_bucket} → {new_bucket}","原因":reason,"價格":_num(row.get("盤中價")),
+            })
+            tracker.pop(code,None)
+            price=_num(row.get("盤中價"))
+            new_idx=_start_signal_episode(history,now,row,new_bucket,price)
+            tracker[code]={
+                "分類":new_bucket,"觸發價":price,"觸發時間":now.isoformat(),
+                "history_index":new_idx,"名稱":_clean_cell(row.get("名稱")),
+            }
+
+    for code,(bucket,r) in actionable.items():
+        price=_num(r.get("盤中價"))
+        old=tracker.get(code)
+        if old is None:
+            idx=_start_signal_episode(history,now,r,bucket,price)
+            tracker[code]={
+                "分類":bucket,"觸發價":price,"觸發時間":now.isoformat(),
+                "history_index":idx,"名稱":_clean_cell(r.get("名稱")),
+            }
+            log.append({
+                "時間":now.strftime("%H:%M:%S"),"代號":code,"名稱":r.get("名稱",""),
+                "變化":f"進入 {bucket}","原因":"即時條件成立","價格":price,
+            })
+        else:
+            idx=old.get("history_index")
+            if idx is not None and 0 <= int(idx) < len(history):
+                rec=history[int(idx)]
+                rec["最新價"]=price
+                rec["目前分類"]=bucket
+                rec["目前狀態"]="✅ 目前有效"
+                p0=_num(rec.get("觸發價"))
+                rec["觸發後漲跌%"]=(price/p0-1)*100 if p0 not in (None,0) and price is not None else None
+
+    for rec in history:
+        code=str(rec.get("代號"))
+        r=row_map.get(code)
+        if r is None:
+            continue
+        price=_num(r.get("盤中價"))
+        rec["最新價"]=price
+        p0=_num(rec.get("觸發價"))
+        rec["觸發後漲跌%"]=(price/p0-1)*100 if p0 not in (None,0) and price is not None else None
+        if rec.get("離開時間"):
+            issue=_signal_data_issue(r)
+            current=_signal_bucket(r)
+            if issue:
+                rec["目前分類"]="⚠️ 行情待刷新"
+            else:
+                rec["目前分類"]=current or "⏳ 等待"
+
+    del log[:-300]
+    del history[:-1200]
 
     trigger_price=[]; trigger_time=[]; change_pct=[]; duration=[]
     for _,r in out.iterrows():
@@ -1796,10 +1977,34 @@ def _decorate_signal_tracking(radar: pd.DataFrame) -> pd.DataFrame:
         duration.append(f"{sec//60}分{sec%60:02d}秒" if sec>=60 else f"{sec}秒")
     out["觸發價"]=trigger_price
     out["觸發時間"]=trigger_time
-    out["觸發後漲跌%"] = change_pct
+    out["觸發後漲跌%"]=change_pct
     out["訊號持續"]=duration
     return out
 
+
+def _today_signal_history_frames() -> tuple[pd.DataFrame,pd.DataFrame]:
+    hist=st.session_state.get("v357_signal_history",[])
+    if not hist:
+        return pd.DataFrame(),pd.DataFrame()
+    h=pd.DataFrame(hist).copy()
+    if h.empty:
+        return pd.DataFrame(),h
+    h["仍在原分類"]=h["離開時間"].fillna("").astype(str).eq("")
+    summary=[]
+    for bucket,g in h.groupby("觸發分類",dropna=False):
+        summary.append({
+            "分類":bucket,
+            "今日曾觸發檔數":int(g["代號"].astype(str).nunique()),
+            "訊號段數":int(len(g)),
+            "目前仍在原分類":int(g.loc[g["仍在原分類"],"代號"].astype(str).nunique()),
+            "已離開／轉分類":int((~g["仍在原分類"]).sum()),
+        })
+    s=pd.DataFrame(summary)
+    if not s.empty:
+        order={"🌱 回測試單":1,"📈 主要進場":2,"🚀 趨勢確認持有":3,"🟡 獲利保護":4,"🟠 積極鎖利":5,"🔴 贏家退潮":6}
+        s["_o"]=s["分類"].map(order).fillna(99)
+        s=s.sort_values(["_o","分類"]).drop(columns="_o")
+    return s,h
 
 def _manual_query_watch_codes(snap: dict) -> set[str]:
     """If the user is looking at a manual intraday stock, keep it in the reactive feed too."""
@@ -1834,6 +2039,10 @@ def _all_reactive_watch_codes(radar: pd.DataFrame, bg_state: dict, snap: dict) -
     for key in ["new_strong","out_strong","new_duck","near"]:
         codes |= {_norm_stock_code(c) for c in (events.get(key) or set()) if _norm_stock_code(c)}
     codes |= _manual_query_watch_codes(snap)
+    for rec in (st.session_state.get("v357_signal_history",[]) or []):
+        c=_norm_stock_code(rec.get("代號"))
+        if c:
+            codes.add(c)
     return sorted(codes)
 
 
@@ -1878,7 +2087,7 @@ def _render_change_radar(snap: dict, bg_state: dict, manager=None):
         "這一層與下方『盤中單檔查詢』使用同一套規則："
         "預備80＋RS70＋市場改善＝試單；右側≥65＋市場改善＝主要進場；"
         "一般/可交易股過熱70～80、RS85領頭股90＝獲利管理。"
-        "全市場約30秒刷新廣度與候選發現；六大交易分類、事件雷達與手動查詢股票全部進入動態5–20秒批次追蹤。主清單只採 MIS z 真實成交價。"
+        "全市場約30秒刷新廣度與候選發現；六大交易分類、事件雷達、手動查詢，以及今日曾觸發後已離開的股票全部進入動態5–20秒批次追蹤。主清單只採 MIS z 真實成交價。真正離開條件的股票不會留在『目前有效』清單，但會保留在『今日曾觸發』紀錄並標示離開原因。"
     )
 
     try:
@@ -1961,42 +2170,65 @@ def _render_change_radar(snap: dict, bg_state: dict, manager=None):
             if trial.empty:
                 st.caption("目前沒有以真實成交價觸發的試單候選。")
             else:
-                st.dataframe(_trade_radar_view(trial,80,"entry"),hide_index=True,use_container_width=True,height=420)
+                st.dataframe(_trade_radar_view(trial,max(80,len(trial)),"entry"),hide_index=True,use_container_width=True,height=420)
 
         with st.expander(f"📈 主要進場候選：{len(major)} 檔｜右側≥65＋市場改善", expanded=False):
             if major.empty:
                 st.caption("目前沒有以真實成交價觸發的主要進場候選。")
             else:
-                st.dataframe(_trade_radar_view(major,100,"entry"),hide_index=True,use_container_width=True,height=460)
+                st.dataframe(_trade_radar_view(major,max(100,len(major)),"entry"),hide_index=True,use_container_width=True,height=460)
 
         with st.expander(f"🚀 趨勢確認持有：{len(hold)} 檔", expanded=False):
             if hold.empty:
                 st.caption("目前沒有盤中右側確認持有名單。")
             else:
-                st.dataframe(_trade_radar_view(hold,100,"entry"),hide_index=True,use_container_width=True,height=440)
+                st.dataframe(_trade_radar_view(hold,max(100,len(hold)),"entry"),hide_index=True,use_container_width=True,height=440)
 
         with st.expander(f"🟡 獲利保護：{len(protect)} 檔｜停止追價／準備鎖利", expanded=False):
             if protect.empty:
                 st.caption("目前沒有進入第一層獲利保護區的股票。")
             else:
-                st.dataframe(_trade_radar_view(protect,100,"exit"),hide_index=True,use_container_width=True,height=440)
+                st.dataframe(_trade_radar_view(protect,max(100,len(protect)),"exit"),hide_index=True,use_container_width=True,height=440)
 
         with st.expander(f"🟠 積極鎖利：{len(lock)} 檔｜一般股80／RS85領頭股90附近", expanded=False):
             if lock.empty:
                 st.caption("目前沒有進入積極鎖利區的股票。")
             else:
-                st.dataframe(_trade_radar_view(lock,100,"exit"),hide_index=True,use_container_width=True,height=440)
+                st.dataframe(_trade_radar_view(lock,max(100,len(lock)),"exit"),hide_index=True,use_container_width=True,height=440)
 
         with st.expander(f"🔴 贏家退潮：{len(retreat)} 檔｜曾過熱後結構退潮", expanded=False):
             if retreat.empty:
                 st.caption("目前沒有觸發贏家退潮管理的股票。")
             else:
-                st.dataframe(_trade_radar_view(retreat,100,"exit"),hide_index=True,use_container_width=True,height=440)
+                st.dataframe(_trade_radar_view(retreat,max(100,len(retreat)),"exit"),hide_index=True,use_container_width=True,height=440)
 
-        fast_log=st.session_state.get("v356_signal_change_log",[])
+        hist_summary,hist_df=_today_signal_history_frames()
+        if not hist_df.empty:
+            closed=hist_df[hist_df["離開時間"].fillna("").astype(str)!=""].copy()
+            closed_unique=int(closed["代號"].astype(str).nunique()) if not closed.empty else 0
+            with st.expander(
+                f"🕘 今日曾觸發／已離開原分類：{closed_unique} 檔｜今日共 {len(hist_df)} 段訊號",
+                expanded=False
+            ):
+                st.caption(
+                    "『目前有效』六區只放此刻仍符合條件的股票；這裡保留今天曾經觸發過的完整軌跡。"
+                    "離開原因會區分條件失效、分類轉換、MIS 無真實成交價或行情逾時；離開原分類本身不等於正式賣出指令。"
+                )
+                if not hist_summary.empty:
+                    st.dataframe(hist_summary,hide_index=True,use_container_width=True,height=min(280,80+35*len(hist_summary)))
+                show_hist=[c for c in [
+                    "代號","名稱","觸發分類","進入時間","觸發價","離開時間","離開價",
+                    "離開原因","目前分類","目前狀態","最新價","觸發後漲跌%"
+                ] if c in hist_df.columns]
+                hz=hist_df.copy()
+                hz["_sort"]=pd.to_datetime(hz["進入時間"],format="%H:%M:%S",errors="coerce")
+                hz=hz.sort_values("_sort",ascending=False).drop(columns="_sort")
+                st.dataframe(hz[show_hist],hide_index=True,use_container_width=True,height=460)
+
+        fast_log=st.session_state.get("v357_signal_change_log",[])
         if fast_log:
-            with st.expander(f"⚡ 盤中動態訊號變化（最近 {min(len(fast_log),120)} 筆）",expanded=False):
-                st.dataframe(pd.DataFrame(fast_log[::-1]),hide_index=True,use_container_width=True,height=320)
+            with st.expander(f"⚡ 盤中動態訊號變化（最近 {min(len(fast_log),300)} 筆）",expanded=False):
+                st.dataframe(pd.DataFrame(fast_log[::-1]),hide_index=True,use_container_width=True,height=340)
 
         st.caption(
             "注意：全市場雷達不知道你的個別持股成本，因此不會把『收盤≤成本-8%』列成全市場硬停損。"
@@ -2976,4 +3208,4 @@ with tabs[7]:
     with open(DEFAULT_RS,"rb") as f: d1.download_button("下載 RS 最新結果",f.read(),file_name="rs_latest.xlsx",mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",use_container_width=True)
     with open(DEFAULT_DUCK,"rb") as f: d2.download_button("下載鴨嘴最新結果",f.read(),file_name="duck_latest.xlsx",mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",use_container_width=True)
 
-st.divider(); st.caption(f"正式版 v3.5.6｜進場 v1.0 × 獲利出場 v1.2 × 失敗風控 v1.0 × 個股決策中心｜RS：{rs_date}｜鴨嘴：{duck_date}｜量化篩選與市場廣度工具，不構成投資建議。")
+st.divider(); st.caption(f"正式版 v3.5.7｜進場 v1.0 × 獲利出場 v1.2 × 失敗風控 v1.0 × 個股決策中心｜RS：{rs_date}｜鴨嘴：{duck_date}｜量化篩選與市場廣度工具，不構成投資建議。")
