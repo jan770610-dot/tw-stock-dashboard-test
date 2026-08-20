@@ -19,8 +19,8 @@ DEFAULT_DUCK = APP_DIR / "duck_latest.xlsx"
 STATUS_FILE = APP_DIR / "update_status.json"
 INTRADAY_BASELINE_FILE = APP_DIR / "intraday_baseline.pkl.gz"
 ACTIONS_URL = "https://github.com/jan770610-dot/tw-stock-dashboard-test/actions/workflows/daily-update.yml"
-LIVE_SCHEMA_VERSION = "v362-manager-reset-1"
-INTRADAY_ENGINE_GENERATION = "3.6.2-manager-reset-1"
+LIVE_SCHEMA_VERSION = "v363-mis-resilience-1"
+INTRADAY_ENGINE_GENERATION = "3.6.3-mis-resilience-1"
 
 st.set_page_config(page_title="台股分析中心", page_icon="📈", layout="wide", initial_sidebar_state="expanded")
 
@@ -28,7 +28,7 @@ st.set_page_config(page_title="台股分析中心", page_icon="📈", layout="wi
 # 瀏覽器 session 可能在程式更新後仍保留舊 radar/override，造成看起來「價格不動」。
 if st.session_state.get("_intraday_live_schema") != LIVE_SCHEMA_VERSION:
     for _k in list(st.session_state.keys()):
-        if str(_k).startswith(("v362_", "v360_", "v359_", "v358_", "v357_", "v356_", "v355_", "v354_")) or _k == "v32_single_override":
+        if str(_k).startswith(("v363_", "v362_", "v360_", "v359_", "v358_", "v357_", "v356_", "v355_", "v354_")) or _k == "v32_single_override":
             st.session_state.pop(_k, None)
     st.session_state["_intraday_live_schema"] = LIVE_SCHEMA_VERSION
 
@@ -2393,7 +2393,7 @@ def _render_trial_summary(bg_state: dict, manager=None):
     mode_title = "📡 今日盤中試算" if dashboard_mode == "intraday" else "🧾 今日收盤試算（等待正式更新）"
     status_text = "🔄 背景正在處理下一批；目前畫面維持上一批完成資料" if running else "🟢 背景待命／等待下一批"
     mode_note = (
-        "全市場約60秒刷新廣度/RS/Wade與候選發現；個股狀態引擎約10秒同步，盤中追蹤股依數量約10–30秒抓取。畫面預設30秒才重繪，避免閱讀時表格一直跳。"
+        "全市場約90秒刷新廣度/RS/Wade與候選發現；個股狀態引擎約10秒同步，盤中追蹤股依數量約10–30秒抓取。畫面預設30秒才重繪，避免閱讀時表格一直跳。"
         if dashboard_mode == "intraday"
         else "13:30 後不再連續背景掃描；保留最後完成結果，等待 18:05 正式資料。"
     )
@@ -2404,10 +2404,20 @@ def _render_trial_summary(bg_state: dict, manager=None):
         f"背景完成：{bg_state.get('last_completed') or snap.get('snapshot_time','—')}｜"
         f"可用報價覆蓋：{_fmt_trial(snap.get('coverage'),1,'%')}｜MIS z真實成交覆蓋：{_fmt_trial(snap.get('real_trade_coverage'),1,'%')}"
     )
-    if last_error and full_fail_streak >= 2:
-        st.warning(f"背景更新已連續失敗 {full_fail_streak} 輪：{last_error}；目前仍顯示上一批成功資料。")
-    elif last_error:
-        st.caption("背景剛出現一次暫時性失敗，系統會自動重試；目前畫面維持上一批成功資料。")
+    if last_error and full_fail_streak >= 3:
+        st.warning(
+            f"全市場同步已連續 {full_fail_streak} 輪未取得足夠新行情；"
+            f"目前沿用上一批成功的市場廣度，個股快速追蹤仍會繼續。"
+        )
+        with st.expander("查看全市場同步錯誤原因", expanded=False):
+            st.code(str(last_error))
+    elif last_error and full_fail_streak >= 1:
+        st.caption(
+            f"⚠️ 全市場同步暫時未成功（連續 {full_fail_streak} 輪）；"
+            "目前不發布低覆蓋率的新 RS/Wade，沿用上一批成功市場資料並自動重試。"
+        )
+        with st.expander("查看這次同步原因", expanded=False):
+            st.code(str(last_error))
 
     c1, c2, c3, c4, c5, c6 = st.columns(6)
     c1.metric("RS 強勢股", f"{int(snap.get('strong_count',0)):,} 檔", _metric_delta(snap.get("strong_count"), strong_count, 0, " 檔"))
@@ -2896,7 +2906,7 @@ message = update_status.get("message", "")
 if dashboard_mode == "intraday":
     st.markdown(
         f'<div class="status-strip status-ok"><b>目前模式：</b>📡 今日盤中試算　｜　'
-        f'<b>正式比較基準：</b>{latest_date}　｜　<b>全市場同步：</b>約60秒　｜　'
+        f'<b>正式比較基準：</b>{latest_date}　｜　<b>全市場同步：</b>約90秒　｜　'
         f'<b>盤中個股同步：</b>動態10–30秒　｜　<b>最近正式排程：</b>{html.escape(str(last_run))}</div>',
         unsafe_allow_html=True
     )
@@ -2932,6 +2942,7 @@ if dashboard_mode in {"intraday", "close_trial"}:
     if st.session_state.get(_manager_key) != INTRADAY_ENGINE_GENERATION:
         _old_generations = [
             st.session_state.get(_manager_key),
+            "3.6.2-manager-reset-1",
             "3.5.9-stable-reading-1",
             "3.5.8-state-machine-1",
         ]
@@ -2964,7 +2975,7 @@ if dashboard_mode in {"intraday", "close_trial"}:
     if dashboard_mode == "intraday":
         ctrl1, ctrl2 = st.columns([3, 1])
         auto_scan = ctrl1.toggle(
-            "背景全市場同步（約 60 秒）",
+            "背景全市場同步（約 90 秒）",
             value=True,
             key="v32_background_scan",
             help="背景執行行情抓取與約2,000檔運算；不會讓前台等待。關閉後仍可用手動單檔查詢。"
@@ -2975,7 +2986,7 @@ if dashboard_mode in {"intraday", "close_trial"}:
             official_duck_codes=official_duck_codes,
             duck_watch_codes=duck_watch_codes,
             formal_date=latest_date,
-            interval_seconds=60,
+            interval_seconds=90,
             enabled=auto_scan,
             ensure_once=True,
         )
@@ -3508,4 +3519,4 @@ with tabs[7]:
     with open(DEFAULT_RS,"rb") as f: d1.download_button("下載 RS 最新結果",f.read(),file_name="rs_latest.xlsx",mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",use_container_width=True)
     with open(DEFAULT_DUCK,"rb") as f: d2.download_button("下載鴨嘴最新結果",f.read(),file_name="duck_latest.xlsx",mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",use_container_width=True)
 
-st.divider(); st.caption(f"正式版 v3.6.2｜進場 v1.0 × 獲利出場 v1.2 × 失敗風控 v1.0 × 個股決策中心｜RS：{rs_date}｜鴨嘴：{duck_date}｜量化篩選與市場廣度工具，不構成投資建議。")
+st.divider(); st.caption(f"正式版 v3.6.3｜進場 v1.0 × 獲利出場 v1.2 × 失敗風控 v1.0 × 個股決策中心｜RS：{rs_date}｜鴨嘴：{duck_date}｜量化篩選與市場廣度工具，不構成投資建議。")

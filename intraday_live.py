@@ -36,7 +36,7 @@ BASELINE_STATUS = APP_DIR / "intraday_baseline_status.json"
 TRADE_STATE_FILE = APP_DIR / "intraday_trade_state_today.json"
 MIS_URL = "https://mis.twse.com.tw/stock/api/getStockInfo.jsp"
 TZ = ZoneInfo("Asia/Taipei")
-ENGINE_VERSION = "3.6.2-manager-reset-1"
+ENGINE_VERSION = "3.6.3-mis-resilience-1"
 
 RS_THRESHOLD = 85.0
 AMOUNT_MIN = 30_000_000.0
@@ -185,6 +185,52 @@ def _fetch_mis_quotes_raw(universe_json: str, batch_size: int = 80, workers: int
     return q, errors
 
 
+def _fetch_mis_quotes_resilient(universe_json: str) -> tuple[pd.DataFrame, list[str]]:
+    """Two-stage MIS fetch for full-market scans.
+
+    First pass stays moderately parallel.  If some/most batches fail, retry only
+    the missing symbols in smaller batches with one worker.  This reduces the
+    chance that a temporary MIS throttle turns into a complete 2,000-stock scan
+    failure on Streamlit Cloud.
+    """
+    universe = json.loads(universe_json)
+    total = len(universe)
+    q1, err1 = _fetch_mis_quotes_raw(universe_json, batch_size=80, workers=3)
+
+    have = set()
+    if q1 is not None and not q1.empty and "code" in q1.columns:
+        have = set(q1["code"].astype(str).map(_norm_code))
+
+    # If first pass is already very healthy, avoid extra network calls.
+    coverage1 = (len(have) / total * 100.0) if total else 100.0
+    if coverage1 >= 92.0 and not err1:
+        return q1, err1
+
+    missing = [
+        {"code": str(r.get("code", "")), "market": str(r.get("market", ""))}
+        for r in universe
+        if _norm_code(r.get("code")) not in have
+    ]
+    q2 = pd.DataFrame()
+    err2 = []
+    if missing:
+        time.sleep(0.45)
+        missing_json = json.dumps(missing, ensure_ascii=False, separators=(",", ":"))
+        q2, err2 = _fetch_mis_quotes_raw(missing_json, batch_size=45, workers=1)
+
+    parts = [q for q in [q1, q2] if q is not None and not q.empty]
+    if parts:
+        q = pd.concat(parts, ignore_index=True)
+        if "code" in q.columns:
+            q["code"] = q["code"].astype(str).map(_norm_code)
+            q = q.drop_duplicates("code", keep="last")
+    else:
+        q = pd.DataFrame()
+
+    errors = list(err1 or []) + list(err2 or [])
+    return q, errors
+
+
 @st.cache_data(ttl=25, show_spinner=False)
 def fetch_mis_quotes(universe_json: str, batch_size: int = 80, workers: int = 4) -> tuple[pd.DataFrame, list[str]]:
     return _fetch_mis_quotes_raw(universe_json, batch_size=batch_size, workers=workers)
@@ -295,9 +341,22 @@ def build_snapshot(daily: pd.DataFrame, strong: pd.DataFrame, use_streamlit_cach
     if use_streamlit_cache:
         q, errors = fetch_mis_quotes(universe_json)
     else:
-        q, errors = _fetch_mis_quotes_raw(universe_json)
+        q, errors = _fetch_mis_quotes_resilient(universe_json)
     if q.empty:
-        raise RuntimeError("TWSE MIS did not return any usable quotes")
+        detail = "；".join(dict.fromkeys([str(e) for e in (errors or []) if str(e)]))[:500]
+        raise RuntimeError(
+            "MIS 全市場兩階段抓取仍無可用行情"
+            + (f"｜{detail}" if detail else "")
+        )
+    raw_coverage = len(q) / len(universe) * 100.0 if universe else 100.0
+    # Too little fresh coverage would make cross-sectional RS/Wade misleading.
+    # Keep the previous successful snapshot instead of publishing a bad new one.
+    if not use_streamlit_cache and raw_coverage < 70.0:
+        detail = "；".join(dict.fromkeys([str(e) for e in (errors or []) if str(e)]))[:350]
+        raise RuntimeError(
+            f"MIS 全市場有效覆蓋僅 {raw_coverage:.1f}%（低於70%安全門檻）"
+            + (f"｜{detail}" if detail else "")
+        )
 
     x = base.merge(q, on="code", how="left")
     x["last"] = pd.to_numeric(x["last"], errors="coerce")
