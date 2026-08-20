@@ -23,7 +23,6 @@ from zoneinfo import ZoneInfo
 import datetime as dt
 import json
 import math
-import os
 import time
 import threading
 
@@ -33,10 +32,8 @@ import streamlit as st
 APP_DIR = Path(__file__).resolve().parent
 BASELINE = APP_DIR / "intraday_baseline.pkl.gz"
 BASELINE_STATUS = APP_DIR / "intraday_baseline_status.json"
-TRADE_STATE_FILE = APP_DIR / "intraday_trade_state_today.json"
 MIS_URL = "https://mis.twse.com.tw/stock/api/getStockInfo.jsp"
 TZ = ZoneInfo("Asia/Taipei")
-ENGINE_VERSION = "3.6.6-conservative-mis-1"
 
 RS_THRESHOLD = 85.0
 AMOUNT_MIN = 30_000_000.0
@@ -75,36 +72,27 @@ def _channel(code: str, market: str) -> str:
     return f"{prefix}_{code}.tw"
 
 
-def _fetch_batch(channels: list[str], timeout: int = 10, attempts: int = 3) -> tuple[list[dict], str | None]:
-    """Fetch one MIS batch with short retry/backoff for transient network failures."""
+def _fetch_batch(channels: list[str], timeout: int = 8) -> tuple[list[dict], str | None]:
     if not channels:
         return [], None
-    last_err=None
-    for attempt in range(max(1,int(attempts))):
-        query = urlencode({"ex_ch": "|".join(channels), "json": "1", "delay": "0", "_": str(int(time.time() * 1000))})
-        req = Request(
-            f"{MIS_URL}?{query}",
-            headers={
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/138 Safari/537.36",
-                "Referer": "https://mis.twse.com.tw/stock/index.jsp",
-                "Accept": "application/json,text/plain,*/*",
-            },
-        )
-        try:
-            with urlopen(req, timeout=timeout) as resp:
-                payload = json.loads(resp.read().decode("utf-8", errors="replace"))
-            rows=payload.get("msgArray", []) or []
-            if rows:
-                return rows, None
-            last_err="MIS 回傳空批次"
-        except Exception as e:
-            last_err=f"{type(e).__name__}: {e}"
-        if attempt < max(1,int(attempts))-1:
-            time.sleep(0.35 * (2 ** attempt))
-    return [], last_err
+    query = urlencode({"ex_ch": "|".join(channels), "json": "1", "delay": "0", "_": str(int(time.time() * 1000))})
+    req = Request(
+        f"{MIS_URL}?{query}",
+        headers={
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/138 Safari/537.36",
+            "Referer": "https://mis.twse.com.tw/stock/index.jsp",
+            "Accept": "application/json,text/plain,*/*",
+        },
+    )
+    try:
+        with urlopen(req, timeout=timeout) as resp:
+            payload = json.loads(resp.read().decode("utf-8", errors="replace"))
+        return payload.get("msgArray", []) or [], None
+    except Exception as e:
+        return [], f"{type(e).__name__}: {e}"
 
 
-def _fetch_mis_quotes_raw(universe_json: str, batch_size: int = 80, workers: int = 4, timeout: int = 6, attempts: int = 2) -> tuple[pd.DataFrame, list[str]]:
+def _fetch_mis_quotes_raw(universe_json: str, batch_size: int = 80, workers: int = 6) -> tuple[pd.DataFrame, list[str]]:
     """Pure-Python quote fetcher. Safe to call from the background worker (no Streamlit API)."""
     universe = json.loads(universe_json)
     channels = [_channel(str(r["code"]), str(r["market"])) for r in universe]
@@ -112,7 +100,7 @@ def _fetch_mis_quotes_raw(universe_json: str, batch_size: int = 80, workers: int
     raw: list[dict] = []
     errors: list[str] = []
     with ThreadPoolExecutor(max_workers=max(1, min(workers, 8))) as ex:
-        futs = {ex.submit(_fetch_batch, b, timeout=timeout, attempts=attempts): b for b in batches}
+        futs = {ex.submit(_fetch_batch, b): b for b in batches}
         for fut in as_completed(futs):
             rows, err = fut.result()
             raw.extend(rows)
@@ -185,82 +173,9 @@ def _fetch_mis_quotes_raw(universe_json: str, batch_size: int = 80, workers: int
     return q, errors
 
 
-def _fetch_mis_quotes_resilient(universe_json: str) -> tuple[pd.DataFrame, list[str]]:
-    """Fast bounded two-stage MIS fetch for full-market scans.
-
-    Design target: do not let a bad MIS minute turn one background rescan into
-    several minutes.  The first pass is moderately parallel with only one retry.
-    The repair pass is allowed only for a manageable missing set and has no retry.
-    If coverage is still too low, build_snapshot rejects the new snapshot and the
-    dashboard keeps the previous successful RS/Wade state.
-    """
-    universe = json.loads(universe_json)
-    total = len(universe)
-
-    # Pass 1: about 20 batches for ~2,000 stocks; 4 workers; at most 2 attempts/batch.
-    q1, err1 = _fetch_mis_quotes_raw(
-        universe_json,
-        batch_size=100,
-        workers=4,
-        timeout=6,
-        attempts=2,
-    )
-
-    have = set()
-    if q1 is not None and not q1.empty and "code" in q1.columns:
-        have = set(q1["code"].astype(str).map(_norm_code))
-    coverage1 = (len(have) / total * 100.0) if total else 100.0
-
-    # Healthy enough: publish immediately.  A few failed sub-batches do not justify
-    # another whole repair cycle if fresh coverage is already >= 92%.
-    if coverage1 >= 92.0:
-        return q1, list(err1 or [])
-
-    missing = [
-        {"code": str(r.get("code", "")), "market": str(r.get("market", ""))}
-        for r in universe
-        if _norm_code(r.get("code")) not in have
-    ]
-
-    # If too much is missing, do not spend minutes serially repairing 1,000+ names.
-    # Fail fast; the caller will keep the previous successful full-market snapshot.
-    if len(missing) > 600:
-        errs = list(err1 or [])
-        errs.append(
-            f"第一階段僅 {coverage1:.1f}% 覆蓋，缺漏 {len(missing)} 檔；"
-            "超過600檔快速補抓上限，保留上一批成功市場快照"
-        )
-        return q1, errs
-
-    q2 = pd.DataFrame()
-    err2 = []
-    if missing:
-        time.sleep(0.25)
-        missing_json = json.dumps(missing, ensure_ascii=False, separators=(",", ":"))
-        # Repair pass: smaller batches, 2 workers, no retry.  It is a bounded repair,
-        # not a second potentially long-running full scan.
-        q2, err2 = _fetch_mis_quotes_raw(
-            missing_json,
-            batch_size=60,
-            workers=2,
-            timeout=4,
-            attempts=1,
-        )
-
-    parts = [q for q in [q1, q2] if q is not None and not q.empty]
-    if parts:
-        q = pd.concat(parts, ignore_index=True)
-        if "code" in q.columns:
-            q["code"] = q["code"].astype(str).map(_norm_code)
-            q = q.drop_duplicates("code", keep="last")
-    else:
-        q = pd.DataFrame()
-
-    return q, list(err1 or []) + list(err2 or [])
-
 @st.cache_data(ttl=25, show_spinner=False)
-def fetch_mis_quotes(universe_json: str, batch_size: int = 80, workers: int = 4) -> tuple[pd.DataFrame, list[str]]:
-    return _fetch_mis_quotes_raw(universe_json, batch_size=batch_size, workers=workers, timeout=6, attempts=2)
+def fetch_mis_quotes(universe_json: str, batch_size: int = 80, workers: int = 6) -> tuple[pd.DataFrame, list[str]]:
+    return _fetch_mis_quotes_raw(universe_json, batch_size=batch_size, workers=workers)
 
 
 def _load_baseline_raw(path_s: str) -> pd.DataFrame:
@@ -368,22 +283,9 @@ def build_snapshot(daily: pd.DataFrame, strong: pd.DataFrame, use_streamlit_cach
     if use_streamlit_cache:
         q, errors = fetch_mis_quotes(universe_json)
     else:
-        q, errors = _fetch_mis_quotes_resilient(universe_json)
+        q, errors = _fetch_mis_quotes_raw(universe_json)
     if q.empty:
-        detail = "；".join(dict.fromkeys([str(e) for e in (errors or []) if str(e)]))[:500]
-        raise RuntimeError(
-            "MIS 全市場兩階段抓取仍無可用行情"
-            + (f"｜{detail}" if detail else "")
-        )
-    raw_coverage = len(q) / len(universe) * 100.0 if universe else 100.0
-    # Too little fresh coverage would make cross-sectional RS/Wade misleading.
-    # Keep the previous successful snapshot instead of publishing a bad new one.
-    if not use_streamlit_cache and raw_coverage < 70.0:
-        detail = "；".join(dict.fromkeys([str(e) for e in (errors or []) if str(e)]))[:350]
-        raise RuntimeError(
-            f"MIS 全市場有效覆蓋僅 {raw_coverage:.1f}%（低於70%安全門檻）"
-            + (f"｜{detail}" if detail else "")
-        )
+        raise RuntimeError("TWSE MIS did not return any usable quotes")
 
     x = base.merge(q, on="code", how="left")
     x["last"] = pd.to_numeric(x["last"], errors="coerce")
@@ -539,12 +441,6 @@ def build_snapshot(daily: pd.DataFrame, strong: pd.DataFrame, use_streamlit_cach
         action = "觀望等待"
 
     quote_coverage = len(x) / len(base) * 100.0 if len(base) else 0.0
-    # 報價覆蓋率包含買一/賣一/前收備援；真正 MIS z 成交另外統計，
-    # 避免把「有參考價」誤說成「有即時成交」。
-    real_trade_coverage = (
-        float(x.get("traded", pd.Series(False, index=x.index)).fillna(False).astype(bool).mean() * 100.0)
-        if len(x) else 0.0
-    )
     newest_time = "—"
     qt = x.get("quote_time")
     if qt is not None and qt.astype(str).str.len().gt(0).any():
@@ -591,7 +487,7 @@ def build_snapshot(daily: pd.DataFrame, strong: pd.DataFrame, use_streamlit_cach
         "ma20_live", "ma50_live", "ma60_live", "ma200_live", "amount_est",
         "strong_live", "strong_cond_count", "strong_missing", "near_strong",
         "duck_price_live", "ma20_gap_pct", "best_bid", "best_ask",
-        "price_source", "price_estimated", "traded", "quote_time", "quote_date",
+        "price_source", "price_estimated", "quote_time", "quote_date",
     ]
     live_stocks = x[live_cols].copy()
     live_stocks = live_stocks.rename(columns={
@@ -600,7 +496,7 @@ def build_snapshot(daily: pd.DataFrame, strong: pd.DataFrame, use_streamlit_cach
         "strong_live": "盤中強勢", "strong_cond_count": "強勢條件通過數", "strong_missing": "強勢尚缺條件", "near_strong": "即將強勢",
         "duck_price_live": "盤中鴨嘴價格結構", "ma20_gap_pct": "月線乖離率%",
         "best_bid": "最佳買價", "best_ask": "最佳賣價",
-        "price_source": "價格來源", "price_estimated": "價格為估計", "traded": "MIS真實成交",
+        "price_source": "價格來源", "price_estimated": "價格為估計",
         "quote_time": "MIS報價時間", "quote_date": "MIS報價日期",
     })
 
@@ -609,8 +505,6 @@ def build_snapshot(daily: pd.DataFrame, strong: pd.DataFrame, use_streamlit_cach
         "snapshot_time": dt.datetime.now(TZ).strftime("%Y-%m-%d %H:%M:%S"),
         "quote_time": newest_time,
         "coverage": quote_coverage,
-        "real_trade_coverage": real_trade_coverage,
-        "engine_version": ENGINE_VERSION,
         "errors": errors,
         "strong_count": strong_count,
         "eligible_count": eligible_count,
@@ -661,113 +555,8 @@ def _codes_from_live(snapshot: dict, col: str, watch_codes: set[str] | None = No
     return set(stocks.loc[mask, "代號"].astype(str))
 
 
-
-
-def _plain_json_value(v):
-    """Convert pandas/numpy-ish scalars into small JSON-safe values."""
-    try:
-        if pd.isna(v):
-            return None
-    except Exception:
-        pass
-    if isinstance(v, (str, int, float, bool)) or v is None:
-        return v
-    try:
-        x = v.item()
-        if isinstance(x, (str, int, float, bool)) or x is None:
-            return x
-    except Exception:
-        pass
-    return str(v)
-
-
-def _trade_state_transition_reason(old_state: str, new_state: str, row: dict) -> str:
-    """Describe why a touched stock changed state, using the same live diagnostics shown in the UI."""
-    old_state = str(old_state or "⏳ 等待")
-    new_state = str(new_state or "⏳ 等待")
-    if old_state == new_state:
-        return "狀態延續"
-    if old_state == "⏳ 等待" and new_state != "⏳ 等待":
-        return f"即時條件成立：{new_state}"
-    if old_state != "⏳ 等待" and new_state != "⏳ 等待":
-        return f"分類轉換：{old_state} → {new_state}"
-
-    right = _f(row.get("右側分數"))
-    rs = _f(row.get("盤中RS"))
-    heat = _f(row.get("過熱程度"))
-    complete = _f(row.get("鴨嘴完成度%"))
-    gate = str(row.get("市場閘門") or "")
-    live_duck = bool(row.get("盤中正式鴨嘴", False))
-    reasons = []
-    if old_state.startswith("📈"):
-        if right is not None and right < 65:
-            reasons.append(f"右側 {right:.1f}<65")
-        if "未確認" in gate:
-            reasons.append("市場廣度閘門未確認")
-        if heat is not None and heat >= 70:
-            reasons.append(f"過熱 {heat:.1f}，離開進場區")
-    elif old_state.startswith("🌱"):
-        if complete is not None and complete < 80:
-            reasons.append(f"鴨嘴完成度 {complete:.0f}%<80%")
-        if rs is not None and rs < 70:
-            reasons.append(f"RS {rs:.1f}<70")
-        if "未確認" in gate:
-            reasons.append("市場廣度閘門未確認")
-        if heat is not None and heat >= 70:
-            reasons.append(f"過熱 {heat:.1f}，離開試單區")
-    elif old_state.startswith("🚀"):
-        if not live_duck:
-            reasons.append("正式鴨嘴結構暫時不成立")
-        if right is not None and right < 65:
-            reasons.append(f"右側 {right:.1f}<65")
-    elif old_state.startswith("🟡"):
-        if heat is not None and heat < 70:
-            reasons.append(f"過熱降至 {heat:.1f}<70")
-    elif old_state.startswith("🟠"):
-        threshold = 90 if rs is not None and rs >= 85 else 80
-        if heat is not None and heat < threshold:
-            reasons.append(f"過熱降至 {heat:.1f}<{threshold}")
-    elif old_state.startswith("🔴"):
-        reasons.append("贏家退潮條件目前解除")
-    return "；".join(reasons[:3]) if reasons else f"{old_state} → {new_state}"
-
-
-def _trade_state_path_text(path) -> str:
-    vals = [str(x) for x in (path or []) if str(x).strip()]
-    return " → ".join(vals[-10:]) if vals else "—"
-
-
-
-def _probe_mis_source() -> tuple[bool, str | None]:
-    """Probe a tiny set before a full-market request burst.
-
-    When the source/network is rejecting this cloud host, the probe fails in a
-    few seconds and the manager opens a cooldown circuit instead of launching
-    20+ full-market batches that cannot succeed.
-    """
-    probe_universe = [
-        {"code": "2330", "market": "TWSE"},
-        {"code": "2317", "market": "TWSE"},
-        {"code": "6488", "market": "TPEX"},
-    ]
-    payload = json.dumps(probe_universe, ensure_ascii=False, separators=(",", ":"))
-    q, errors = _fetch_mis_quotes_raw(
-        payload, batch_size=3, workers=1, timeout=4, attempts=1
-    )
-    if q is not None and not q.empty:
-        return True, None
-    err = "；".join(dict.fromkeys([str(e) for e in (errors or []) if str(e)]))[:350]
-    return False, err or "MIS 小型連線探測沒有回傳行情"
-
-
 class IntradayBackgroundManager:
-    """Process-shared scanner: full-market pulse + reactive intraday watch universe.
-
-    v3.5.5 keeps every stock currently used by a盤中/即時 panel in the fast
-    watch universe.  The full market is rescanned on a slower cadence to keep
-    breadth/RS/Wade and discovery honest; active/event/manual stocks are then
-    refreshed much more frequently in MIS batches.
-    """
+    """Process-shared scanner: full market ~90s + actionable watchlist ~10s."""
 
     def __init__(self):
         self._lock = threading.RLock()
@@ -780,7 +569,7 @@ class IntradayBackgroundManager:
         self._duck_watch: set[str] = set()
         self._formal_date = "—"
         self._config_sig = None
-        self._interval = 300.0
+        self._interval = 90.0
         self._enabled = False
         self._force_once = False
         self._snapshot: dict | None = None
@@ -792,16 +581,10 @@ class IntradayBackgroundManager:
         self._last_started: dt.datetime | None = None
         self._last_completed: dt.datetime | None = None
         self._last_error: str | None = None
-        self._full_fail_streak = 0
-        # v3.6.5: source circuit breaker.  If TWSE MIS starts rejecting the
-        # Streamlit Cloud host, do not hammer 2,000 symbols every 90 seconds.
-        self._source_circuit_until: dt.datetime | None = None
-        self._source_probe_error: str | None = None
 
-        # v3.5.5: every stock shown by a盤中/即時 decision/event/manual view is
-        # eligible for the reactive watch universe, not only the first 120 names.
+        # v3.5.4: once a stock becomes actionable, follow it separately in small MIS batches.
         self._fast_watch_codes: list[str] = []
-        self._fast_interval = 5.0
+        self._fast_interval = 10.0
         self._fast_enabled = False
         self._fast_rows: pd.DataFrame | None = None
         self._fast_version = 0
@@ -809,20 +592,6 @@ class IntradayBackgroundManager:
         self._fast_last_started: dt.datetime | None = None
         self._fast_last_completed: dt.datetime | None = None
         self._fast_last_error: str | None = None
-        self._fast_last_returned_count = 0
-        self._fast_cycle = 0
-        self._fast_fail_streak = 0
-
-        # v3.5.8: process-shared per-stock state machine.  Once a stock has entered
-        # any actionable radar state, it remains traceable for the rest of the day
-        # even after it returns to "等待" or moves to another bucket.
-        self._trade_state_day = dt.datetime.now(TZ).strftime("%Y-%m-%d")
-        self._trade_states: dict[str, dict] = {}
-        self._trade_state_events: list[dict] = []
-        self._trade_state_version = 0
-        self._trade_state_last_save = 0.0
-        self._trade_state_persist_error: str | None = None
-        self._load_trade_state_file_locked()
 
         self._thread = threading.Thread(target=self._loop, name="tw-intraday-background", daemon=True)
         self._thread.start()
@@ -835,7 +604,7 @@ class IntradayBackgroundManager:
         official_duck_codes: set[str] | None = None,
         duck_watch_codes: set[str] | None = None,
         formal_date: str = "—",
-        interval_seconds: int = 60,
+        interval_seconds: int = 90,
         enabled: bool = True,
         ensure_once: bool = False,
     ) -> None:
@@ -869,10 +638,8 @@ class IntradayBackgroundManager:
                     self._fast_version = 0
                     self._fast_last_completed = None
                     self._fast_last_started = None
-                    self._fast_last_returned_count = 0
-                    self._fast_cycle = 0
                 should_wake = True
-            new_interval = float(max(60, int(interval_seconds)))
+            new_interval = float(max(30, int(interval_seconds)))
             if new_interval != self._interval or bool(enabled) != self._enabled:
                 self._interval = new_interval
                 self._enabled = bool(enabled)
@@ -885,217 +652,7 @@ class IntradayBackgroundManager:
         if should_wake:
             self._wake.set()
 
-    def _reset_trade_state_day_locked(self, day: str | None = None) -> None:
-        day = day or dt.datetime.now(TZ).strftime("%Y-%m-%d")
-        if day == self._trade_state_day:
-            return
-        self._trade_state_day = day
-        self._trade_states = {}
-        self._trade_state_events = []
-        self._trade_state_version += 1
-        self._trade_state_persist_error = None
-        try:
-            if TRADE_STATE_FILE.exists():
-                TRADE_STATE_FILE.unlink()
-        except Exception:
-            pass
-
-    def _load_trade_state_file_locked(self) -> None:
-        """Best-effort restore for browser/session refreshes and same-container restarts."""
-        try:
-            if not TRADE_STATE_FILE.exists():
-                return
-            payload = json.loads(TRADE_STATE_FILE.read_text(encoding="utf-8"))
-            today = dt.datetime.now(TZ).strftime("%Y-%m-%d")
-            if str(payload.get("day") or "") != today:
-                try:
-                    TRADE_STATE_FILE.unlink()
-                except Exception:
-                    pass
-                return
-            states = payload.get("states") or {}
-            events = payload.get("events") or []
-            if isinstance(states, dict):
-                self._trade_states = {str(k): dict(v) for k, v in states.items() if isinstance(v, dict)}
-            if isinstance(events, list):
-                self._trade_state_events = [dict(x) for x in events[-2000:] if isinstance(x, dict)]
-            self._trade_state_day = today
-        except Exception as e:
-            self._trade_state_persist_error = f"讀取狀態檔失敗：{type(e).__name__}: {e}"
-
-    def _save_trade_state_file_locked(self, force: bool = False) -> None:
-        now_ts = time.time()
-        if not force and now_ts - self._trade_state_last_save < 20.0:
-            return
-        try:
-            # Only touched stocks need durable continuity; untouched waiting stocks can
-            # always be reconstructed from the next full-market snapshot.
-            touched = {
-                code: rec for code, rec in self._trade_states.items()
-                if bool(rec.get("今日曾觸發", False))
-            }
-            payload = {
-                "day": self._trade_state_day,
-                "engine_version": ENGINE_VERSION,
-                "saved_at": dt.datetime.now(TZ).strftime("%Y-%m-%d %H:%M:%S"),
-                "states": touched,
-                "events": self._trade_state_events[-2000:],
-            }
-            tmp = TRADE_STATE_FILE.with_name(TRADE_STATE_FILE.name + ".tmp")
-            tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-            os.replace(tmp, TRADE_STATE_FILE)
-            self._trade_state_last_save = now_ts
-            self._trade_state_persist_error = None
-        except Exception as e:
-            self._trade_state_persist_error = f"寫入狀態檔失敗：{type(e).__name__}: {e}"
-
-    def sync_trade_states(self, rows) -> None:
-        """Synchronize app-classified live rows into one continuous state per stock.
-
-        `rows` can be a DataFrame or a list of dicts.  Data-quality problems do not
-        force a trading-state transition: the last valid state is kept and the row is
-        marked non-actionable until a fresh MIS z quote returns.
-        """
-        if rows is None:
-            return
-        if isinstance(rows, pd.DataFrame):
-            records = rows.to_dict("records")
-        else:
-            records = list(rows or [])
-        if not records:
-            return
-
-        now = dt.datetime.now(TZ)
-        day = now.strftime("%Y-%m-%d")
-        now_text = now.strftime("%Y-%m-%d %H:%M:%S")
-        clock = now.strftime("%H:%M:%S")
-        changed = False
-        with self._lock:
-            self._reset_trade_state_day_locked(day)
-            for raw in records:
-                if not isinstance(raw, dict):
-                    continue
-                row = {str(k): _plain_json_value(v) for k, v in raw.items()}
-                code = _norm_code(row.get("代號"))
-                if not code:
-                    continue
-                candidate = str(row.get("狀態") or "⏳ 等待")
-                data_issue = str(row.get("資料問題") or "").strip()
-                price = _f(row.get("盤中價"))
-                rec = self._trade_states.get(code)
-
-                # Do not create 2,000 permanent waiting rows.  A stock enters the state
-                # machine only after its first real actionable signal; from then on it
-                # never disappears for the rest of that trading day.
-                if rec is None:
-                    if data_issue or candidate == "⏳ 等待":
-                        continue
-                    path = [candidate]
-                    rec = {
-                        "日期": day,
-                        "代號": code,
-                        "名稱": str(row.get("名稱") or ""),
-                        "市場": str(row.get("市場") or ""),
-                        "目前狀態": candidate,
-                        "前一狀態": "—",
-                        "今日路徑清單": path,
-                        "今日路徑": _trade_state_path_text(path),
-                        "今日曾觸發": True,
-                        "首次觸發分類": candidate,
-                        "首次觸發時間": clock,
-                        "首次觸發價": price,
-                        "本狀態觸發時間": clock,
-                        "本狀態觸發價": price,
-                        "狀態起始時間": clock,
-                        "最近變更時間": clock,
-                        "最近變更原因": f"首次進入：{candidate}",
-                        "狀態變更次數": 0,
-                    }
-                    self._trade_states[code] = rec
-                    self._trade_state_events.append({
-                        "時間": clock, "代號": code, "名稱": rec["名稱"],
-                        "前一狀態": "—", "目前狀態": candidate,
-                        "價格": price, "原因": rec["最近變更原因"],
-                    })
-                    changed = True
-                else:
-                    rec["名稱"] = str(row.get("名稱") or rec.get("名稱") or "")
-                    rec["市場"] = str(row.get("市場") or rec.get("市場") or "")
-
-                # Always refresh diagnostics/data-health, even while a quote is stale.
-                rec["最後同步時間"] = now_text
-                rec["資料狀態"] = str(row.get("資料狀態") or "—")
-                rec["資料層級"] = str(row.get("資料層級") or "—")
-                rec["資料更新時間"] = str(row.get("資料更新時間") or "—")
-                rec["MIS報價時間"] = str(row.get("MIS報價時間") or "—")
-                rec["資料問題"] = data_issue
-                rec["可即時操作"] = bool(not data_issue and candidate != "⏳ 等待")
-                rec["下一步條件"] = str(row.get("下一步條件") or rec.get("下一步條件") or "—")
-                for k in ["盤中RS", "右側分數", "過熱程度", "鴨嘴完成度%", "市場閘門", "盤中操作", "盤中正式鴨嘴"]:
-                    if k in row:
-                        rec[k] = row.get(k)
-
-                # Keep last real price separate from an estimated book/previous-close reference.
-                if not bool(row.get("價格為估計", False)) and price is not None:
-                    rec["最新價"] = price
-                    rec["最新真實價時間"] = now_text
-                elif "最新價" not in rec and price is not None:
-                    rec["最新價"] = price
-
-                # A temporary stale/estimated quote must not make a stock look as if it
-                # left the strategy.  Wait for the next fresh real quote before changing state.
-                if data_issue:
-                    rec["顯示狀態"] = f"{rec.get('目前狀態','⏳ 等待')}｜⚠️ 行情待刷新"
-                    continue
-
-                old_state = str(rec.get("目前狀態") or "⏳ 等待")
-                if candidate != old_state:
-                    reason = _trade_state_transition_reason(old_state, candidate, row)
-                    rec["前一狀態"] = old_state
-                    rec["目前狀態"] = candidate
-                    path = list(rec.get("今日路徑清單") or [])
-                    if not path or path[-1] != candidate:
-                        path.append(candidate)
-                    rec["今日路徑清單"] = path[-12:]
-                    rec["今日路徑"] = _trade_state_path_text(rec["今日路徑清單"])
-                    rec["狀態起始時間"] = clock
-                    rec["本狀態觸發時間"] = clock
-                    rec["本狀態觸發價"] = price
-                    rec["最近變更時間"] = clock
-                    rec["最近變更原因"] = reason
-                    rec["狀態變更次數"] = int(rec.get("狀態變更次數", 0) or 0) + 1
-                    if candidate != "⏳ 等待":
-                        rec["今日曾觸發"] = True
-                    self._trade_state_events.append({
-                        "時間": clock, "代號": code, "名稱": rec.get("名稱", ""),
-                        "前一狀態": old_state, "目前狀態": candidate,
-                        "價格": price, "原因": reason,
-                    })
-                    changed = True
-
-                rec["顯示狀態"] = str(rec.get("目前狀態") or "⏳ 等待")
-                p0 = _f(rec.get("首次觸發價"))
-                ps = _f(rec.get("本狀態觸發價"))
-                pnow = _f(rec.get("最新價"))
-                rec["首次觸發後漲跌%"] = ((pnow / p0 - 1.0) * 100.0) if p0 not in (None, 0) and pnow is not None else None
-                rec["本狀態漲跌%"] = ((pnow / ps - 1.0) * 100.0) if ps not in (None, 0) and pnow is not None else None
-
-            self._trade_state_events = self._trade_state_events[-3000:]
-            self._trade_state_version += 1
-            self._save_trade_state_file_locked(force=changed)
-
-    def get_trade_state_table(self) -> pd.DataFrame:
-        with self._lock:
-            rows = [dict(v) for v in self._trade_states.values() if bool(v.get("今日曾觸發", False))]
-        return pd.DataFrame(rows)
-
-    def get_trade_state(self, code: str) -> dict | None:
-        code = _norm_code(code)
-        with self._lock:
-            rec = self._trade_states.get(code)
-            return dict(rec) if rec and bool(rec.get("今日曾觸發", False)) else None
-
-    def set_fast_watch_codes(self, codes, interval_seconds: int = 5, enabled: bool = True, max_codes: int = 2500) -> None:
+    def set_fast_watch_codes(self, codes, interval_seconds: int = 10, enabled: bool = True, max_codes: int = 120) -> None:
         ordered = []
         seen = set()
         for code in list(codes or []):
@@ -1110,14 +667,7 @@ class IntradayBackgroundManager:
             active = bool(enabled and self._enabled and ordered)
             if ordered != self._fast_watch_codes:
                 self._fast_watch_codes = ordered
-                # 不再因候選名單增減就把整張快速行情清空。
-                # 保留仍在追蹤名單中的上一筆快刷資料，下一輪再逐碼覆蓋。
-                if self._fast_rows is not None and not self._fast_rows.empty and "代號" in self._fast_rows.columns:
-                    keep = self._fast_rows.copy()
-                    keep["代號"] = keep["代號"].astype(str).map(_norm_code)
-                    self._fast_rows = keep[keep["代號"].isin(set(ordered))].copy()
-                else:
-                    self._fast_rows = None
+                self._fast_rows = None
                 self._fast_last_completed = None
                 self._fast_last_started = None
                 should_wake = True
@@ -1153,17 +703,9 @@ class IntradayBackgroundManager:
                 "last_started": self._last_started.strftime("%Y-%m-%d %H:%M:%S") if self._last_started else None,
                 "last_completed": self._last_completed.strftime("%Y-%m-%d %H:%M:%S") if self._last_completed else None,
                 "last_error": self._last_error,
-                "full_fail_streak": int(getattr(self, "_full_fail_streak", 0)),
-                "source_circuit_until": self._source_circuit_until.strftime("%Y-%m-%d %H:%M:%S") if getattr(self, "_source_circuit_until", None) else None,
-                "source_probe_error": getattr(self, "_source_probe_error", None),
-                "source_circuit_open": bool(getattr(self, "_source_circuit_until", None) and dt.datetime.now(TZ) < self._source_circuit_until),
                 "fast_rows": None if self._fast_rows is None else self._fast_rows.copy(deep=False),
                 "fast_watch_codes": list(self._fast_watch_codes),
                 "fast_watch_count": len(self._fast_watch_codes),
-                "fast_returned_count": int(self._fast_last_returned_count),
-                "fast_coverage": (float(self._fast_last_returned_count) / len(self._fast_watch_codes) * 100.0) if self._fast_watch_codes else 0.0,
-                "fast_cycle": int(self._fast_cycle),
-                "engine_version": ENGINE_VERSION,
                 "fast_version": self._fast_version,
                 "fast_running": self._fast_running,
                 "fast_enabled": self._fast_enabled,
@@ -1171,13 +713,6 @@ class IntradayBackgroundManager:
                 "fast_last_started": self._fast_last_started.strftime("%Y-%m-%d %H:%M:%S") if self._fast_last_started else None,
                 "fast_last_completed": self._fast_last_completed.strftime("%Y-%m-%d %H:%M:%S") if self._fast_last_completed else None,
                 "fast_last_error": self._fast_last_error,
-                "fast_fail_streak": int(getattr(self, "_fast_fail_streak", 0)),
-                "trade_state_day": self._trade_state_day,
-                "trade_state_version": int(self._trade_state_version),
-                "trade_state_codes": [code for code, rec in self._trade_states.items() if bool(rec.get("今日曾觸發", False))],
-                "trade_state_count": sum(1 for rec in self._trade_states.values() if bool(rec.get("今日曾觸發", False))),
-                "trade_state_events": list(self._trade_state_events[-500:]),
-                "trade_state_persist_error": self._trade_state_persist_error,
             }
 
     def _accept_snapshot(self, snap: dict) -> None:
@@ -1220,8 +755,8 @@ class IntradayBackgroundManager:
             "compare_label": compare_label,
         }
         self._version += 1
-        # 全市場重掃完成後，保留既有快速行情，避免每30秒瞬間退回舊快照。
-        # 只把 fast anchor 清掉，讓下一個 loop 立刻用新全市場基準重刷追蹤股。
+        # Re-anchor fast calculations to the just-completed full market snapshot.
+        self._fast_rows = None
         self._fast_last_completed = None
         self._fast_last_started = None
 
@@ -1247,32 +782,9 @@ class IntradayBackgroundManager:
             anchor=max(full_anchors) if full_anchors else None
             due = anchor is None or (now - anchor).total_seconds() >= interval
 
-            # Full scan has priority when due; but first honor the source circuit breaker.
+            # Full scan has priority when due; it refreshes the market gate and candidate discovery universe.
             if ready and (force or (enabled and due)):
                 with self._lock:
-                    circuit_until = self._source_circuit_until
-                if circuit_until is not None and now < circuit_until and not force:
-                    # No network burst during cooldown.  Existing formal/last-good data remain usable.
-                    self._wake.clear()
-                    self._wake.wait(min(15.0, max(1.0, (circuit_until-now).total_seconds())))
-                    continue
-
-                # Tiny preflight. If even 3 representative symbols are rejected,
-                # a 1,991-stock scan cannot work; cool down for five minutes.
-                ok_probe, probe_err = _probe_mis_source()
-                if not ok_probe:
-                    with self._lock:
-                        self._force_once = False
-                        self._running = False
-                        self._full_fail_streak += 1
-                        self._source_probe_error = probe_err
-                        self._last_error = f"MIS來源連線探測失敗：{probe_err}"
-                        self._source_circuit_until = dt.datetime.now(TZ) + dt.timedelta(minutes=10)
-                    continue
-
-                with self._lock:
-                    self._source_probe_error = None
-                    self._source_circuit_until = None
                     self._force_once = False
                     self._running = True
                     self._last_started = dt.datetime.now(TZ)
@@ -1283,19 +795,12 @@ class IntradayBackgroundManager:
                     snap = build_snapshot(daily_local, strong_local, use_streamlit_cache=False)
                 except Exception as e:
                     with self._lock:
-                        self._full_fail_streak += 1
                         self._last_error = f"{type(e).__name__}: {e}"
                         self._running = False
-                        # A failed full scan after a successful probe still suggests
-                        # throttling; use a shorter two-minute cooldown.
-                        self._source_circuit_until = dt.datetime.now(TZ) + dt.timedelta(minutes=5)
                 else:
                     with self._lock:
                         self._accept_snapshot(snap)
                         self._last_completed = dt.datetime.now(TZ)
-                        self._full_fail_streak = 0
-                        self._last_error = None
-                        self._source_circuit_until = None
                         self._running = False
                 continue
 
@@ -1310,40 +815,16 @@ class IntradayBackgroundManager:
                     fast_snapshot_local = snap_for_fast
                     fast_codes_local = list(fast_codes)
                 try:
-                    rows = refresh_watchlist(fast_snapshot_local, fast_codes_local, max_codes=2500)
+                    rows = refresh_watchlist(fast_snapshot_local, fast_codes_local, max_codes=120)
                 except Exception as e:
                     with self._lock:
-                        self._fast_fail_streak += 1
                         self._fast_last_error = f"{type(e).__name__}: {e}"
                         self._fast_running = False
                 else:
                     with self._lock:
-                        now_done = dt.datetime.now(TZ)
-                        self._fast_fail_streak = 0
-                        self._fast_last_error = None
-                        # MIS 批次可能偶爾少回個別股票；不能因此讓該股退回30秒甚至更舊的全市場列。
-                        # 將本輪成功回傳逐碼合併到上一輪快速行情，未回傳者保留上一筆並由 UI 顯示資料年齡。
-                        if rows is not None and not rows.empty:
-                            nr = rows.copy()
-                            nr["代號"] = nr["代號"].astype(str).map(_norm_code)
-                            nr["快速追蹤批次"] = self._fast_cycle + 1
-                            nr["快速抓取完成時間"] = now_done.strftime("%Y-%m-%d %H:%M:%S")
-                            if self._fast_rows is None or self._fast_rows.empty:
-                                merged = nr
-                            else:
-                                old = self._fast_rows.copy()
-                                old["代號"] = old["代號"].astype(str).map(_norm_code)
-                                merged = pd.concat([old, nr], ignore_index=True)
-                                merged = merged.drop_duplicates("代號", keep="last")
-                            if self._fast_watch_codes:
-                                merged = merged[merged["代號"].isin(set(self._fast_watch_codes))].copy()
-                            self._fast_rows = merged
-                            self._fast_last_returned_count = int(len(nr))
-                        else:
-                            self._fast_last_returned_count = 0
-                        self._fast_cycle += 1
+                        self._fast_rows = rows
                         self._fast_version += 1
-                        self._fast_last_completed = now_done
+                        self._fast_last_completed = dt.datetime.now(TZ)
                         self._fast_running = False
                 continue
 
@@ -1357,14 +838,13 @@ class IntradayBackgroundManager:
             self._wake.wait(wait_s)
 
 
-def refresh_watchlist(snapshot: dict, codes, max_codes: int = 2500) -> pd.DataFrame:
+def refresh_watchlist(snapshot: dict, codes, max_codes: int = 120) -> pd.DataFrame:
     """Batch-refresh a small actionable watchlist without rescanning the whole market.
 
     The full-market snapshot remains the ranking anchor. Updated watched stocks are
     reranked together against the unchanged 250-day returns of the rest of the market.
-    The caller can pass the complete intraday-active universe; requests are still batched
-    (80 symbols per MIS request) rather than one request per stock.  The app dynamically
-    slows the fast interval when the active universe becomes very large.
+    One MIS batch request can therefore refresh dozens of candidates every ~10 seconds
+    without making 2,000 quote requests or one request per stock.
     """
     if not snapshot or snapshot.get("stocks") is None:
         raise RuntimeError("尚未有背景市場快照")
@@ -1390,7 +870,7 @@ def refresh_watchlist(snapshot: dict, codes, max_codes: int = 2500) -> pd.DataFr
     market_map = dict(zip(hit["代號"].astype(str), hit.get("市場", pd.Series("TWSE", index=hit.index)).astype(str)))
     universe = [{"code": c, "market": market_map.get(c, "TWSE")} for c in ordered if c in market_map]
     universe_json = json.dumps(universe, ensure_ascii=False, separators=(",", ":"))
-    q, errors = _fetch_mis_quotes_raw(universe_json, batch_size=90, workers=3, timeout=4, attempts=1)
+    q, errors = _fetch_mis_quotes_raw(universe_json, batch_size=80, workers=3)
     if q.empty:
         raise RuntimeError(errors[0] if errors else "MIS 沒有回傳快速追蹤行情")
     q["code"] = q["code"].astype(str).map(_norm_code)
@@ -1481,16 +961,12 @@ def refresh_watchlist(snapshot: dict, codes, max_codes: int = 2500) -> pd.DataFr
             "盤中鴨嘴價格結構": bool(last > ma20 > ma60),
             "月線乖離率%": (last / ma20 - 1.0) * 100.0 if ma20 else None,
             "快速追蹤時間": dt.datetime.now(TZ).strftime("%Y-%m-%d %H:%M:%S"),
-            "快速追蹤epoch": time.time(),
-            "行情引擎版本": ENGINE_VERSION,
         })
     return pd.DataFrame(rows)
 
 
 @st.cache_resource(show_spinner=False)
-def get_background_manager(engine_generation: str = ENGINE_VERSION) -> IntradayBackgroundManager:
-    # generation 參數是 cache key 的一部分；部署新版時強制建立新的 manager/thread，
-    # 避免 Streamlit 沿用舊版 cache_resource 背景執行緒。
+def get_background_manager() -> IntradayBackgroundManager:
     return IntradayBackgroundManager()
 
 
@@ -1605,13 +1081,13 @@ def _render_once(daily: pd.DataFrame, strong: pd.DataFrame, all_ok: pd.DataFrame
 
 def render_intraday_panel(daily: pd.DataFrame, strong: pd.DataFrame, all_ok: pd.DataFrame, pre: pd.DataFrame, rs_latest: pd.Series):
     st.subheader("📡 盤中即時市場雷達")
-    st.caption("v3.5.5：全市場約30秒更新廣度/RS/Wade；盤中活躍個股另以動態5–20秒批次追蹤。")
+    st.caption("v3.2：全市場行情與計算在背景執行；頁面只讀最後完成快照，不會在自動刷新時等待網路。")
     if not BASELINE.exists():
         st.warning("尚未找到 intraday_baseline.pkl.gz。部署這個版本後，請手動跑一次『每日台股自動更新』。")
         return
 
     auto = st.toggle("背景自動掃描", value=True, key="intraday_auto_refresh")
-    seconds = st.select_slider("背景掃描頻率", options=[30, 45, 60, 90], value=30, format_func=lambda x: f"{x} 秒")
+    seconds = st.select_slider("背景掃描頻率", options=[60, 90, 120], value=90, format_func=lambda x: f"{x} 秒")
     manager = get_background_manager()
     official_strong = _code_set(strong)
     official_duck = _code_set(all_ok)
