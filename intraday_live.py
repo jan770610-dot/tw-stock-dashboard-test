@@ -117,41 +117,34 @@ def _fetch_mis_quotes_raw(universe_json: str, batch_size: int = 80, workers: int
             continue
         prev = _f(m.get("y"))
         z_last = _f(m.get("z"))
-        pz_last = _f(m.get("pz"))
         best_bid = _first_book_price(m.get("b"))
         best_ask = _first_book_price(m.get("a"))
 
-        # MIS 的 z 在逐筆交易期間可能暫時回傳 '-'。舊版直接退回昨收 y，
-        # 會把活躍個股顯示成「昨收、0.00%」。新邏輯先使用 pz（MIS 回傳的
-        # 最近成交備援），再以五檔中間價作估計；只有完全沒有盤中資訊時才退回昨收。
+        # v3.5.2：只有 MIS z 才當「最新成交價」。
+        # z 暫時沒有值時，不再使用 pz，也不再取買一/賣一中間價，
+        # 避免出現像 245.25 這種普通股票實際不可成交的價位。
+        # 試算若需要價格，改採真實存在於委託簿上的買一（較保守），
+        # 其次賣一，最後才以前收作備援；UI 一律標示為參考價而非成交價。
         if z_last is not None:
             last = z_last
             price_source = "MIS z 最新成交"
             estimated = False
-        elif pz_last is not None:
-            last = pz_last
-            price_source = "MIS pz 最近成交"
-            estimated = False
-        elif best_bid is not None and best_ask is not None:
-            last = (best_bid + best_ask) / 2.0
-            price_source = "五檔買賣中間估計"
-            estimated = True
         elif best_bid is not None:
             last = best_bid
-            price_source = "最佳買價估計"
+            price_source = "最佳買價參考（無最新成交）"
             estimated = True
         elif best_ask is not None:
             last = best_ask
-            price_source = "最佳賣價估計"
+            price_source = "最佳賣價參考（無最新成交）"
             estimated = True
         else:
             last = prev
-            price_source = "前收備援（尚無盤中價）"
+            price_source = "前收備援（尚無盤中成交/五檔）"
             estimated = True
 
         if last is None:
             continue
-        traded = (z_last is not None) or (pz_last is not None)
+        traded = z_last is not None
         high = _f(m.get("h"), last)
         low = _f(m.get("l"), last)
         open_ = _f(m.get("o"), last)
@@ -347,6 +340,11 @@ def build_snapshot(daily: pd.DataFrame, strong: pd.DataFrame, use_streamlit_cach
     decline_count = int(x["decline"].sum())
     breadth_den = advance_count + decline_count
     advance_ratio = advance_count / breadth_den * 100.0 if breadth_den else 50.0
+    ma20_valid = pd.to_numeric(x["ma20_live"], errors="coerce").notna()
+    above_ma20_ratio = (
+        float((x.loc[ma20_valid, "last"] > x.loc[ma20_valid, "ma20_live"]).mean() * 100.0)
+        if ma20_valid.any() else float("nan")
+    )
 
     def _market_ratio(market: str) -> float:
         z = x[x["market"].astype(str).str.upper() == market]
@@ -521,6 +519,7 @@ def build_snapshot(daily: pd.DataFrame, strong: pd.DataFrame, use_streamlit_cach
         "advance_count": advance_count,
         "decline_count": decline_count,
         "advance_ratio": advance_ratio,
+        "above_ma20_ratio": above_ma20_ratio,
         "twse_adv": twse_adv,
         "tpex_adv": tpex_adv,
         "new_high": new_high,

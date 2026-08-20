@@ -1664,11 +1664,163 @@ def _render_trial_summary(bg_state: dict):
     _render_change_radar(snap, bg_state)
 
 
+
+def _intraday_entry_gate(snap: dict) -> dict:
+    """盤中版本的市場進場閘門，盡量貼近進場回測所用的廣度條件。"""
+    adv=_num(snap.get("advance_ratio"),0) or 0
+    ma20_pct=_num(snap.get("above_ma20_ratio"))
+    trend=str(snap.get("trend") or "")
+    stage_now=str(snap.get("stage") or "")
+    risk_now=str(snap.get("risk") or "")
+    improving=trend in {"增加","明顯增加"} or stage_now in {"低檔回升","中段回升"}
+    breadth_ok=adv>=50 and (ma20_pct is None or ma20_pct>=50) and improving and not risk_now.startswith("🟠")
+    ma20_text="MA20廣度不足" if ma20_pct is None else f"MA20上方 {ma20_pct:.1f}%"
+    label="✅ 盤中市場廣度改善" if breadth_ok else "⏳ 盤中市場廣度未確認"
+    detail=f"上漲 {adv:.1f}%｜{ma20_text}｜強勢股{trend or '—'}｜{risk_now or '未觸發'}"
+    return {"允許":bool(breadth_ok),"標籤":label,"說明":detail}
+
+
+def _intraday_stock_trade_plan(live_row, formal_row, snap: dict, cost=None) -> dict:
+    """把單檔即時行情套入 v3.5 的進場/獲利/失敗風控，產生盤中試算操作。"""
+    price=_num(live_row.get("盤中價"))
+    rs_live=_num(live_row.get("盤中RS"))
+    live_ma20=_num(live_row.get("盤中MA20"))
+    live_ma60=_num(live_row.get("盤中MA60"))
+    estimated=_boolish(live_row.get("價格為估計"))
+
+    if formal_row is None:
+        formal_row=pd.Series(dtype=object)
+
+    prev_ma20=_num(formal_row.get("MA20"))
+    prev_ma60=_num(formal_row.get("MA60"))
+    ma20chg=(live_ma20-prev_ma20) if live_ma20 is not None and prev_ma20 is not None else _num(formal_row.get("MA20較前日"),0) or 0
+    ma60chg=(live_ma60-prev_ma60) if live_ma60 is not None and prev_ma60 is not None else _num(formal_row.get("MA60較前日"),0) or 0
+    if live_ma20 is not None and live_ma60 is not None and prev_ma20 is not None and prev_ma60 is not None:
+        spreadchg=(live_ma20-live_ma60)-(prev_ma20-prev_ma60)
+    else:
+        spreadchg=_num(formal_row.get("開口較前日"),0) or 0
+
+    conds=[
+        price is not None and live_ma20 is not None and live_ma60 is not None and price>live_ma20 and price>live_ma60,
+        live_ma20 is not None and live_ma60 is not None and live_ma20>live_ma60,
+        ma20chg>0,
+        ma60chg>0,
+        spreadchg>0,
+    ]
+    complete=float(sum(bool(x) for x in conds)*20)
+
+    prev_stage=_clean_cell(formal_row.get("鴨嘴階段"))
+    prev_formal=_boolish(formal_row.get("正式鴨嘴")) or prev_stage.startswith("持續符合") or prev_stage.startswith("新進")
+    live_formal=all(conds)
+    today_new=bool(live_formal and not prev_formal)
+    exit_today=bool(prev_formal and not live_formal)
+    pre_s=_clean_cell(formal_row.get("預備鴨嘴狀態"))
+
+    gap20=((price/live_ma20-1.0)*100.0) if price is not None and live_ma20 not in (None,0) else 0.0
+    heat=max(0,min(70,max(0,gap20)*5.0))
+    if rs_live is not None and rs_live>=95: heat+=12
+    elif rs_live is not None and rs_live>=85: heat+=8
+    if live_formal or complete>=100: heat+=8
+    first_hot=formal_row.get("首次過熱日期")
+    try:
+        has_hot=not pd.isna(first_hot) and str(first_hot).strip() not in {"","—","-"}
+    except Exception:
+        has_hot=bool(first_hot)
+    if has_hot: heat+=8
+    heat=max(0,min(100,heat))
+
+    right=max(0,min(55,complete*0.55))
+    if rs_live is not None:
+        if rs_live>=85: right+=25
+        elif rs_live>=70: right+=18
+        elif rs_live>=50: right+=10
+    if today_new: right+=12
+    elif live_formal: right+=8
+    elif "A級" in pre_s: right+=6
+    if ma20chg>0 and ma60chg>0 and spreadchg>0: right+=6
+    if exit_today: right-=30
+    right=max(0,min(100,right))
+
+    gate=_intraday_entry_gate(snap)
+    entry=stock_entry_plan(
+        complete,rs_live,right,heat,live_formal,today_new,pre_s,
+        market_entry_ok=gate["允許"],market_entry_label=gate["標籤"]
+    )
+    profit=stock_profit_exit_plan(
+        heat,rs_live,right,live_formal,today_new,exit_today,
+        has_hot_date=has_hot,ma20chg=ma20chg,spreadchg=spreadchg
+    )
+
+    # -8% 回測規則是「收盤確認」。盤中只顯示是否已進入該區，不把盤中價直接當正式停損成交訊號。
+    failure=stock_failure_risk_plan(
+        price,cost=cost if cost and cost>0 else None,exit_today=exit_today,
+        right=right,ma20=live_ma20,ma20chg=ma20chg
+    )
+    fail_stage=_clean_cell(failure.get("失敗風控")) or "—"
+    profit_stage=_clean_cell(profit.get("獲利階段")) or "—"
+    entry_stage=_clean_cell(entry.get("進場階段")) or "—"
+
+    if fail_stage.startswith("🔴"):
+        operation="🔴 出場區（收盤確認）"
+        action="目前盤中已落入成本-8%區；停止加碼，若收盤仍符合則依回測規則退出。"
+    elif profit_stage.startswith("🔴"):
+        operation="🔴 贏家退潮／退出"
+        action=profit.get("獲利動作") or "提高減碼幅度"
+    elif profit_stage.startswith("🟠"):
+        operation="🟠 分批減碼"
+        action=(profit.get("獲利動作") or "分批鎖利")+"；盤中先列警示，收盤確認。"
+    elif profit_stage.startswith("🟡") and ("鎖利" in profit_stage or "高熱" in profit_stage or heat>=70):
+        operation="🟡 停止追價／準備鎖利"
+        action=(profit.get("獲利動作") or "停止追價")+"；盤中先列警示，收盤確認。"
+    elif exit_today:
+        operation="🟡 結構轉弱"
+        action="停止新增部位並提高警覺；單一盤中結構轉弱不直接等同全數賣出。"
+    elif entry_stage.startswith("🌱"):
+        operation="🌱 小部位試單"
+        action=entry.get("進場動作") or "小部位試單"
+    elif entry_stage.startswith("📈"):
+        operation="📈 主要進場"
+        action=entry.get("進場動作") or "建立／補到基本部位"
+    elif live_formal and right>=65:
+        operation="🚀 偏多持有"
+        action="右側結構盤中仍成立；已有部位續抱，未持有者避免追滿。"
+    elif entry_stage.startswith("⚠️"):
+        operation="⚠️ 暫不進場"
+        action=entry.get("進場動作") or "等待降溫"
+    else:
+        operation="⏳ 等待"
+        action=entry.get("進場動作") or "等待更完整觸發"
+
+    if estimated:
+        action=f"{action}｜目前價格是委託簿/前收參考，不是最新成交，判讀可信度降一級。"
+
+    return {
+        "盤中操作":operation,
+        "盤中動作":action,
+        "進場階段":entry_stage,
+        "進場動作":entry.get("進場動作") or "—",
+        "獲利階段":profit_stage,
+        "獲利動作":profit.get("獲利動作") or "—",
+        "失敗風控":fail_stage,
+        "風控動作":failure.get("風控動作") or "—",
+        "右側分數":right,
+        "過熱程度":heat,
+        "鴨嘴完成度%":complete,
+        "盤中正式鴨嘴":live_formal,
+        "盤中今日新進":today_new,
+        "盤中結構退出":exit_today,
+        "市場閘門":gate["標籤"],
+        "市場閘門說明":gate["說明"],
+        "硬停損價":failure.get("硬停損價"),
+        "成本報酬%":failure.get("成本報酬%"),
+    }
+
+
 def _manual_stock_lookup(manager):
     st.write("### 🔎 個股最新狀況（手動查詢）")
     st.caption(
         "查詢會先用背景快照定位股票，再自動只向 MIS 更新這一檔；不會重抓 2,000 檔。"
-        "因此個股價格會優先顯示單檔最新成交；若 MIS 當下沒有成交欄位，會明確標示備援來源與最佳買賣價。"
+        "除了價格、RS與鴨嘴外，會直接顯示『盤中要進場、持有、減碼還是等待』。所有盤中操作都是試算，正式仍以收盤確認。"
     )
     with st.form("v32_manual_lookup_form", clear_on_submit=False):
         q = st.text_input("輸入股票代號或名稱", key="v32_manual_lookup_input", placeholder="例如 2330、台積電")
@@ -1701,7 +1853,7 @@ def _manual_stock_lookup(manager):
         hit = hit.sort_values(sort_cols, ascending=[False] * len(sort_cols), na_position="last")
     r = hit.iloc[0].copy()
 
-    # v3.5.1：手動查詢本身就只刷新命中的單一股票，避免把背景快照價誤認為即時價。
+    # v3.5.2：搜尋即單檔刷新；全市場仍保留背景快照架構。
     if submitted and q.strip():
         try:
             from intraday_live import refresh_single_stock
@@ -1721,6 +1873,10 @@ def _manual_stock_lookup(manager):
         source_time = bg_state.get("last_completed") or snap.get("snapshot_time", "—")
         source_label = "背景快照"
 
+    code_s=_norm_stock_code(r.get("代號"))
+    formal_hit=stock_lr[stock_lr["代號"].astype(str).map(_norm_stock_code)==code_s] if not stock_lr.empty and "代號" in stock_lr.columns else pd.DataFrame()
+    formal_row=formal_hit.iloc[0] if not formal_hit.empty else pd.Series(dtype=object)
+
     mis_time = _clean_cell(r.get("MIS報價時間")) or "—"
     price_source = _clean_cell(r.get("價格來源")) or source_label
     bid_s = _fmt_trial(r.get("最佳買價"), 2)
@@ -1736,6 +1892,33 @@ def _manual_stock_lookup(manager):
     c3.metric("盤中 RS", _fmt_trial(r.get("盤中RS"), 1), "強勢" if bool(r.get("盤中強勢", False)) else "未達強勢")
     c4.metric("強勢條件", f"{int(_num(r.get('強勢條件通過數'),0) or 0)}/6", str(r.get("強勢尚缺條件") or "—"))
     c5.metric("鴨嘴價格結構", "✅ 符合" if bool(r.get("盤中鴨嘴價格結構", False)) else "—", f"MA20乖離 {_fmt_trial(r.get('月線乖離率%'),1,'%')}")
+
+    if estimated:
+        st.warning(
+            f"目前沒有 MIS z 最新成交，顯示的是「{price_source}」；不會再用買賣中間價，所以不會出現 245.25 這種不可成交價位。"
+        )
+
+    cost_v=st.number_input(
+        "我的平均成本價（選填；盤中會提示是否已進入 -8% 收盤硬停損區）",
+        min_value=0.0,value=0.0,step=0.1,format="%.2f",key=f"intraday_cost_{code_s}"
+    )
+
+    plan=_intraday_stock_trade_plan(r,formal_row,snap,cost=cost_v if cost_v>0 else None)
+    st.write("#### 🎯 盤中操作判讀")
+    decision_cards([
+        ("現在要做什麼",plan["盤中操作"],_short_text(plan["盤中動作"],110)),
+        ("進場判讀",plan["進場階段"],_short_text(plan["進場動作"],95)),
+        ("獲利／出場",plan["獲利階段"],_short_text(plan["獲利動作"],95)),
+        ("失敗風控",plan["失敗風控"],_short_text(plan["風控動作"],95)),
+    ])
+    st.info(f"**盤中下一步：** {plan['盤中動作']}")
+    st.caption(
+        f"盤中試算：右側 {plan['右側分數']:.0f}／過熱 {plan['過熱程度']:.0f}／"
+        f"鴨嘴完成 {plan['鴨嘴完成度%']:.0f}%｜{plan['市場閘門']}｜{plan['市場閘門說明']}"
+    )
+    if cost_v>0 and plan.get("硬停損價") is not None:
+        ret_txt="—" if plan.get("成本報酬%") is None else f"{plan['成本報酬%']:+.2f}%"
+        st.caption(f"平均成本 {cost_v:.2f}｜-8% 收盤硬停損參考價 {plan['硬停損價']:.2f}｜目前相對成本 {ret_txt}。盤中跌破只預警，收盤仍符合才正式觸發。")
 
     if bool(r.get("即將強勢", False)):
         st.warning(f"🌱 **即將符合強勢**｜目前尚缺：{r.get('強勢尚缺條件','—')}")
@@ -1760,7 +1943,7 @@ def _manual_stock_lookup(manager):
 
 st.title("📈 台股分析中心")
 st.markdown(
-    '<div class="hero-sub">RS 市場廣度 × 鴨嘴型態 × 培育中心｜正式網頁版 v3.5.1｜進場回測 × 獲利管理 × -8%失敗風控 × 個股決策中心</div>',
+    '<div class="hero-sub">RS 市場廣度 × 鴨嘴型態 × 培育中心｜正式網頁版 v3.5.2｜進場回測 × 獲利管理 × -8%失敗風控 × 個股決策中心</div>',
     unsafe_allow_html=True
 )
 
@@ -2318,4 +2501,4 @@ with tabs[7]:
     with open(DEFAULT_RS,"rb") as f: d1.download_button("下載 RS 最新結果",f.read(),file_name="rs_latest.xlsx",mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",use_container_width=True)
     with open(DEFAULT_DUCK,"rb") as f: d2.download_button("下載鴨嘴最新結果",f.read(),file_name="duck_latest.xlsx",mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",use_container_width=True)
 
-st.divider(); st.caption(f"正式版 v3.5｜進場 v1.0 × 獲利出場 v1.2 × 失敗風控 v1.0 × 個股決策中心｜RS：{rs_date}｜鴨嘴：{duck_date}｜量化篩選與市場廣度工具，不構成投資建議。")
+st.divider(); st.caption(f"正式版 v3.5.2｜進場 v1.0 × 獲利出場 v1.2 × 失敗風控 v1.0 × 個股決策中心｜RS：{rs_date}｜鴨嘴：{duck_date}｜量化篩選與市場廣度工具，不構成投資建議。")
