@@ -34,6 +34,7 @@ BASELINE = APP_DIR / "intraday_baseline.pkl.gz"
 BASELINE_STATUS = APP_DIR / "intraday_baseline_status.json"
 MIS_URL = "https://mis.twse.com.tw/stock/api/getStockInfo.jsp"
 TZ = ZoneInfo("Asia/Taipei")
+ENGINE_VERSION = "3.5.6-auditfix-1"
 
 RS_THRESHOLD = 85.0
 AMOUNT_MIN = 30_000_000.0
@@ -441,6 +442,12 @@ def build_snapshot(daily: pd.DataFrame, strong: pd.DataFrame, use_streamlit_cach
         action = "觀望等待"
 
     quote_coverage = len(x) / len(base) * 100.0 if len(base) else 0.0
+    # 報價覆蓋率包含買一/賣一/前收備援；真正 MIS z 成交另外統計，
+    # 避免把「有參考價」誤說成「有即時成交」。
+    real_trade_coverage = (
+        float(x.get("traded", pd.Series(False, index=x.index)).fillna(False).astype(bool).mean() * 100.0)
+        if len(x) else 0.0
+    )
     newest_time = "—"
     qt = x.get("quote_time")
     if qt is not None and qt.astype(str).str.len().gt(0).any():
@@ -487,7 +494,7 @@ def build_snapshot(daily: pd.DataFrame, strong: pd.DataFrame, use_streamlit_cach
         "ma20_live", "ma50_live", "ma60_live", "ma200_live", "amount_est",
         "strong_live", "strong_cond_count", "strong_missing", "near_strong",
         "duck_price_live", "ma20_gap_pct", "best_bid", "best_ask",
-        "price_source", "price_estimated", "quote_time", "quote_date",
+        "price_source", "price_estimated", "traded", "quote_time", "quote_date",
     ]
     live_stocks = x[live_cols].copy()
     live_stocks = live_stocks.rename(columns={
@@ -496,7 +503,7 @@ def build_snapshot(daily: pd.DataFrame, strong: pd.DataFrame, use_streamlit_cach
         "strong_live": "盤中強勢", "strong_cond_count": "強勢條件通過數", "strong_missing": "強勢尚缺條件", "near_strong": "即將強勢",
         "duck_price_live": "盤中鴨嘴價格結構", "ma20_gap_pct": "月線乖離率%",
         "best_bid": "最佳買價", "best_ask": "最佳賣價",
-        "price_source": "價格來源", "price_estimated": "價格為估計",
+        "price_source": "價格來源", "price_estimated": "價格為估計", "traded": "MIS真實成交",
         "quote_time": "MIS報價時間", "quote_date": "MIS報價日期",
     })
 
@@ -505,6 +512,8 @@ def build_snapshot(daily: pd.DataFrame, strong: pd.DataFrame, use_streamlit_cach
         "snapshot_time": dt.datetime.now(TZ).strftime("%Y-%m-%d %H:%M:%S"),
         "quote_time": newest_time,
         "coverage": quote_coverage,
+        "real_trade_coverage": real_trade_coverage,
+        "engine_version": ENGINE_VERSION,
         "errors": errors,
         "strong_count": strong_count,
         "eligible_count": eligible_count,
@@ -599,6 +608,8 @@ class IntradayBackgroundManager:
         self._fast_last_started: dt.datetime | None = None
         self._fast_last_completed: dt.datetime | None = None
         self._fast_last_error: str | None = None
+        self._fast_last_returned_count = 0
+        self._fast_cycle = 0
 
         self._thread = threading.Thread(target=self._loop, name="tw-intraday-background", daemon=True)
         self._thread.start()
@@ -645,6 +656,8 @@ class IntradayBackgroundManager:
                     self._fast_version = 0
                     self._fast_last_completed = None
                     self._fast_last_started = None
+                    self._fast_last_returned_count = 0
+                    self._fast_cycle = 0
                 should_wake = True
             new_interval = float(max(30, int(interval_seconds)))
             if new_interval != self._interval or bool(enabled) != self._enabled:
@@ -674,7 +687,14 @@ class IntradayBackgroundManager:
             active = bool(enabled and self._enabled and ordered)
             if ordered != self._fast_watch_codes:
                 self._fast_watch_codes = ordered
-                self._fast_rows = None
+                # 不再因候選名單增減就把整張快速行情清空。
+                # 保留仍在追蹤名單中的上一筆快刷資料，下一輪再逐碼覆蓋。
+                if self._fast_rows is not None and not self._fast_rows.empty and "代號" in self._fast_rows.columns:
+                    keep = self._fast_rows.copy()
+                    keep["代號"] = keep["代號"].astype(str).map(_norm_code)
+                    self._fast_rows = keep[keep["代號"].isin(set(ordered))].copy()
+                else:
+                    self._fast_rows = None
                 self._fast_last_completed = None
                 self._fast_last_started = None
                 should_wake = True
@@ -713,6 +733,10 @@ class IntradayBackgroundManager:
                 "fast_rows": None if self._fast_rows is None else self._fast_rows.copy(deep=False),
                 "fast_watch_codes": list(self._fast_watch_codes),
                 "fast_watch_count": len(self._fast_watch_codes),
+                "fast_returned_count": int(self._fast_last_returned_count),
+                "fast_coverage": (float(self._fast_last_returned_count) / len(self._fast_watch_codes) * 100.0) if self._fast_watch_codes else 0.0,
+                "fast_cycle": int(self._fast_cycle),
+                "engine_version": ENGINE_VERSION,
                 "fast_version": self._fast_version,
                 "fast_running": self._fast_running,
                 "fast_enabled": self._fast_enabled,
@@ -762,8 +786,8 @@ class IntradayBackgroundManager:
             "compare_label": compare_label,
         }
         self._version += 1
-        # Re-anchor fast calculations to the just-completed full market snapshot.
-        self._fast_rows = None
+        # 全市場重掃完成後，保留既有快速行情，避免每30秒瞬間退回舊快照。
+        # 只把 fast anchor 清掉，讓下一個 loop 立刻用新全市場基準重刷追蹤股。
         self._fast_last_completed = None
         self._fast_last_started = None
 
@@ -829,9 +853,30 @@ class IntradayBackgroundManager:
                         self._fast_running = False
                 else:
                     with self._lock:
-                        self._fast_rows = rows
+                        now_done = dt.datetime.now(TZ)
+                        # MIS 批次可能偶爾少回個別股票；不能因此讓該股退回30秒甚至更舊的全市場列。
+                        # 將本輪成功回傳逐碼合併到上一輪快速行情，未回傳者保留上一筆並由 UI 顯示資料年齡。
+                        if rows is not None and not rows.empty:
+                            nr = rows.copy()
+                            nr["代號"] = nr["代號"].astype(str).map(_norm_code)
+                            nr["快速追蹤批次"] = self._fast_cycle + 1
+                            nr["快速抓取完成時間"] = now_done.strftime("%Y-%m-%d %H:%M:%S")
+                            if self._fast_rows is None or self._fast_rows.empty:
+                                merged = nr
+                            else:
+                                old = self._fast_rows.copy()
+                                old["代號"] = old["代號"].astype(str).map(_norm_code)
+                                merged = pd.concat([old, nr], ignore_index=True)
+                                merged = merged.drop_duplicates("代號", keep="last")
+                            if self._fast_watch_codes:
+                                merged = merged[merged["代號"].isin(set(self._fast_watch_codes))].copy()
+                            self._fast_rows = merged
+                            self._fast_last_returned_count = int(len(nr))
+                        else:
+                            self._fast_last_returned_count = 0
+                        self._fast_cycle += 1
                         self._fast_version += 1
-                        self._fast_last_completed = dt.datetime.now(TZ)
+                        self._fast_last_completed = now_done
                         self._fast_running = False
                 continue
 
@@ -969,12 +1014,16 @@ def refresh_watchlist(snapshot: dict, codes, max_codes: int = 2500) -> pd.DataFr
             "盤中鴨嘴價格結構": bool(last > ma20 > ma60),
             "月線乖離率%": (last / ma20 - 1.0) * 100.0 if ma20 else None,
             "快速追蹤時間": dt.datetime.now(TZ).strftime("%Y-%m-%d %H:%M:%S"),
+            "快速追蹤epoch": time.time(),
+            "行情引擎版本": ENGINE_VERSION,
         })
     return pd.DataFrame(rows)
 
 
 @st.cache_resource(show_spinner=False)
-def get_background_manager() -> IntradayBackgroundManager:
+def get_background_manager(engine_generation: str = ENGINE_VERSION) -> IntradayBackgroundManager:
+    # generation 參數是 cache key 的一部分；部署新版時強制建立新的 manager/thread，
+    # 避免 Streamlit 沿用舊版 cache_resource 背景執行緒。
     return IntradayBackgroundManager()
 
 
