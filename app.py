@@ -1553,10 +1553,190 @@ def _event_table(stocks: pd.DataFrame, codes: set[str], limit=30) -> pd.DataFram
     return z[show].head(limit)
 
 
+def _intraday_trade_radar_table(snap: dict) -> pd.DataFrame:
+    """用與盤中單檔查詢完全相同的 v3.5 交易規則，重算全市場盤中操作分類。
+
+    主交易雷達只把 MIS z 真實成交價列為可操作清單；委託簿/前收參考價仍保留
+    在資料中，但不會因參考價跨過門檻而製造假的進場或減碼訊號。
+    """
+    stocks=snap.get("stocks") if snap else None
+    if stocks is None or stocks.empty:
+        return pd.DataFrame()
+
+    live=stocks.copy()
+    live["代號"]=live["代號"].map(_norm_stock_code)
+
+    formal_map={}
+    if stock_lr is not None and not stock_lr.empty and "代號" in stock_lr.columns:
+        f=stock_lr.copy()
+        f["代號"]=f["代號"].map(_norm_stock_code)
+        f=f.drop_duplicates("代號",keep="last")
+        formal_map={str(r.get("代號")):r for r in f.to_dict("records")}
+
+    rows=[]
+    for lr in live.to_dict("records"):
+        code=_norm_stock_code(lr.get("代號"))
+        formal_row=formal_map.get(code,{})
+        try:
+            plan=_intraday_stock_trade_plan(lr,formal_row,snap,cost=None)
+        except Exception:
+            # 單一股票資料不足不應讓整個雷達消失。
+            continue
+        rows.append({
+            "代號":code,
+            "名稱":lr.get("名稱",""),
+            "市場":lr.get("市場",""),
+            "盤中價":_num(lr.get("盤中價")),
+            "漲跌幅%":_num(lr.get("漲跌幅%")),
+            "盤中RS":_num(lr.get("盤中RS")),
+            "價格來源":_clean_cell(lr.get("價格來源")) or "—",
+            "價格為估計":_boolish(lr.get("價格為估計")),
+            "MIS報價時間":_clean_cell(lr.get("MIS報價時間")) or "—",
+            "盤中操作":plan.get("盤中操作","⏳ 等待"),
+            "盤中動作":plan.get("盤中動作","—"),
+            "進場階段":plan.get("進場階段","—"),
+            "獲利階段":plan.get("獲利階段","—"),
+            "失敗風控":plan.get("失敗風控","—"),
+            "右側分數":_num(plan.get("右側分數")),
+            "過熱程度":_num(plan.get("過熱程度")),
+            "鴨嘴完成度%":_num(plan.get("鴨嘴完成度%")),
+            "盤中正式鴨嘴":bool(plan.get("盤中正式鴨嘴",False)),
+            "盤中今日新進":bool(plan.get("盤中今日新進",False)),
+            "盤中結構退出":bool(plan.get("盤中結構退出",False)),
+            "市場閘門":plan.get("市場閘門","—"),
+        })
+
+    out=pd.DataFrame(rows)
+    if out.empty:
+        return out
+    out["成交狀態"]=out["價格為估計"].map(lambda v:"⚪ 參考價" if bool(v) else "✅ MIS z成交")
+    return out
+
+
+def _get_intraday_trade_radar(snap: dict, bg_state: dict) -> pd.DataFrame:
+    """同一個背景版本只重算一次全市場交易分類，前台30秒刷新不重做2,000檔。"""
+    cache_key=(str(latest_date),int(bg_state.get("version",0) or 0))
+    cache=st.session_state.get("v353_trade_radar_cache")
+    if isinstance(cache,dict) and cache.get("key")==cache_key and isinstance(cache.get("data"),pd.DataFrame):
+        return cache["data"]
+    data=_intraday_trade_radar_table(snap)
+    st.session_state["v353_trade_radar_cache"]={"key":cache_key,"data":data}
+    return data
+
+
+def _trade_radar_view(df: pd.DataFrame, limit=80, sort_kind="entry") -> pd.DataFrame:
+    if df is None or df.empty:
+        return pd.DataFrame()
+    z=df.copy()
+    if sort_kind=="exit":
+        sort_cols=[c for c in ["過熱程度","盤中RS","右側分數"] if c in z.columns]
+    else:
+        sort_cols=[c for c in ["右側分數","盤中RS","鴨嘴完成度%"] if c in z.columns]
+    if sort_cols:
+        z=z.sort_values(sort_cols,ascending=[False]*len(sort_cols),na_position="last")
+    show=[c for c in [
+        "代號","名稱","市場","盤中價","漲跌幅%","盤中RS","鴨嘴完成度%",
+        "右側分數","過熱程度","盤中操作","進場階段","獲利階段",
+        "市場閘門","成交狀態","價格來源","MIS報價時間"
+    ] if c in z.columns]
+    return z[show].head(limit)
+
+
 def _render_change_radar(snap: dict, bg_state: dict):
     stocks = snap.get("stocks")
     if stocks is None or stocks.empty:
         return
+
+    # ===== 第一層：最新回測後真正可操作的進出場雷達 =====
+    st.write("#### 🎯 盤中回測交易雷達")
+    st.caption(
+        "這一層與下方『盤中單檔查詢』使用同一套規則："
+        "預備80＋RS70＋市場改善＝試單；右側≥65＋市場改善＝主要進場；"
+        "一般/可交易股過熱70～80、RS85領頭股90＝獲利管理。"
+        "主清單只採 MIS z 真實成交價，參考價不會製造進出場訊號。"
+    )
+
+    try:
+        radar=_get_intraday_trade_radar(snap,bg_state)
+    except Exception as e:
+        radar=pd.DataFrame()
+        st.warning(f"盤中交易雷達暫時無法重算：{e}；下方市場事件雷達仍可使用。")
+
+    if not radar.empty:
+        real=radar[~radar["價格為估計"].fillna(True).astype(bool)].copy()
+        est_count=int(radar["價格為估計"].fillna(False).astype(bool).sum())
+        entry_s=real["進場階段"].fillna("").astype(str)
+        profit_s=real["獲利階段"].fillna("").astype(str)
+        op_s=real["盤中操作"].fillna("").astype(str)
+
+        trial=real[entry_s.str.startswith("🌱")]
+        major=real[entry_s.str.startswith("📈")]
+        hold=real[op_s.str.startswith("🚀")]
+        protect=real[profit_s.str.startswith("🟡") & ~profit_s.str.contains("結構轉弱",na=False)]
+        lock=real[profit_s.str.startswith("🟠")]
+        retreat=real[profit_s.str.startswith("🔴")]
+
+        c1,c2,c3,c4,c5,c6=st.columns(6)
+        c1.metric("🌱 回測試單候選",f"{len(trial)} 檔")
+        c2.metric("📈 主要進場候選",f"{len(major)} 檔")
+        c3.metric("🚀 趨勢確認持有",f"{len(hold)} 檔")
+        c4.metric("🟡 獲利保護",f"{len(protect)} 檔")
+        c5.metric("🟠 積極鎖利",f"{len(lock)} 檔")
+        c6.metric("🔴 贏家退潮",f"{len(retreat)} 檔")
+
+        gate=_intraday_entry_gate(snap)
+        if gate["允許"]:
+            st.success(f"目前盤中進場閘門：{gate['標籤']}｜{gate['說明']}")
+        else:
+            st.warning(f"目前盤中進場閘門：{gate['標籤']}｜{gate['說明']}。即使個股結構到位，也先列觀察，不直接升級新買點。")
+        if est_count:
+            st.caption(f"另有 {est_count} 檔目前只有委託簿/前收參考價，已排除在上述可操作數量之外。")
+
+        with st.expander(f"🌱 回測試單候選：{len(trial)} 檔｜預備80＋RS70＋市場改善", expanded=False):
+            if trial.empty:
+                st.caption("目前沒有以真實成交價觸發的試單候選。")
+            else:
+                st.dataframe(_trade_radar_view(trial,80,"entry"),hide_index=True,use_container_width=True,height=420)
+
+        with st.expander(f"📈 主要進場候選：{len(major)} 檔｜右側≥65＋市場改善", expanded=False):
+            if major.empty:
+                st.caption("目前沒有以真實成交價觸發的主要進場候選。")
+            else:
+                st.dataframe(_trade_radar_view(major,100,"entry"),hide_index=True,use_container_width=True,height=460)
+
+        with st.expander(f"🚀 趨勢確認持有：{len(hold)} 檔", expanded=False):
+            if hold.empty:
+                st.caption("目前沒有盤中右側確認持有名單。")
+            else:
+                st.dataframe(_trade_radar_view(hold,100,"entry"),hide_index=True,use_container_width=True,height=440)
+
+        with st.expander(f"🟡 獲利保護：{len(protect)} 檔｜停止追價／準備鎖利", expanded=False):
+            if protect.empty:
+                st.caption("目前沒有進入第一層獲利保護區的股票。")
+            else:
+                st.dataframe(_trade_radar_view(protect,100,"exit"),hide_index=True,use_container_width=True,height=440)
+
+        with st.expander(f"🟠 積極鎖利：{len(lock)} 檔｜一般股80／RS85領頭股90附近", expanded=False):
+            if lock.empty:
+                st.caption("目前沒有進入積極鎖利區的股票。")
+            else:
+                st.dataframe(_trade_radar_view(lock,100,"exit"),hide_index=True,use_container_width=True,height=440)
+
+        with st.expander(f"🔴 贏家退潮：{len(retreat)} 檔｜曾過熱後結構退潮", expanded=False):
+            if retreat.empty:
+                st.caption("目前沒有觸發贏家退潮管理的股票。")
+            else:
+                st.dataframe(_trade_radar_view(retreat,100,"exit"),hide_index=True,use_container_width=True,height=440)
+
+        st.caption(
+            "注意：全市場雷達不知道你的個別持股成本，因此不會把『收盤≤成本-8%』列成全市場硬停損。"
+            "-8% 最後防線仍在單檔查詢／個股決策卡填入成本後判斷。"
+        )
+    else:
+        st.info("盤中交易雷達尚無可用結果；等待背景第一批完成後會自動出現。")
+
+    # ===== 第二層：保留原本的市場事件掃描，但不再把掉出強勢條件叫做「退出」 =====
+    st.divider()
     events = bg_state.get("events") or {}
     new_strong = set(events.get("new_strong") or set())
     out_strong = set(events.get("out_strong") or set())
@@ -1564,19 +1744,19 @@ def _render_change_radar(snap: dict, bg_state: dict):
     near_codes = set(events.get("near") or set())
     compare_label = str(events.get("compare_label") or f"相對 {latest_date} 正式")
 
-    st.write("#### 🔔 盤中個股變化雷達")
+    st.write("##### 📡 市場事件觀察（原強勢／鴨嘴雷達）")
     st.caption(
-        f"{compare_label}｜全市場掃描在背景執行；這裡只讀取已完成結果。"
-        "詳細清單預設收合，避免新事件出現時把整個頁面高度突然撐開。"
+        f"{compare_label}｜這一層是市場結構事件，不等同回測後的買賣指令。"
+        "原本『暫時退出』改名為『結構轉弱』，避免與真正出場條件混淆。"
     )
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("🔥 本輪新進強勢", f"{len(new_strong)} 檔")
     c2.metric("🌱 即將符合強勢", f"{len(near_codes)} 檔")
-    c3.metric("⚠️ 本輪暫時退出", f"{len(out_strong)} 檔")
+    c3.metric("⚠️ 本輪結構轉弱", f"{len(out_strong)} 檔")
     c4.metric("🦆 鴨嘴結構新進", f"{len(new_duck)} 檔")
 
     if new_strong:
-        st.success(f"🔥 最新背景掃描發現 {len(new_strong)} 檔新進強勢；展開下方可查看。")
+        st.success(f"🔥 最新背景掃描發現 {len(new_strong)} 檔新進強勢；這是事件觀察，不代表一定是最佳買點。")
     with st.expander(f"🔥 本輪新進強勢：{len(new_strong)} 檔", expanded=False):
         if new_strong:
             st.dataframe(_event_table(stocks, new_strong, 40), hide_index=True, use_container_width=True, height=360)
@@ -1587,11 +1767,11 @@ def _render_change_radar(snap: dict, bg_state: dict):
             st.dataframe(_event_table(stocks, near_codes, 80), hide_index=True, use_container_width=True, height=420)
         else:
             st.caption("目前沒有只差一項且已接近門檻的股票。")
-    with st.expander(f"⚠️ 本輪暫時退出：{len(out_strong)} 檔", expanded=False):
+    with st.expander(f"⚠️ 本輪結構轉弱：{len(out_strong)} 檔", expanded=False):
         if out_strong:
             st.dataframe(_event_table(stocks, out_strong, 50), hide_index=True, use_container_width=True, height=360)
         else:
-            st.caption("本輪沒有暫時退出。")
+            st.caption("本輪沒有強勢結構轉弱。")
     with st.expander(f"🦆 本輪新進鴨嘴價格結構：{len(new_duck)} 檔", expanded=False):
         if new_duck:
             st.dataframe(_event_table(stocks, new_duck, 50), hide_index=True, use_container_width=True, height=360)
@@ -1601,8 +1781,10 @@ def _render_change_radar(snap: dict, bg_state: dict):
     log = bg_state.get("event_log") or []
     if log:
         with st.expander(f"🕘 今日盤中事件紀錄（最近 {min(len(log), 300)} 筆）", expanded=False):
-            st.dataframe(pd.DataFrame(log[::-1]), hide_index=True, use_container_width=True, height=360)
-
+            log_df=pd.DataFrame(log[::-1])
+            if "類型" in log_df.columns:
+                log_df["類型"]=log_df["類型"].replace({"⚠️ 暫時退出":"⚠️ 結構轉弱"})
+            st.dataframe(log_df, hide_index=True, use_container_width=True, height=360)
 
 def _render_trial_summary(bg_state: dict):
     snap = bg_state.get("snapshot")
@@ -1943,7 +2125,7 @@ def _manual_stock_lookup(manager):
 
 st.title("📈 台股分析中心")
 st.markdown(
-    '<div class="hero-sub">RS 市場廣度 × 鴨嘴型態 × 培育中心｜正式網頁版 v3.5.2｜進場回測 × 獲利管理 × -8%失敗風控 × 個股決策中心</div>',
+    '<div class="hero-sub">RS 市場廣度 × 鴨嘴型態 × 培育中心｜正式網頁版 v3.5.3｜進場回測 × 獲利管理 × -8%失敗風控 × 個股決策中心</div>',
     unsafe_allow_html=True
 )
 
@@ -2501,4 +2683,4 @@ with tabs[7]:
     with open(DEFAULT_RS,"rb") as f: d1.download_button("下載 RS 最新結果",f.read(),file_name="rs_latest.xlsx",mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",use_container_width=True)
     with open(DEFAULT_DUCK,"rb") as f: d2.download_button("下載鴨嘴最新結果",f.read(),file_name="duck_latest.xlsx",mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",use_container_width=True)
 
-st.divider(); st.caption(f"正式版 v3.5.2｜進場 v1.0 × 獲利出場 v1.2 × 失敗風控 v1.0 × 個股決策中心｜RS：{rs_date}｜鴨嘴：{duck_date}｜量化篩選與市場廣度工具，不構成投資建議。")
+st.divider(); st.caption(f"正式版 v3.5.3｜進場 v1.0 × 獲利出場 v1.2 × 失敗風控 v1.0 × 個股決策中心｜RS：{rs_date}｜鴨嘴：{duck_date}｜量化篩選與市場廣度工具，不構成投資建議。")
