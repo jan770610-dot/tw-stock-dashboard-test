@@ -1,0 +1,90 @@
+name: Wade historical backfill & backtest
+
+on:
+  workflow_dispatch:
+    inputs:
+      end_date:
+        description: "結束日 YYYY-MM-DD；留白=今天"
+        required: false
+        default: ""
+      workers:
+        description: "歷史下載並行數；1最保守，2較快"
+        required: true
+        default: "1"
+        type: choice
+        options:
+          - "1"
+          - "2"
+      write_back:
+        description: "完成後是否把小型結果資料庫 commit 回 main"
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+jobs:
+  backfill:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r automation/requirements.txt
+
+      - name: Restore historical daily cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            automation/rs/cache
+          key: wade-history-cache-v1-${{ github.run_id }}
+          restore-keys: |
+            wade-history-cache-v1-
+
+      - name: Run historical backfill and causality-safe backtest
+        shell: bash
+        run: |
+          END_ARG=""
+          if [ -n "${{ inputs.end_date }}" ]; then
+            END_ARG="--end ${{ inputs.end_date }}"
+          fi
+          python automation/wade_history_backtest.py \
+            --start 2018-01-01 \
+            --warmup-start 2016-01-01 \
+            --workers "${{ inputs.workers }}" \
+            --retry-rounds 2 \
+            $END_ARG
+
+      - name: Upload Wade database and backtest results
+        uses: actions/upload-artifact@v4
+        with:
+          name: wade-history-results
+          path: data/wade_history/
+          retention-days: 30
+
+      - name: Optional write-back of compact results
+        if: ${{ inputs.write_back == true }}
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data/wade_history/wade_market_history.csv.gz \
+                  data/wade_history/wade_signal_events.csv \
+                  data/wade_history/wade_backtest_summary.csv \
+                  data/wade_history/wade_backtest_by_year.csv \
+                  data/wade_history/wade_history_status.json || true
+          if git diff --cached --quiet; then
+            echo "No changes to commit"
+          else
+            git commit -m "data: update Wade historical backtest database"
+            git push
+          fi
